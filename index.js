@@ -1,3 +1,5 @@
+const cors = require('cors');
+app.use(cors());
 require('dotenv').config(); // This line reads your .env file
 const express = require('express');
 const { Pool } = require('pg');
