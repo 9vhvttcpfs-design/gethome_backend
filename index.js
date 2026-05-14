@@ -17,5 +17,4 @@ pool.connect((err) => {
 
 app.listen(10000, () => console.log('🚀 Server running on port 10000'));
 
-
 console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : "URL NOT FOUND");
