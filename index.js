@@ -34,3 +34,12 @@ app.listen(PORT, () => {
 
 // Diagnostic check
 console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : "URL NOT FOUND");
+// Add this right before app.listen
+app.get('/', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.send(`✅ Backend is live! Database time: ${result.rows[0].now}`);
+  } catch (err) {
+    res.status(500).send('❌ Backend is live, but database connection failed.');
+  }
+});
