@@ -21,11 +21,6 @@ pool.connect((err) => {
   }
 });
 
-// A simple route so your frontend can test the connection
-app.get('/', (req, res) => {
-  res.send('✅ Backend is live and connected to the database!');
-});
-
 // Start the server
 const PORT = process.env.PORT || 10000;
 // This tells the server what to show when you visit the URL
@@ -38,3 +33,4 @@ app.listen(PORT, () => {
 
 // Diagnostic check
 console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : "URL NOT FOUND");
+
