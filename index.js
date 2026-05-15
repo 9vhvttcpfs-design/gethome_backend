@@ -27,6 +27,18 @@ const PORT = process.env.PORT || 10000;
 app.get('/', (req, res) => {
   res.send('✅ GetHome Backend is officially LIVE and talking to the Frontend!');
 });
+
+// This route sends the houses to your frontend
+app.get('/api/properties', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM properties');
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Database error:", err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
