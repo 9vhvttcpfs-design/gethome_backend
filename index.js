@@ -38,7 +38,7 @@ console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : 
 app.get('/', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
-    res.send(`✅ Backend is live! Database time: ${result.rows[0].now}`);
+    res.send(`✅ GetHome Backend is live! Database time: ${result.rows[0].now}`);
   } catch (err) {
     res.status(500).send('❌ Backend is live, but database connection failed.');
   }
