@@ -34,3 +34,4 @@ app.listen(PORT, () => {
 // Diagnostic check
 console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : "URL NOT FOUND");
 
+
