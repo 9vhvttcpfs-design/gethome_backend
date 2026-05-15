@@ -9,16 +9,11 @@ const app = express();
 app.use(cors());
 
 // Database Connection
-// Database Connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
     rejectUnauthorized: false
   }
-});
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
 });
 
 pool.connect((err) => {
@@ -40,6 +35,7 @@ app.get('/', (req, res) => {
 app.get('/api/properties', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM properties');
+
     res.json(result.rows);
   } catch (err) {
     console.error("Database error:", err.message);
@@ -53,5 +49,4 @@ app.listen(PORT, () => {
 
 // Diagnostic check
 console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : "URL NOT FOUND");
-
 
