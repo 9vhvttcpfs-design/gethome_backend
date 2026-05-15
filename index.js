@@ -28,18 +28,13 @@ app.get('/', (req, res) => {
 
 // Start the server
 const PORT = process.env.PORT || 10000;
+// This tells the server what to show when you visit the URL
+app.get('/', (req, res) => {
+  res.send('✅ GetHome Backend is officially LIVE and talking to the Frontend!');
+});
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
 // Diagnostic check
 console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : "URL NOT FOUND");
-// Add this right before app.listen
-app.get('/', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW()');
-    res.send(`✅ GetHome Backend is live! Database time: ${result.rows[0].now}`);
-  } catch (err) {
-    res.status(500).send('❌ Backend is live, but database connection failed.');
-  }
-});
