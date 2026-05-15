@@ -10,8 +10,14 @@ app.use(cors());
 
 // Database Connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+  user: 'postgres',
+  host: 'aws-0-eu-west-1.pooler.supabase.com',
+  database: 'postgres',
+  password: 'YOUR_ACTUAL_DATABASE_PASSWORD', // Put your real password here
+  port: 6543,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
 pool.connect((err) => {
