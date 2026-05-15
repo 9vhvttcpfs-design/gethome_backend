@@ -9,6 +9,14 @@ const app = express();
 app.use(cors());
 
 // Database Connection
+// Database Connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
