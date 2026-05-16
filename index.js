@@ -10,7 +10,11 @@ app.use(cors());
 
 // Database Connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  user: 'postgres',
+  host: 'postgres.ibyndthykkysoiwfoesg.supabase.co',
+  database: 'postgres',
+  password: 'GetHome2026Secure', // Put the clean, symbol-free password you just created here!
+  port: 5432,
   ssl: {
     rejectUnauthorized: false
   }
