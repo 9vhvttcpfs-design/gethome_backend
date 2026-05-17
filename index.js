@@ -1,9 +1,14 @@
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
-require('dotenv').config();
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+
+// ⚡ CRITICAL MIDDLEWARE: Add these two lines right here!
+app.use(cors());          // Allows frontend to talk to backend
+app.use(express.json());  // Allows backend to read incoming form data (req.body)
+
+// ... your supabase initialization and routes continue below ...
 
 // Allow your frontend to talk to this backend
 app.use(cors());
