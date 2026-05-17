@@ -14,12 +14,12 @@ app.use(express.json());  // Allows backend to read incoming form data (req.body
 app.use(cors());
 
 // Database Connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
+const { createClient } = require('@supabase/supabase-js');
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 pool.connect((err) => {
   if (err) {
