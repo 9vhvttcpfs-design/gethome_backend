@@ -1,64 +1,57 @@
-const express = require('express');
-const cors = require('cors');
-const { createClient } = require('@supabase/supabase-js');
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-client';
+
+dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 5000;
 
-// ⚡ CRITICAL MIDDLEWARE: Add these two lines right here!
-app.use(cors());          // Allows frontend to talk to backend
-app.use(express.json());  // Allows backend to read incoming form data (req.body)
-
-// ... your supabase initialization and routes continue below ...
-
-// Allow your frontend to talk to this backend
+// Enable cross-origin requests and JSON parser body extensions
 app.use(cors());
+app.use(express.json());
 
-// Database Connection
-
+// Initialize the official Supabase Client using your environment keys
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 
+if (!supabaseUrl || !supabaseKey) {
+  console.error("⚠️ System Alert: Missing Supabase Environment Variables!");
+}
+
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-pool.connect((err) => {
-  if (err) {
-    console.error('❌ Database connection failed:', err.stack);
-  } else {
-    console.log('✅ Connected to GetHome Database');
-  }
-});
-
-// Start the server
-const PORT = process.env.PORT || 10000;
-// This tells the server what to show when you visit the URL
+// 🌐 ROUTE 1: Simple Gateway Verification Check
 app.get('/', (req, res) => {
-  res.send('✅ GetHome Backend is officially LIVE and talking to the Frontend!');
+  res.send("✅ GetHome Backend is officially LIVE and talking to the Frontend!");
 });
 
-// This route sends the houses to your frontend
+// 🌐 ROUTE 2: Fetch listings from your database table (GET)
 app.get('/api/properties', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM properties');
+    const { data, error } = await supabase
+      .from('properties')
+      .select('*')
+      .order('id', { ascending: false });
 
-    res.json(result.rows);
+    if (error) throw error;
+    res.json(data);
   } catch (err) {
-    console.error("Database error:", err.message);
-    res.status(500).send('Server Error');
+    console.error("Error fetching properties:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Add this route right below your existing GET /api/properties route
-
+// 🌐 ROUTE 3: Add a brand new listing permanent row (POST)
 app.post('/api/properties', async (req, res) => {
   try {
     const { title, location, price, image_url } = req.body;
 
-    // Basic validation to make sure required fields aren't empty
     if (!title || !location || !price) {
-      return res.status(400).json({ error: "Title, location, and price are required." });
+      return res.status(400).json({ error: "Required elements (title, location, price) are missing." });
     }
 
-    // Insert the data into your Supabase 'properties' table
     const { data, error } = await supabase
       .from('properties')
       .insert([
@@ -69,25 +62,17 @@ app.post('/api/properties', async (req, res) => {
           image_url: image_url || null 
         }
       ])
-      .select(); // Returns the newly created row
+      .select();
 
-    if (error) {
-      console.error("Supabase insert error:", error);
-      return res.status(500).json({ error: error.message });
-    }
-
-    // Send back the newly created property
+    if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
-    console.error("Server error during post:", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("Error saving property row:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
+// Spin up the listener instance
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Server processing operations smoothly on port ${PORT}`);
 });
-
-// Diagnostic check
-console.log("Checking connection to:", process.env.DATABASE_URL ? "URL Found" : "URL NOT FOUND");
-
