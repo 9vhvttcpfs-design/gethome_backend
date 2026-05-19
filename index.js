@@ -22,6 +22,7 @@ app.get('/', (req, res) => {
   res.send("✅ GetHome Backend is officially LIVE and talking to the Frontend!");
 });
 
+// FETCH ALL PROPERTIES WITH TRANSPARENT MOVE-IN BREAKDOWNS
 app.get('/api/properties', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -30,9 +31,31 @@ app.get('/api/properties', async (req, res) => {
       .order('id', { ascending: false });
 
     if (error) throw error;
-    res.json(data);
+
+    // Map through properties and dynamically compute totals so agents can't hide fees
+    const transparentProperties = data.map(property => {
+      const rent = parseFloat(property.rent) || 0;
+      const agency = parseFloat(property.agency_fee) || 0;
+      const agreement = parseFloat(property.agreement_fee) || 0;
+      const caution = parseFloat(property.caution_fee) || 0;
+      const serviceCharge = parseFloat(property.service_charge) || 0;
+      
+      const totalMoveInCost = rent + agency + agreement + caution + serviceCharge;
+
+      return {
+        ...property,
+        rent,
+        agency_fee: agency,
+        agreement_fee: agreement,
+        caution_fee: caution,
+        service_charge: serviceCharge,
+        total_payment: totalMoveInCost
+      };
+    });
+
+    res.json(transparentProperties);
   } catch (err) {
-    console.error("Error fetching properties:", err.message);
+    console.error("Error fetching transparent listings:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
