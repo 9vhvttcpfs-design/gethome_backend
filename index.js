@@ -127,26 +127,74 @@ app.get('/api/properties', async (req, res) => {
     res.json(out);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// POST /api/upload-image
+// Receives base64 image data, uploads to Supabase Storage, returns public URL
+app.post('/api/upload-image', async (req, res) => {
+  const { fileName, fileType, fileData } = req.body;
+  if (!fileName || !fileType || !fileData) {
+    return res.status(400).json({ error: "fileName, fileType, and fileData are required." });
+  }
+  try {
+    // Strip base64 prefix (data:image/jpeg;base64,XXXX)
+    const base64Data = fileData.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    const { data, error } = await supabase.storage
+      .from('property-images')
+      .upload(fileName, buffer, {
+        contentType: fileType,
+        upsert: true,
+      });
+    if (error) throw error;
+    // Get public URL
+    const { data: urlData } = supabase.storage
+      .from('property-images')
+      .getPublicUrl(fileName);
+    res.status(200).json({ url: urlData.publicUrl });
+  } catch (err) {
+    console.error("Image upload error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.post('/api/properties', async (req, res) => {
-  const { title, location, price, image_url } = req.body;
+  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
-    const { data, error } = await supabase.from('properties').insert([{ title, location, price: parseFloat(price), image_url: image_url || null }]).select();
+    const { data, error } = await supabase.from('properties').insert([{
+      title,
+      location,
+      price:          parseFloat(price)          || 0,
+      image_url:      image_url                  || null,
+      rent:           parseFloat(rent)           || parseFloat(price) || 0,
+      agency_fee:     parseFloat(agency_fee)     || 0,
+      agreement_fee:  parseFloat(agreement_fee)  || 0,
+      caution_fee:    parseFloat(caution_fee)    || 0,
+      service_charge: parseFloat(service_charge) || 0,
+    }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // PUT /api/properties/:id  — update an existing listing
 app.put('/api/properties/:id', async (req, res) => {
-  const { id }                      = req.params;
-  const { title, location, price, image_url } = req.body;
+  const { id } = req.params;
+  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge } = req.body;
   if (!title || !location || !price) {
     return res.status(400).json({ error: "title, location, and price are required." });
   }
   try {
     const { data, error } = await supabase
       .from('properties')
-      .update({ title, location, price: parseFloat(price), image_url: image_url || null })
+      .update({
+        title,
+        location,
+        price:          parseFloat(price)          || 0,
+        image_url:      image_url                  || null,
+        rent:           parseFloat(rent)           || parseFloat(price) || 0,
+        agency_fee:     parseFloat(agency_fee)     || 0,
+        agreement_fee:  parseFloat(agreement_fee)  || 0,
+        caution_fee:    parseFloat(caution_fee)    || 0,
+        service_charge: parseFloat(service_charge) || 0,
+      })
       .eq('id', id)
       .select();
     if (error) throw error;
