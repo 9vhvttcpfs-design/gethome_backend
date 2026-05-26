@@ -370,4 +370,39 @@ ACTION REQUIRED---------------
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
+app.put('/api/properties/:id', async (req, res) => {
+  const { id } = req.params;
+  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge } = req.body;
+  if (!title || !location || !price) {
+    return res.status(400).json({ error: "title, location, and price are required." });
+  }
+  try {
+    const { data, error } = await supabase
+      .from('properties')
+      .update({ title, location, price: parseFloat(price) || 0, image_url: image_url || null, rent: parseFloat(rent) || 0, agency_fee: parseFloat(agency_fee) || 0, agreement_fee: parseFloat(agreement_fee) || 0, caution_fee: parseFloat(caution_fee) || 0, service_charge: parseFloat(service_charge) || 0 })
+      .eq('id', id)
+      .select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Property not found." });
+    res.status(200).json(data[0]);
+  } catch (err) {
+    console.error("Error updating property:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/properties/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { error } = await supabase
+      .from('properties')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+    res.status(200).json({ success: true, deletedId: id });
+  } catch (err) {
+    console.error("Error deleting property:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.listen(PORT, () => console.log(` GetHome backend running on port ${PORT}`));
