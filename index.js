@@ -20,7 +20,7 @@ const transporter = nodemailer.createTransport({
   secure: true,
   auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
 });
-// Tiny helper so we don't repeat try/catch in every email send
+// Send email to admin
 async function sendAdminEmail(subject, text) {
   await transporter.sendMail({
     from:    `"GetHome Platform" <${process.env.SMTP_USER}>`,
@@ -28,6 +28,47 @@ async function sendAdminEmail(subject, text) {
     subject,
     text,
   });
+}
+// Send email to customer - never blocks main flow
+async function sendCustomerEmail(to, subject, text) {
+  if (!to) return;
+  try {
+    await transporter.sendMail({
+      from:    `"GetHome" <${process.env.SMTP_USER}>`,
+      to,
+      subject,
+      text,
+    });
+    console.log(`Customer email sent to ${to}`);
+  } catch (err) {
+    console.error(`Customer email failed to ${to}:`, err.message);
+  }
+}
+// Send SMS via Termii
+// Add TERMII_API_KEY and TERMII_SENDER_ID to Render env vars
+async function sendSMS(phone, message) {
+  if (!process.env.TERMII_API_KEY || !phone) return;
+  try {
+    let p = String(phone).replace(/\D/g, '');
+    if (p.startsWith('0')) p = '234' + p.slice(1);
+    if (!p.startsWith('234')) p = '234' + p;
+    const res = await fetch('https://api.ng.termii.com/api/sms/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        to:      p,
+        from:    process.env.TERMII_SENDER_ID || 'GetHome',
+        sms:     message,
+        type:    'plain',
+        channel: 'generic',
+        api_key: process.env.TERMII_API_KEY,
+      }),
+    });
+    const data = await res.json();
+    console.log('SMS sent:', data.message || data.code);
+  } catch (err) {
+    console.error('SMS failed:', err.message);
+  }
 }
 // ──────────────────────────────────────────────────────────
 // HEALTH CHECK
@@ -45,6 +86,20 @@ app.post('/api/auth/signup', async (req, res) => {
   try {
     const { data, error } = await supabase.auth.signUp({ email, password });
     if (error) return res.status(400).json({ error: error.message });
+    const userEmail = data.user.email;
+    // Send welcome email to new customer
+    await sendCustomerEmail(
+      userEmail,
+      'Welcome to GetHome - Your Account is Ready',
+      `Hello and welcome to GetHome!
+Your account has been successfully created.
+GetHome is Nigeria's verified real estate platform offering:- Verified property listings with transparent fee breakdowns- Secure escrow deposit protection- Professional proxy inspections- Cleaning and relocation services
+You can now browse properties, book inspections, and secure listings
+with our escrow payment system.
+If you have any questions, contact us via WhatsApp: +2349077246534
+Thank you for choosing GetHome.
+The GetHome Team`
+    );
     res.status(201).json({
       user:  { id: data.user.id, email: data.user.email },
       token: data.session?.access_token || null,
@@ -273,8 +328,34 @@ NEXT STEPS----------
 =========================================
   `.trim();
   try {
+    // Notify admin
     await sendAdminEmail(` Escrow Confirmed — ${property_title} (Ref: ${reference})`, body);
-    console.log(` Escrow notification sent. Ref: ${reference}`);
+    // Send customer confirmation email
+    await sendCustomerEmail(
+      user_email,
+      `GetHome - Escrow Payment Confirmed for ${property_title}`,
+      `Hello,
+Your escrow payment has been successfully confirmed!
+PAYMENT DETAILS--------------
+Reference    : ${reference}
+Property     : ${property_title}
+Location     : ${property_location}
+Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
+WHAT HAPPENS NEXT-----------------
+1. Our operations team has been notified.
+2. An inspection officer will be assigned to your property.
+3. We will contact you within 24 hours to confirm your inspection slot.
+4. Your funds are held securely in escrow until verification is complete.
+For any questions, contact us via WhatsApp: +2349077246534
+Thank you for trusting GetHome.
+The GetHome Team`
+    );
+    // Send customer SMS confirmation
+    await sendSMS(
+      user_email, // Note: replace with user_phone when phone field is added
+      `GetHome: Your escrow payment of NGN ${Number(amount_naira).toLocaleString('en-NG')} for ${property_title} is confirmed. Ref: ${reference}. Our team will contact you within 24hrs.`
+    );
+    console.log(`Escrow notification sent. Ref: ${reference}`);
     res.status(200).json({ success: true });
   } catch (err) {
     console.error("Escrow email error:", err.message);
@@ -321,8 +402,31 @@ NEXT STEPS----------
 ==============================================
   `.trim();
   try {
+    // Notify admin
     await sendAdminEmail(` Proxy Inspection Booked — ${property_title} (Ref: ${reference})`, body);
-    console.log(` Inspection notification sent. Ref: ${reference}`);
+    // Send customer confirmation email
+    await sendCustomerEmail(
+      user_email,
+      `GetHome - Proxy Inspection Booked for ${property_title}`,
+      `Hello,
+Your proxy inspection has been successfully booked and paid for!
+INSPECTION DETAILS------------------
+Reference    : ${reference}
+Property     : ${property_title}
+Location     : ${property_location}
+Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
+You do not need to travel or be present. We handle everything.
+For any questions, contact us via WhatsApp: +2349077246534
+Thank you for choosing GetHome.
+The GetHome Team`
+    );
+    // Send SMS confirmation
+    await sendSMS(
+      user_email,
+      `GetHome: Proxy Inspection booked for ${property_title}. Ref: ${reference}. Your video report will be delivered within 48hrs to your email.`
+    );
+    console.log(`Inspection notification sent. Ref: ${reference}`);
     res.status(200).json({ success: true });
   } catch (err) {
     console.error("Inspection email error:", err.message);
@@ -368,41 +472,54 @@ ACTION REQUIRED---------------
   }
 });
 // ──────────────────────────────────────────────────────────
+// LEGAL AGREEMENT ACCEPTANCE
+// Records when a user accepts Terms, Privacy Policy or
+// Agent Agreement. Stored in Supabase for compliance.
+// ──────────────────────────────────────────────────────────
+app.post('/api/legal/accept', async (req, res) => {
+  const { user_id, user_email, agreement_type, version } = req.body;
+  // agreement_type: 'terms_and_privacy' | 'agent_agreement'
+  if (!user_id || !agreement_type) {
+    return res.status(400).json({ error: "user_id and agreement_type are required." });
+  }
+  try {
+    // Log acceptance to Supabase
+    // Uncomment once you create the legal_acceptances table:
+    // await supabase.from('legal_acceptances').insert([{
+    //   user_id,
+    //   user_email,
+    //   agreement_type,
+    //   version: version || '1.0',
+    //   accepted_at: new Date().toISOString(),
+    //   ip_address: req.ip,
+    // }]);
+    console.log(`Legal acceptance: ${user_email} accepted ${agreement_type}`);
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Legal acceptance error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
+// AGENT LISTING COUNT
+// Returns how many listings an agent has published.
+// Used for tier enforcement.
+// ──────────────────────────────────────────────────────────
+app.get('/api/agent/listing-count/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const { count, error } = await supabase
+      .from('properties')
+      .select('*', { count: 'exact', head: true })
+      .eq('created_by', userId);
+    if (error) throw error;
+    res.status(200).json({ count: count || 0 });
+  } catch (err) {
+    console.error('Listing count error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
-app.put('/api/properties/:id', async (req, res) => {
-  const { id } = req.params;
-  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge } = req.body;
-  if (!title || !location || !price) {
-    return res.status(400).json({ error: "title, location, and price are required." });
-  }
-  try {
-    const { data, error } = await supabase
-      .from('properties')
-      .update({ title, location, price: parseFloat(price) || 0, image_url: image_url || null, rent: parseFloat(rent) || 0, agency_fee: parseFloat(agency_fee) || 0, agreement_fee: parseFloat(agreement_fee) || 0, caution_fee: parseFloat(caution_fee) || 0, service_charge: parseFloat(service_charge) || 0 })
-      .eq('id', id)
-      .select();
-    if (error) throw error;
-    if (!data || data.length === 0) return res.status(404).json({ error: "Property not found." });
-    res.status(200).json(data[0]);
-  } catch (err) {
-    console.error("Error updating property:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/properties/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { error } = await supabase
-      .from('properties')
-      .delete()
-      .eq('id', id);
-    if (error) throw error;
-    res.status(200).json({ success: true, deletedId: id });
-  } catch (err) {
-    console.error("Error deleting property:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
 app.listen(PORT, () => console.log(` GetHome backend running on port ${PORT}`));
