@@ -211,7 +211,7 @@ app.post('/api/upload-image', async (req, res) => {
   }
 });
 app.post('/api/properties', async (req, res) => {
-  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge } = req.body;
+  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
     const { data, error } = await supabase.from('properties').insert([{
@@ -232,7 +232,7 @@ app.post('/api/properties', async (req, res) => {
 // PUT /api/properties/:id  — update an existing listing
 app.put('/api/properties/:id', async (req, res) => {
   const { id } = req.params;
-  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge } = req.body;
+  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
   if (!title || !location || !price) {
     return res.status(400).json({ error: "title, location, and price are required." });
   }
