@@ -82,8 +82,17 @@ async function sendSMS(phone, message) {
 // HEALTH CHECK
 // ──────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.send(" GetHome Backend is officially LIVE and talking to the Frontend!");
+  res.json({ status: 'ok', message: 'GetHome Backend is LIVE', timestamp: new Date().toISOString() });
 });
+// Self-ping every 14 minutes to prevent Render free tier sleep
+setInterval(function() {
+  try {
+    var https = require('https');
+    var url = process.env.RENDER_EXTERNAL_URL || '';
+    if (!url) return;
+    https.get(url + '/', function(r){ console.log('Keep-alive ping:', r.statusCode); }).on('error', function(){});
+  } catch(e) {}
+}, 14 * 60 * 1000);
 // ──────────────────────────────────────────────────────────
 // AUTH
 // ──────────────────────────────────────────────────────────
@@ -116,8 +125,8 @@ Thank you for choosing GetHome.
 The GetHome Team`
       );
     } catch (emailErr) {
-    }
       console.error('Welcome email error (non-blocking):', emailErr.message);
+    }
     res.status(201).json({
       user:  { id: data.user.id, email: data.user.email, role: 'customer' },
       token: data.session?.access_token || null,
@@ -191,8 +200,8 @@ app.post('/api/auth/login', async (req, res) => {
         .single();
       if (profile?.role) role = profile.role;
     } catch {
-      // profiles table may not exist yet — default to 'customer', no crash
     }
+      // profiles table may not exist yet — default to 'customer', no crash
     res.status(200).json({
       user:  { id: data.user.id, email: data.user.email, role },
       token: data.session?.access_token,
@@ -273,8 +282,8 @@ app.post('/api/upload-image', async (req, res) => {
     res.status(200).json({ url: urlData.publicUrl });
   } catch (err) {
     console.error("Image upload error:", err.message);
-    res.status(500).json({ error: err.message });
   }
+    res.status(500).json({ error: err.message });
 });
 app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
@@ -533,9 +542,9 @@ ACTION REQUIRED---------------
     console.log(` Agent upgrade notification sent. Ref: ${reference}`);
     res.status(200).json({ success: true, tier, listingLimit: t.limit });
   } catch (err) {
+  }
     console.error("Agent upgrade email error:", err.message);
     res.status(200).json({ success: false, warning: "Payment captured but email failed." });
-  }
 });
 // ──────────────────────────────────────────────────────────
 // LEGAL AGREEMENT ACCEPTANCE
