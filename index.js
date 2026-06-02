@@ -5,7 +5,15 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const PORT = process.env.PORT || 5000;
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    /\.netlify\.app$/,
+    /\.netlify\.com$/,
+  ],
+  credentials: true,
+}));
 app.use(express.json());
 // ── Supabase ───────────────────────────────────────────────
 const supabase = createClient(
@@ -87,10 +95,17 @@ app.post('/api/auth/signup', async (req, res) => {
     const { data, error } = await supabase.auth.signUp({ email, password });
     if (error) return res.status(400).json({ error: error.message });
     const userEmail = data.user.email;
-    // Send welcome email to new customer
-    await sendCustomerEmail(
-      userEmail,
-      'Welcome to GetHome - Your Account is Ready',
+    // Create profile entry for the new user (role defaults to 'customer')
+    try {
+      await supabase.from('profiles').upsert([{ id: data.user.id, role: 'customer' }], { onConflict: 'id' });
+    } catch (profileErr) {
+      console.error('Profile creation error (non-blocking):', profileErr.message);
+    }
+    // Send welcome email - wrapped so it never blocks signup
+    try {
+      await sendCustomerEmail(
+        userEmail,
+        'Welcome to GetHome - Your Account is Ready',
       `Hello and welcome to GetHome!
 Your account has been successfully created.
 GetHome is Nigeria's verified real estate platform offering:- Verified property listings with transparent fee breakdowns- Secure escrow deposit protection- Professional proxy inspections- Cleaning and relocation services
@@ -99,20 +114,71 @@ with our escrow payment system.
 If you have any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
 The GetHome Team`
-    );
+      );
+    } catch (emailErr) {
+    }
+      console.error('Welcome email error (non-blocking):', emailErr.message);
     res.status(201).json({
-      user:  { id: data.user.id, email: data.user.email },
+      user:  { id: data.user.id, email: data.user.email, role: 'customer' },
       token: data.session?.access_token || null,
       confirmationRequired: !data.session,
     });
-  } catch (err) { res.status(500).json({ error: "Internal error during sign-up." }); }
+  } catch (err) {
+    console.error('Signup error:', err);
+    res.status(500).json({ error: err.message || "Internal error during sign-up." });
+  }
+});
+// Agent registration - same as signup but sets role to 'agent'
+app.post('/api/auth/agent-register', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  // Block disposable emails
+  const blockedDomains = ['mailinator.com','guerrillamail.com','tempmail.com','throwam.com','yopmail.com','sharklasers.com','trashmail.com'];
+  const emailDomain = email.split('@')[1]?.toLowerCase();
+  if (blockedDomains.includes(emailDomain)) {
+    return res.status(400).json({ error: 'Disposable email addresses are not allowed. Please use a real email.' });
+  }
+  try {
+    const { data, error } = await supabase.auth.signUp({ email, password });
+    if (error) return res.status(400).json({ error: error.message });
+    // Set role to 'agent' in profiles table
+    try {
+      await supabase.from('profiles').upsert([{ id: data.user.id, role: 'agent' }], { onConflict: 'id' });
+    } catch (profileErr) {
+      console.error('Agent profile error:', profileErr.message);
+    }
+    // Notify admin of new agent registration
+    try {
+      await sendAdminEmail(
+        'New Agent Registration - GetHome',
+        `A new agent has registered:\n\nEmail: ${email}\nTime: ${new Date().toISOString()}\n\nPlease review and verify this agent account.`
+      );
+    } catch (emailErr) {
+      console.error('Admin notification error:', emailErr.message);
+    }
+    res.status(201).json({
+      user: { id: data.user.id, email: data.user.email, role: 'agent' },
+      token: data.session?.access_token || null,
+      confirmationRequired: !data.session,
+    });
+  } catch (err) {
+    console.error('Agent register error:', err);
+    res.status(500).json({ error: err.message || 'Internal error during agent registration.' });
+  }
 });
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
   try {
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) return res.status(401).json({ error: error.message });
+    if (error) {
+      console.error('Login error:', error.message);
+      const msg = error.message.includes('Invalid login') ? 'Invalid email or password. Please try again.' :
+                  error.message.includes('Email not confirmed') ? 'Please verify your email before logging in. Check your inbox.' :
+                  error.message;
+      return res.status(401).json({ error: msg });
+    }
     // Fetch the user's role from your public 'profiles' table.
     // Expected schema: profiles(id uuid references auth.users, role text)
     // Role values: 'customer' (default), 'agent', 'admin'
