@@ -30,10 +30,13 @@ const supabase = createClient(
 // ── Nodemailer ─────────────────────────────────────────────
 // Render env vars needed: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ADMIN_EMAIL
 const transporter = nodemailer.createTransport({
-  host:   process.env.SMTP_HOST || 'smtp.gmail.com',
-  port:   Number(process.env.SMTP_PORT) || 465,
-  secure: true,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  host:   process.env.SMTP_HOST || 'smtp.resend.com',
+  port:   Number(process.env.SMTP_PORT) || 587,
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER || 'resend',
+    pass: process.env.SMTP_PASS,
+  },
 });
 // Send email to admin
 async function sendAdminEmail(subject, text) {
