@@ -31,8 +31,8 @@ const supabase = createClient(
 // Render env vars needed: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ADMIN_EMAIL
 const transporter = nodemailer.createTransport({
   host:   process.env.SMTP_HOST || 'smtp.resend.com',
-  port:   Number(process.env.SMTP_PORT) || 587,
-  secure: false,
+  port:   Number(process.env.SMTP_PORT) || 465,
+  secure: true,
   auth: {
     user: process.env.SMTP_USER || 'resend',
     pass: process.env.SMTP_PASS,
