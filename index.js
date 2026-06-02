@@ -5,13 +5,20 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const PORT = process.env.PORT || 5000;
+const allowedOrigins = [
+  'https://trygethome.online',
+  'https://www.trygethome.online',
+  'http://localhost:5173',
+  'http://localhost:5174',
+];
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    /\.netlify\.app$/,
-    /\.netlify\.com$/,
-  ],
+  origin: function(origin, callback) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
 }));
 app.use(express.json());
@@ -200,8 +207,8 @@ app.post('/api/auth/login', async (req, res) => {
         .single();
       if (profile?.role) role = profile.role;
     } catch {
-    }
       // profiles table may not exist yet — default to 'customer', no crash
+    }
     res.status(200).json({
       user:  { id: data.user.id, email: data.user.email, role },
       token: data.session?.access_token,
@@ -282,8 +289,8 @@ app.post('/api/upload-image', async (req, res) => {
     res.status(200).json({ url: urlData.publicUrl });
   } catch (err) {
     console.error("Image upload error:", err.message);
-  }
     res.status(500).json({ error: err.message });
+  }
 });
 app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
@@ -542,9 +549,9 @@ ACTION REQUIRED---------------
     console.log(` Agent upgrade notification sent. Ref: ${reference}`);
     res.status(200).json({ success: true, tier, listingLimit: t.limit });
   } catch (err) {
-  }
     console.error("Agent upgrade email error:", err.message);
     res.status(200).json({ success: false, warning: "Payment captured but email failed." });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // LEGAL AGREEMENT ACCEPTANCE
