@@ -62,6 +62,18 @@ async function sendCustomerEmail(to, subject, text) {
           to: [to],
           subject,
           text,
+          html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:20px;color:#374151">
+            <h2 style="color:#0a2240">GetHome</h2>
+            <div style="white-space:pre-line;line-height:1.7">${text}</div>
+            <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0"/>
+            <div style="text-align:center;margin:20px 0">
+              <a href="https://trygethome.online"
+                style="display:inline-block;padding:12px 28px;background-color:#27ae60;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:bold;font-size:15px">
+                Open GetHome App
+              </a>
+            </div>
+            <p style="color:#94a3b8;font-size:12px;text-align:center">trygethome.online</p>
+          </div>`,
         }),
       });
       const result = await response.json();
@@ -80,6 +92,14 @@ async function sendCustomerEmail(to, subject, text) {
       await transporter.sendMail({
         from: `"GetHome" <${process.env.SMTP_USER || 'noreply@trygethome.online'}>`,
         to, subject, text,
+        html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:20px">
+          <h2 style="color:#0a2240">GetHome</h2>
+          <div style="white-space:pre-line;line-height:1.7;color:#374151">${text}</div>
+          <div style="text-align:center;margin:24px 0">
+            <a href="https://trygethome.online" style="display:inline-block;padding:12px 28px;background:#27ae60;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold">Open GetHome App</a>
+          </div>
+          <p style="color:#94a3b8;font-size:12px;text-align:center">trygethome.online</p>
+        </div>`,
       });
       console.log('Email sent via SMTP to:', to);
     } catch (err) {
@@ -222,13 +242,18 @@ app.post('/api/auth/signup', async (req, res) => {
       try {
         await sendCustomerEmail(
           userEmail,
-          'Welcome to GetHome!',
+          'Welcome to GetHome - Verify Your Email',
           `Hello and welcome to GetHome!
 Your account has been successfully created.
-Please check your inbox and click the verification link to activate your account.
-Once verified you can browse properties, book inspections and secure listings.
-Questions? WhatsApp: +2349077246534
-The GetHome Team`
+VERIFY YOUR EMAIL:
+Please check your inbox for a separate verification email from GetHome and click the confirmation link inside it.
+Once verified, sign in to your account here:
+https://trygethome.online
+On the GetHome app you can:
+- Browse verified properties with full fee breakdown- Book inspections- Secure listings with escrow protection
+Questions? WhatsApp us: https://wa.me/2349077246534
+The GetHome Team
+https://trygethome.online`
         );
       } catch (e) {
         console.error('Welcome email failed (non-blocking):', e.message);
@@ -292,21 +317,19 @@ app.post('/api/auth/agent-register', async (req, res) => {
           'GetHome Agent Registration - Next Steps',
           `Hello!
 Thank you for registering as a GetHome agent.
-Your account has been created successfully. To activate your agent account and start listing properties, please verify your email first, then contact us on WhatsApp:
-ACTIVATE YOUR ACCOUNT:
-Click this link to message us on WhatsApp:
+STEP 1 - VERIFY YOUR EMAIL:
+Check your inbox for a verification email from GetHome and click the confirmation link.
+STEP 2 - CONTACT US ON WHATSAPP:
+After verifying, message us on WhatsApp to activate your agent account:
 ${agentWhatsAppLink}
-Or open WhatsApp and message: +${process.env.WHATSAPP_NUMBER || "2349077246534"}
 Tell us: "I just registered as an agent with email: ${email}"
-Once we verify your details, your agent access will be approved and you can start uploading listings.
-WHAT HAPPENS NEXT:
-1. Verify your email (check your inbox for a confirmation link)
-2. Message us on WhatsApp with your registered email
-3. We approve your account within 24 hours
-4. You can then log in and start listing properties
-Questions? WhatsApp: +${process.env.WHATSAPP_NUMBER || "2349077246534"}
+STEP 3 - SIGN IN TO YOUR ACCOUNT:
+Once approved, sign in here to start listing properties:
+https://trygethome.online
+We approve agent accounts within 24 hours.
+Questions? WhatsApp: https://wa.me/${process.env.WHATSAPP_NUMBER || "2349077246534"}
 The GetHome Team
-trygethome.online`
+https://trygethome.online`
         );
         console.log('Agent welcome email sent to:', email);
       } catch (emailErr) {
@@ -492,9 +515,9 @@ app.put('/api/properties/:id', async (req, res) => {
     if (!data || data.length === 0) return res.status(404).json({ error: "Property not found." });
     res.status(200).json(data[0]);
   } catch (err) {
-  }
     console.error("Error updating property:", err.message);
     res.status(500).json({ error: err.message });
+  }
 });
 // DELETE /api/properties/:id  — permanently remove a listing
 app.delete('/api/properties/:id', async (req, res) => {
@@ -651,7 +674,8 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure
+- Written condition and defect report- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
