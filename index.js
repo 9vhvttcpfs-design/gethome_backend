@@ -49,17 +49,21 @@ async function sendAdminEmail(subject, text) {
 }
 // Send email to customer - never blocks main flow
 async function sendCustomerEmail(to, subject, text) {
-  if (!to) return;
+  if (!to || !process.env.SMTP_PASS) {
+    console.log('Email skipped - no recipient or SMTP not configured');
+    return;
+  }
   try {
     await transporter.sendMail({
-      from:    `"GetHome" <${process.env.SMTP_USER}>`,
+      from:    `"GetHome" <${process.env.SMTP_USER || 'noreply@trygethome.online'}>`,
       to,
       subject,
       text,
     });
-    console.log(`Customer email sent to ${to}`);
+    console.log(`Email sent to ${to}`);
   } catch (err) {
-    console.error(`Customer email failed to ${to}:`, err.message);
+    console.error(`Email failed to ${to}:`, err.message);
+    // Never rethrow - email failures must never break user flows
   }
 }
 // Send SMS via Termii
@@ -108,43 +112,54 @@ setInterval(function() {
 // ──────────────────────────────────────────────────────────
 app.post('/api/auth/signup', async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password)      return res.status(400).json({ error: "Email and password are required." });
-  if (password.length < 6)      return res.status(400).json({ error: "Password must be at least 6 characters." });
+  if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
+  if (password.length < 6)  return res.status(400).json({ error: "Password must be at least 6 characters." });
+  // Block disposable emails
+  const blockedDomains = ['mailinator.com','guerrillamail.com','tempmail.com','throwam.com','yopmail.com','sharklasers.com'];
+  const emailDomain = email.split('@')[1]?.toLowerCase();
+  if (blockedDomains.includes(emailDomain)) {
+    return res.status(400).json({ error: 'Disposable email addresses are not allowed.' });
+  }
   try {
     const { data, error } = await supabase.auth.signUp({ email, password });
     if (error) return res.status(400).json({ error: error.message });
-    const userEmail = data.user.email;
-    // Create profile entry for the new user (role defaults to 'customer')
-    try {
-      await supabase.from('profiles').upsert([{ id: data.user.id, role: 'customer' }], { onConflict: 'id' });
-    } catch (profileErr) {
-      console.error('Profile creation error (non-blocking):', profileErr.message);
+    // Safely get user info - data.user may be null if email confirmation pending
+    const userId   = data?.user?.id   || null;
+    const userEmail = data?.user?.email || email;
+    const hasSession = !!data?.session;
+    // Create profile - non-blocking
+    if (userId) {
+      supabase.from('profiles')
+        .upsert([{ id: userId, role: 'customer' }], { onConflict: 'id' })
+        .then(() => console.log('Profile created for:', userEmail))
+        .catch(e  => console.error('Profile error (non-blocking):', e.message));
     }
-    // Send welcome email - wrapped so it never blocks signup
-    try {
-      await sendCustomerEmail(
-        userEmail,
-        'Welcome to GetHome - Your Account is Ready',
-      `Hello and welcome to GetHome!
+    // Send welcome email - completely non-blocking, never affects response
+    setImmediate(async function() {
+      try {
+        await sendCustomerEmail(
+          userEmail,
+          'Welcome to GetHome!',
+          `Hello and welcome to GetHome!
 Your account has been successfully created.
-GetHome is Nigeria's verified real estate platform offering:- Verified property listings with transparent fee breakdowns- Secure escrow deposit protection- Professional proxy inspections- Cleaning and relocation services
-You can now browse properties, book inspections, and secure listings
-with our escrow payment system.
-If you have any questions, contact us via WhatsApp: +2349077246534
-Thank you for choosing GetHome.
+Please check your inbox and click the verification link to activate your account.
+Once verified you can browse properties, book inspections and secure listings.
+Questions? WhatsApp: +2349077246534
 The GetHome Team`
-      );
-    } catch (emailErr) {
-      console.error('Welcome email error (non-blocking):', emailErr.message);
-    }
-    res.status(201).json({
-      user:  { id: data.user.id, email: data.user.email, role: 'customer' },
-      token: data.session?.access_token || null,
-      confirmationRequired: !data.session,
+        );
+      } catch (e) {
+        console.error('Welcome email failed (non-blocking):', e.message);
+      }
+    });
+    // Always respond successfully - email sending never blocks this
+    return res.status(201).json({
+      user:  userId ? { id: userId, email: userEmail, role: 'customer' } : null,
+      token: data?.session?.access_token || null,
+      confirmationRequired: !hasSession,
     });
   } catch (err) {
-    console.error('Signup error:', err);
-    res.status(500).json({ error: err.message || "Internal error during sign-up." });
+    console.error('Signup error:', err.message);
+    return res.status(500).json({ error: 'Signup failed. Please try again.' });
   }
 });
 // Agent registration - same as signup but sets role to 'agent'
@@ -176,15 +191,18 @@ app.post('/api/auth/agent-register', async (req, res) => {
     } catch (emailErr) {
       console.error('Admin notification error:', emailErr.message);
     }
-    res.status(201).json({
-      user: { id: data.user.id, email: data.user.email, role: 'agent' },
-      token: data.session?.access_token || null,
-      confirmationRequired: !data.session,
+    const userId    = data?.user?.id    || null;
+    const userEmail  = data?.user?.email  || email;
+    const hasSession = !!data?.session;
+    return res.status(201).json({
+      user: userId ? { id: userId, email: userEmail, role: 'agent' } : null,
+      token: data?.session?.access_token || null,
+      confirmationRequired: !hasSession,
     });
   } catch (err) {
-    console.error('Agent register error:', err);
-    res.status(500).json({ error: err.message || 'Internal error during agent registration.' });
   }
+    console.error('Agent register error:', err.message);
+    return res.status(500).json({ error: 'Agent registration failed. Please try again.' });
 });
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
