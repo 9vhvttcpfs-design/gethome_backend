@@ -168,7 +168,6 @@ app.post('/api/auth/signup', async (req, res) => {
     return res.status(400).json({ error: 'Disposable email addresses are not allowed.' });
   }
   try {
-    // Use signUp with options to control email behavior
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
@@ -209,8 +208,8 @@ app.post('/api/auth/signup', async (req, res) => {
         if (found) finalUserId = found.id;
       } catch (lookupErr) {
         console.error('User lookup error (non-blocking):', lookupErr.message);
-    }
       }
+    }
     // Create profile - non-blocking
     if (finalUserId) {
       supabase.from('profiles')
@@ -493,9 +492,9 @@ app.put('/api/properties/:id', async (req, res) => {
     if (!data || data.length === 0) return res.status(404).json({ error: "Property not found." });
     res.status(200).json(data[0]);
   } catch (err) {
+  }
     console.error("Error updating property:", err.message);
     res.status(500).json({ error: err.message });
-  }
 });
 // DELETE /api/properties/:id  — permanently remove a listing
 app.delete('/api/properties/:id', async (req, res) => {
@@ -640,8 +639,7 @@ NEXT STEPS----------
   `.trim();
   try {
     // Notify admin
- Proxy Inspection Booked — ${property_title} (Ref: ${reference})`, body);
-    await sendAdminEmail(`
+    await sendAdminEmail(` Proxy Inspection Booked — ${property_title} (Ref: ${reference})`, body);
     // Send customer confirmation email
     await sendCustomerEmail(
       user_email,
