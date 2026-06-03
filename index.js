@@ -37,6 +37,11 @@ const transporter = nodemailer.createTransport({
     user: process.env.SMTP_USER || 'resend',
     pass: process.env.SMTP_PASS,
   },
+  tls: {
+    rejectUnauthorized: false,
+  },
+  debug: true,
+  logger: true,
 });
 // Send email to admin
 async function sendAdminEmail(subject, text) {
@@ -97,6 +102,30 @@ async function sendSMS(phone, message) {
 // ──────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'GetHome Backend is LIVE', timestamp: new Date().toISOString() });
+});
+// Test email endpoint - visit /test-email?to=youremail@gmail.com to test
+app.get('/test-email', async (req, res) => {
+  const to = req.query.to;
+  if (!to) return res.status(400).json({ error: 'Add ?to=youremail@gmail.com to the URL' });
+  try {
+    console.log('Testing email to:', to);
+    console.log('SMTP config:', {
+      host: process.env.SMTP_HOST || 'smtp.resend.com',
+      port: process.env.SMTP_PORT || 465,
+      user: process.env.SMTP_USER || 'resend',
+      passSet: !!process.env.SMTP_PASS,
+    });
+    await transporter.sendMail({
+      from: `"GetHome" <${process.env.SMTP_USER || 'noreply@trygethome.online'}>`,
+      to,
+      subject: 'GetHome Email Test',
+      text: 'This is a test email from GetHome backend. If you see this, email is working!',
+    });
+    res.json({ success: true, message: 'Test email sent to ' + to });
+  } catch (err) {
+    console.error('Test email error:', err);
+    res.status(500).json({ success: false, error: err.message, code: err.code, smtp: { host: process.env.SMTP_HOST, port: process.env.SMTP_PORT, user: process.env.SMTP_USER, passSet: !!process.env.SMTP_PASS } });
+  }
 });
 // Self-ping every 14 minutes to prevent Render free tier sleep
 setInterval(function() {
@@ -165,8 +194,8 @@ app.post('/api/auth/signup', async (req, res) => {
         if (found) finalUserId = found.id;
       } catch (lookupErr) {
         console.error('User lookup error (non-blocking):', lookupErr.message);
-    }
       }
+    }
     // Create profile - non-blocking
     if (finalUserId) {
       supabase.from('profiles')
@@ -231,15 +260,50 @@ app.post('/api/auth/agent-register', async (req, res) => {
     } catch (profileErr) {
       console.error('Agent profile error:', profileErr.message);
     }
+    // Send welcome email to agent with WhatsApp link for account approval
+    const agentWhatsAppMsg = encodeURIComponent(
+      `Hello GetHome, I just registered as an agent with this email: ${email}. Please activate my agent account.`
+    );
+    const agentWhatsAppLink = `https://wa.me/${process.env.WHATSAPP_NUMBER || "2349077246534"}?text=${agentWhatsAppMsg}`;
+    setImmediate(async function() {
+      try {
+        await sendCustomerEmail(
+          email,
+          'GetHome Agent Registration - Next Steps',
+          `Hello!
+Thank you for registering as a GetHome agent.
+Your account has been created successfully. To activate your agent account and start listing properties, please verify your email first, then contact us on WhatsApp:
+ACTIVATE YOUR ACCOUNT:
+Click this link to message us on WhatsApp:
+${agentWhatsAppLink}
+Or open WhatsApp and message: +${process.env.WHATSAPP_NUMBER || "2349077246534"}
+Tell us: "I just registered as an agent with email: ${email}"
+Once we verify your details, your agent access will be approved and you can start uploading listings.
+WHAT HAPPENS NEXT:
+1. Verify your email (check your inbox for a confirmation link)
+2. Message us on WhatsApp with your registered email
+3. We approve your account within 24 hours
+4. You can then log in and start listing properties
+Questions? WhatsApp: +${process.env.WHATSAPP_NUMBER || "2349077246534"}
+The GetHome Team
+trygethome.online`
+        );
+        console.log('Agent welcome email sent to:', email);
+      } catch (emailErr) {
+        console.error('Agent welcome email error:', emailErr.message);
+      }
+    });
     // Notify admin of new agent registration
-    try {
-      await sendAdminEmail(
-        'New Agent Registration - GetHome',
-        `A new agent has registered:\n\nEmail: ${email}\nTime: ${new Date().toISOString()}\n\nPlease review and verify this agent account.`
-      );
-    } catch (emailErr) {
-      console.error('Admin notification error:', emailErr.message);
-    }
+    setImmediate(async function() {
+      try {
+        await sendAdminEmail(
+          'New Agent Registration - GetHome',
+          `A new agent has registered:\n\nEmail: ${email}\nTime: ${new Date().toISOString()}\n\nPlease review and approve this agent account.`
+        );
+      } catch (emailErr) {
+        console.error('Admin notification error:', emailErr.message);
+      }
+    });
     const userId    = data?.user?.id    || null;
     const userEmail  = data?.user?.email  || email;
     const hasSession = !!data?.session;
@@ -567,7 +631,8 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report
+- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
