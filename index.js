@@ -37,38 +37,56 @@ const transporter = nodemailer.createTransport({
     user: process.env.SMTP_USER || 'resend',
     pass: process.env.SMTP_PASS,
   },
-  tls: {
-    rejectUnauthorized: false,
-  },
-  debug: true,
-  logger: true,
+  tls: { rejectUnauthorized: false },
 });
 // Send email to admin
 async function sendAdminEmail(subject, text) {
-  await transporter.sendMail({
-    from:    `"GetHome Platform" <${process.env.SMTP_USER}>`,
-    to:      process.env.ADMIN_EMAIL,
-    subject,
-    text,
-  });
+  if (!process.env.ADMIN_EMAIL) return;
+  await sendCustomerEmail(process.env.ADMIN_EMAIL, subject, text);
 }
 // Send email to customer - never blocks main flow
 async function sendCustomerEmail(to, subject, text) {
-  if (!to || !process.env.SMTP_PASS) {
-    console.log('Email skipped - no recipient or SMTP not configured');
-    return;
+  if (!to) { console.log('Email skipped - no recipient'); return; }
+  const resendKey = process.env.RESEND_API_KEY || process.env.SMTP_PASS;
+  // Try Resend HTTP API first (most reliable)
+  if (resendKey) {
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${resendKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: `GetHome <${process.env.SMTP_FROM || 'noreply@trygethome.online'}>`,
+          to: [to],
+          subject,
+          text,
+        }),
+      });
+      const result = await response.json();
+      if (response.ok) {
+        console.log('Email sent via Resend API to:', to, '| ID:', result.id);
+        return;
+      }
+      console.error('Resend API error:', result);
+    } catch (err) {
+      console.error('Resend API failed, trying SMTP:', err.message);
+    }
   }
-  try {
-    await transporter.sendMail({
-      from:    `"GetHome" <${process.env.SMTP_USER || 'noreply@trygethome.online'}>`,
-      to,
-      subject,
-      text,
-    });
-    console.log(`Email sent to ${to}`);
-  } catch (err) {
-    console.error(`Email failed to ${to}:`, err.message);
-    // Never rethrow - email failures must never break user flows
+  // Fallback to SMTP
+  if (process.env.SMTP_PASS) {
+    try {
+      await transporter.sendMail({
+        from: `"GetHome" <${process.env.SMTP_USER || 'noreply@trygethome.online'}>`,
+        to, subject, text,
+      });
+      console.log('Email sent via SMTP to:', to);
+    } catch (err) {
+      console.error('SMTP also failed:', err.message);
+    }
+  } else {
+    console.log('No email credentials configured - skipping email to:', to);
   }
 }
 // Send SMS via Termii
@@ -228,8 +246,8 @@ The GetHome Team`
     });
   } catch (err) {
     console.error('Signup error:', err.message);
-    return res.status(500).json({ error: 'Signup failed. Please try again.' });
   }
+    return res.status(500).json({ error: 'Signup failed. Please try again.' });
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
@@ -473,8 +491,8 @@ app.put('/api/properties/:id', async (req, res) => {
     res.status(200).json(data[0]);
   } catch (err) {
     console.error("Error updating property:", err.message);
-    res.status(500).json({ error: err.message });
   }
+    res.status(500).json({ error: err.message });
 });
 // DELETE /api/properties/:id  — permanently remove a listing
 app.delete('/api/properties/:id', async (req, res) => {
@@ -631,8 +649,7 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report
-- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
@@ -732,9 +749,9 @@ app.get('/api/agent/listing-count/:userId', async (req, res) => {
     if (error) throw error;
     res.status(200).json({ count: count || 0 });
   } catch (err) {
+  }
     console.error('Listing count error:', err.message);
     res.status(500).json({ error: err.message });
-  }
 });
 // ──────────────────────────────────────────────────────────
 // START SERVER
