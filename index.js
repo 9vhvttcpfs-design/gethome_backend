@@ -121,20 +121,36 @@ app.post('/api/auth/signup', async (req, res) => {
     return res.status(400).json({ error: 'Disposable email addresses are not allowed.' });
   }
   try {
-    const { data, error } = await supabase.auth.signUp({ email, password });
-    // Handle Supabase email errors gracefully
-    // "Error sending confirmation email" means user WAS created but Supabase
-    // could not send its verification email - treat as success
+    // Use signUp with options to control email behavior
+    const signUpOptions = {
+      email,
+      password,
+      options: {
+        // Let Supabase handle email confirmation via its dashboard settings
+        // If email confirmation is OFF in Supabase dashboard, session is returned immediately
+        emailRedirectTo: undefined,
+      }
+    };
+    const { data, error } = await supabase.auth.signUp(signUpOptions);
+    // Handle errors - ignore email-related errors since user is still created
     if (error) {
-      const isEmailError = error.message.toLowerCase().includes('sending') ||
-                           error.message.toLowerCase().includes('email') ||
-                           error.message.toLowerCase().includes('confirmation');
+      const errMsg = error.message.toLowerCase();
+      const isEmailError = errMsg.includes('sending') ||
+                           errMsg.includes('confirmation') ||
+                           errMsg.includes('smtp') ||
+                           errMsg.includes('email rate') ||
+                           errMsg.includes('not send');
+      const isAlreadyExists = errMsg.includes('already registered') ||
+                               errMsg.includes('already exists') ||
+                               errMsg.includes('user already');
+      if (isAlreadyExists) {
+        return res.status(400).json({ error: 'An account with this email already exists. Please log in instead.' });
+      }
       if (!isEmailError) {
-        // Real errors like "User already registered" should still be returned
         return res.status(400).json({ error: error.message });
       }
-      // Email send error - log it but continue, user was likely created
-      console.error('Supabase email error (non-blocking):', error.message);
+      // Email error - log and continue, account was created
+      console.error('Supabase email error (account still created):', error.message);
     }
     // Safely get user info - data.user may be null if email error occurred
     const userId    = data?.user?.id    || null;
@@ -149,8 +165,8 @@ app.post('/api/auth/signup', async (req, res) => {
         if (found) finalUserId = found.id;
       } catch (lookupErr) {
         console.error('User lookup error (non-blocking):', lookupErr.message);
-      }
     }
+      }
     // Create profile - non-blocking
     if (finalUserId) {
       supabase.from('profiles')
@@ -519,8 +535,7 @@ A customer has paid for a GetHome Proxy Inspection.
 Please schedule a site visit within 24 hours.
 Paystack Reference : ${reference}
 Amount Paid (₦)    : ₦${Number(amount_naira).toLocaleString('en-NG')}
-CUSTOMER
---------
+CUSTOMER--------
 Email : ${user_email || 'N/A'}
 PROPERTY--------
 Listing ID : ${property_id}
@@ -552,8 +567,7 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector
-- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
