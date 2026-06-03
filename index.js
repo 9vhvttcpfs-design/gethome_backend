@@ -169,16 +169,13 @@ app.post('/api/auth/signup', async (req, res) => {
   }
   try {
     // Use signUp with options to control email behavior
-    const signUpOptions = {
+    const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
-        // Let Supabase handle email confirmation via its dashboard settings
-        // If email confirmation is OFF in Supabase dashboard, session is returned immediately
-        emailRedirectTo: undefined,
-      }
-    };
-    const { data, error } = await supabase.auth.signUp(signUpOptions);
+        emailRedirectTo: 'https://trygethome.online',
+      },
+    });
     // Handle errors - ignore email-related errors since user is still created
     if (error) {
       const errMsg = error.message.toLowerCase();
@@ -212,8 +209,8 @@ app.post('/api/auth/signup', async (req, res) => {
         if (found) finalUserId = found.id;
       } catch (lookupErr) {
         console.error('User lookup error (non-blocking):', lookupErr.message);
-      }
     }
+      }
     // Create profile - non-blocking
     if (finalUserId) {
       supabase.from('profiles')
@@ -246,8 +243,8 @@ The GetHome Team`
     });
   } catch (err) {
     console.error('Signup error:', err.message);
-  }
     return res.status(500).json({ error: 'Signup failed. Please try again.' });
+  }
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
@@ -261,7 +258,13 @@ app.post('/api/auth/agent-register', async (req, res) => {
     return res.status(400).json({ error: 'Disposable email addresses are not allowed. Please use a real email.' });
   }
   try {
-    const { data, error } = await supabase.auth.signUp({ email, password });
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        emailRedirectTo: 'https://trygethome.online',
+      },
+    });
     // Handle Supabase email errors - user may still be created
     if (error) {
       const isEmailError = error.message.toLowerCase().includes('sending') ||
@@ -491,8 +494,8 @@ app.put('/api/properties/:id', async (req, res) => {
     res.status(200).json(data[0]);
   } catch (err) {
     console.error("Error updating property:", err.message);
-  }
     res.status(500).json({ error: err.message });
+  }
 });
 // DELETE /api/properties/:id  — permanently remove a listing
 app.delete('/api/properties/:id', async (req, res) => {
@@ -637,7 +640,8 @@ NEXT STEPS----------
   `.trim();
   try {
     // Notify admin
-    await sendAdminEmail(` Proxy Inspection Booked — ${property_title} (Ref: ${reference})`, body);
+ Proxy Inspection Booked — ${property_title} (Ref: ${reference})`, body);
+    await sendAdminEmail(`
     // Send customer confirmation email
     await sendCustomerEmail(
       user_email,
@@ -749,9 +753,9 @@ app.get('/api/agent/listing-count/:userId', async (req, res) => {
     if (error) throw error;
     res.status(200).json({ count: count || 0 });
   } catch (err) {
-  }
     console.error('Listing count error:', err.message);
     res.status(500).json({ error: err.message });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // START SERVER
