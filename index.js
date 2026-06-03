@@ -122,15 +122,39 @@ app.post('/api/auth/signup', async (req, res) => {
   }
   try {
     const { data, error } = await supabase.auth.signUp({ email, password });
-    if (error) return res.status(400).json({ error: error.message });
-    // Safely get user info - data.user may be null if email confirmation pending
-    const userId   = data?.user?.id   || null;
+    // Handle Supabase email errors gracefully
+    // "Error sending confirmation email" means user WAS created but Supabase
+    // could not send its verification email - treat as success
+    if (error) {
+      const isEmailError = error.message.toLowerCase().includes('sending') ||
+                           error.message.toLowerCase().includes('email') ||
+                           error.message.toLowerCase().includes('confirmation');
+      if (!isEmailError) {
+        // Real errors like "User already registered" should still be returned
+        return res.status(400).json({ error: error.message });
+      }
+      // Email send error - log it but continue, user was likely created
+      console.error('Supabase email error (non-blocking):', error.message);
+    }
+    // Safely get user info - data.user may be null if email error occurred
+    const userId    = data?.user?.id    || null;
     const userEmail = data?.user?.email || email;
     const hasSession = !!data?.session;
+    // If user was not returned due to email error, try to fetch them
+    let finalUserId = userId;
+    if (!finalUserId) {
+      try {
+        const { data: listData } = await supabase.auth.admin.listUsers();
+        const found = listData?.users?.find(u => u.email === email);
+        if (found) finalUserId = found.id;
+      } catch (lookupErr) {
+        console.error('User lookup error (non-blocking):', lookupErr.message);
+      }
+    }
     // Create profile - non-blocking
-    if (userId) {
+    if (finalUserId) {
       supabase.from('profiles')
-        .upsert([{ id: userId, role: 'customer' }], { onConflict: 'id' })
+        .upsert([{ id: finalUserId, role: 'customer' }], { onConflict: 'id' })
         .then(() => console.log('Profile created for:', userEmail))
         .catch(e  => console.error('Profile error (non-blocking):', e.message));
     }
@@ -153,7 +177,7 @@ The GetHome Team`
     });
     // Always respond successfully - email sending never blocks this
     return res.status(201).json({
-      user:  userId ? { id: userId, email: userEmail, role: 'customer' } : null,
+      user:  finalUserId ? { id: finalUserId, email: userEmail, role: 'customer' } : null,
       token: data?.session?.access_token || null,
       confirmationRequired: !hasSession,
     });
@@ -175,7 +199,16 @@ app.post('/api/auth/agent-register', async (req, res) => {
   }
   try {
     const { data, error } = await supabase.auth.signUp({ email, password });
-    if (error) return res.status(400).json({ error: error.message });
+    // Handle Supabase email errors - user may still be created
+    if (error) {
+      const isEmailError = error.message.toLowerCase().includes('sending') ||
+                           error.message.toLowerCase().includes('email') ||
+                           error.message.toLowerCase().includes('confirmation');
+      if (!isEmailError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error('Supabase email error for agent (non-blocking):', error.message);
+    }
     // Set role to 'agent' in profiles table
     try {
       await supabase.from('profiles').upsert([{ id: data.user.id, role: 'agent' }], { onConflict: 'id' });
@@ -200,9 +233,9 @@ app.post('/api/auth/agent-register', async (req, res) => {
       confirmationRequired: !hasSession,
     });
   } catch (err) {
-  }
     console.error('Agent register error:', err.message);
     return res.status(500).json({ error: 'Agent registration failed. Please try again.' });
+  }
 });
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
@@ -486,7 +519,8 @@ A customer has paid for a GetHome Proxy Inspection.
 Please schedule a site visit within 24 hours.
 Paystack Reference : ${reference}
 Amount Paid (₦)    : ₦${Number(amount_naira).toLocaleString('en-NG')}
-CUSTOMER--------
+CUSTOMER
+--------
 Email : ${user_email || 'N/A'}
 PROPERTY--------
 Listing ID : ${property_id}
@@ -518,7 +552,8 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector
+- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
