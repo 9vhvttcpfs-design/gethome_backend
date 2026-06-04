@@ -324,12 +324,12 @@ app.post('/api/auth/signup', async (req, res) => {
         console.error('User lookup error (non-blocking):', lookupErr.message);
       }
     }
-    // Create profile - non-blocking
+    // Create customer profile with explicit role and status
     if (finalUserId) {
       supabase.from('profiles')
-        .upsert([{ id: finalUserId, role: 'customer' }], { onConflict: 'id' })
-        .then(() => console.log('Profile created for:', userEmail))
-        .catch(e  => console.error('Profile error (non-blocking):', e.message));
+        .upsert([{ id: finalUserId, role: 'customer', status: 'approved' }], { onConflict: 'id' })
+        .then(() => console.log('Customer profile created for:', userEmail))
+        .catch(e => console.error('Profile error (non-blocking):', e.message));
     }
     // Send welcome email - completely non-blocking, never affects response
     setImmediate(async function() {
@@ -392,11 +392,18 @@ app.post('/api/auth/agent-register', async (req, res) => {
       }
       console.error('Supabase email error for agent (non-blocking):', error.message);
     }
-    // Set role to 'agent' in profiles table
-    try {
-      await supabase.from('profiles').upsert([{ id: data.user.id, role: 'agent' }], { onConflict: 'id' });
-    } catch (profileErr) {
-      console.error('Agent profile error:', profileErr.message);
+    // Set role=agent and status=pending explicitly in profiles table
+    const agentUserId = data?.user?.id || null;
+    if (agentUserId) {
+      try {
+        const { error: profileErr } = await supabase
+          .from('profiles')
+          .upsert([{ id: agentUserId, role: 'agent', status: 'pending' }], { onConflict: 'id' });
+        if (profileErr) console.error('Agent profile error:', profileErr.message);
+        else console.log('Agent profile created: role=agent, status=pending for', email);
+      } catch (profileErr) {
+        console.error('Agent profile upsert failed:', profileErr.message);
+      }
     }
     // Send welcome email to agent with WhatsApp link for account approval
     const agentWhatsAppMsg = encodeURIComponent(
@@ -437,8 +444,8 @@ https://trygethome.online`
           `A new agent has registered:\n\nEmail: ${email}\nTime: ${new Date().toISOString()}\n\nPlease review and approve this agent account.`
         );
       } catch (emailErr) {
-      }
         console.error('Admin notification error:', emailErr.message);
+      }
     });
     const userId    = data?.user?.id    || null;
     const userEmail  = data?.user?.email  || email;
@@ -485,8 +492,11 @@ app.post('/api/auth/login', async (req, res) => {
     } catch {
       // profiles table may not exist yet - default to customer
     }
+    // If agent is pending - return special flag so frontend can block login
+    const isPendingAgent = role === 'agent' && status === 'pending';
     res.status(200).json({
       user:  { id: data.user.id, email: data.user.email, role, status, is_unlimited },
+      pendingAgent: isPendingAgent,
       token: data.session?.access_token,
     });
   } catch (err) { res.status(500).json({ error: "Internal error during login." }); }
@@ -752,8 +762,7 @@ DELIVERABLE TO CUSTOMER-----------------------
   • Video walkthrough of all rooms + structure
   • Written defect / condition report
   • Delivered within 48 hours of booking
-NEXT STEPS
-----------
+NEXT STEPS----------
   1. Assign a field inspector to this property.
   2. Coordinate access with the listing agent.
   3. Record and edit the inspection video.
