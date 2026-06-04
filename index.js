@@ -165,6 +165,100 @@ app.get('/test-email', async (req, res) => {
     res.status(500).json({ success: false, error: err.message, code: err.code, smtp: { host: process.env.SMTP_HOST, port: process.env.SMTP_PORT, user: process.env.SMTP_USER, passSet: !!process.env.SMTP_PASS } });
   }
 });
+// ──────────────────────────────────────────────────────────
+// ADMIN ENDPOINTS
+// ──────────────────────────────────────────────────────────
+// Get all agents (admin only)
+app.get('/api/admin/agents', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    // Verify admin role
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+    if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    // Fetch all agents with their profile info
+    const { data: agents, error } = await supabase
+      .from('profiles')
+      .select('id, role, status, is_unlimited, created_at')
+      .eq('role', 'agent')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    // Get emails from auth.users for each agent
+    const agentsWithEmail = await Promise.all((agents || []).map(async function(agent) {
+      try {
+        const { data: authUser } = await supabase.auth.admin.getUserById(agent.id);
+        return Object.assign({}, agent, { email: authUser?.user?.email || 'Unknown' });
+      } catch (e) {
+        return Object.assign({}, agent, { email: 'Unknown' });
+      }
+    }));
+    res.json(agentsWithEmail);
+  } catch (err) {
+    console.error('Fetch agents error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// Approve agent (admin only)
+app.post('/api/admin/approve-agent', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+    if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { agentId } = req.body;
+    if (!agentId) return res.status(400).json({ error: 'agentId required' });
+    const { error } = await supabase.from('profiles').update({ status: 'approved' }).eq('id', agentId);
+    if (error) throw error;
+    // Get agent email to notify them
+    try {
+      const { data: authUser } = await supabase.auth.admin.getUserById(agentId);
+      const agentEmail = authUser?.user?.email;
+      if (agentEmail) {
+        setImmediate(async function() {
+          try {
+            await sendCustomerEmail(
+              agentEmail,
+              'Your GetHome Agent Account Has Been Approved!',
+              `Congratulations!
+Your GetHome agent account has been approved. You can now log in and start listing properties.
+Sign in here: https://trygethome.online
+Welcome to the GetHome agent network!
+The GetHome Team
+https://trygethome.online`
+            );
+          } catch (e) { console.error('Approval email error:', e.message); }
+        });
+      }
+    } catch (e) { console.error('Could not send approval email:', e.message); }
+    res.json({ success: true, message: 'Agent approved successfully' });
+  } catch (err) {
+    console.error('Approve agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// Reject agent (admin only)
+app.post('/api/admin/reject-agent', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+    if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { agentId } = req.body;
+    if (!agentId) return res.status(400).json({ error: 'agentId required' });
+    const { error } = await supabase.from('profiles').update({ status: 'rejected' }).eq('id', agentId);
+    if (error) throw error;
+    res.json({ success: true, message: 'Agent rejected' });
+  } catch (err) {
+    console.error('Reject agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // Self-ping every 14 minutes to prevent Render free tier sleep
 setInterval(function() {
   try {
@@ -249,8 +343,7 @@ VERIFY YOUR EMAIL:
 Please check your inbox for a separate verification email from GetHome and click the confirmation link inside it.
 Once verified, sign in to your account here:
 https://trygethome.online
-On the GetHome app you can:
-- Browse verified properties with full fee breakdown- Book inspections- Secure listings with escrow protection
+On the GetHome app you can:- Browse verified properties with full fee breakdown- Book inspections- Secure listings with escrow protection
 Questions? WhatsApp us: https://wa.me/2349077246534
 The GetHome Team
 https://trygethome.online`
@@ -266,9 +359,9 @@ https://trygethome.online`
       confirmationRequired: !hasSession,
     });
   } catch (err) {
+  }
     console.error('Signup error:', err.message);
     return res.status(500).json({ error: 'Signup failed. Please try again.' });
-  }
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
@@ -344,8 +437,8 @@ https://trygethome.online`
           `A new agent has registered:\n\nEmail: ${email}\nTime: ${new Date().toISOString()}\n\nPlease review and approve this agent account.`
         );
       } catch (emailErr) {
-        console.error('Admin notification error:', emailErr.message);
       }
+        console.error('Admin notification error:', emailErr.message);
     });
     const userId    = data?.user?.id    || null;
     const userEmail  = data?.user?.email  || email;
@@ -606,8 +699,7 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT HAPPENS NEXT
------------------
+WHAT HAPPENS NEXT-----------------
 1. Our operations team has been notified.
 2. An inspection officer will be assigned to your property.
 3. We will contact you within 24 hours to confirm your inspection slot.
@@ -660,7 +752,8 @@ DELIVERABLE TO CUSTOMER-----------------------
   • Video walkthrough of all rooms + structure
   • Written defect / condition report
   • Delivered within 48 hours of booking
-NEXT STEPS----------
+NEXT STEPS
+----------
   1. Assign a field inspector to this property.
   2. Coordinate access with the listing agent.
   3. Record and edit the inspection video.
