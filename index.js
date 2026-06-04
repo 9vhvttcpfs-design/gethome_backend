@@ -323,6 +323,10 @@ app.post('/api/auth/signup', async (req, res) => {
       password,
       options: {
         emailRedirectTo: 'https://trygethome.online',
+        data: {
+          role: 'customer',
+          status: 'approved',
+        },
       },
     });
     // Handle errors - ignore email-related errors since user is still created
@@ -416,6 +420,10 @@ app.post('/api/auth/agent-register', async (req, res) => {
       password,
       options: {
         emailRedirectTo: 'https://trygethome.online',
+        data: {
+          role: 'agent',
+          status: 'pending',
+        },
       },
     });
     // Handle Supabase email errors - user may still be created
@@ -564,9 +572,9 @@ app.get('/api/auth/me', async (req, res) => {
     } catch { /* profiles table not set up yet — safe default */ }
     res.status(200).json({ user: { id: user.id, email: user.email, role } });
   } catch (err) {
-  }
     console.error('/api/auth/me error:', err.message);
     res.status(500).json({ error: "Internal error fetching user profile." });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // PROPERTIES
@@ -726,8 +734,7 @@ Title      : ${property_title}
 Location   : ${property_location}
 ADD-ON SERVICES OPTED IN-------------------------
 ${addOnLines}
-REVENUE SUMMARY FOR THIS TRANSACTION
--------------------------------------
+REVENUE SUMMARY FOR THIS TRANSACTION-------------------------------------
   Escrow Processing Fee (kept by platform) : ₦${Number(escrow_fee_naira || 0).toLocaleString('en-NG')}
   Cleaning commission (if opted in)        : ₦${add_ons.cleaning   ? '12,000' : '0'}
   Relocation commission (if opted in)      : ₦${add_ons.relocation ? '30,000' : '0'}
@@ -794,7 +801,8 @@ A customer has paid for a GetHome Proxy Inspection.
 Please schedule a site visit within 24 hours.
 Paystack Reference : ${reference}
 Amount Paid (₦)    : ₦${Number(amount_naira).toLocaleString('en-NG')}
-CUSTOMER--------
+CUSTOMER
+--------
 Email : ${user_email || 'N/A'}
 PROPERTY--------
 Listing ID : ${property_id}
@@ -826,7 +834,8 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector
+- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
@@ -867,8 +876,7 @@ Paystack Reference : ${reference}
 Agent Email        : ${agent_email}
 New Tier           : ${t.label}
 Listing Limit      : ${t.limit} active listings
-ACTION REQUIRED
----------------
+ACTION REQUIRED---------------
   1. Update this agent's tier in your admin records.
   2. If Agency plan: set up their dedicated Agency Profile page.
   3. Send a welcome email confirming their new plan.
@@ -909,8 +917,8 @@ app.post('/api/legal/accept', async (req, res) => {
     res.status(200).json({ success: true });
   } catch (err) {
     console.error('Legal acceptance error:', err.message);
-  }
     res.status(500).json({ error: err.message });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // AGENT LISTING COUNT
