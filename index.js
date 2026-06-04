@@ -376,18 +376,24 @@ app.post('/api/auth/login', async (req, res) => {
     // Expected schema: profiles(id uuid references auth.users, role text)
     // Role values: 'customer' (default), 'agent', 'admin'
     let role = 'customer';
+    let status = 'approved';
+    let is_unlimited = false;
     try {
       const { data: profile } = await supabase
         .from('profiles')
-        .select('role')
+        .select('role, status, is_unlimited')
         .eq('id', data.user.id)
         .single();
       if (profile?.role) role = profile.role;
+      if (profile?.status) status = profile.status;
+      if (profile?.is_unlimited) is_unlimited = profile.is_unlimited;
+      // Admins are always approved
+      if (role === 'admin') status = 'approved';
     } catch {
-      // profiles table may not exist yet — default to 'customer', no crash
+      // profiles table may not exist yet - default to customer
     }
     res.status(200).json({
-      user:  { id: data.user.id, email: data.user.email, role },
+      user:  { id: data.user.id, email: data.user.email, role, status, is_unlimited },
       token: data.session?.access_token,
     });
   } catch (err) { res.status(500).json({ error: "Internal error during login." }); }
@@ -600,7 +606,8 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT HAPPENS NEXT-----------------
+WHAT HAPPENS NEXT
+-----------------
 1. Our operations team has been notified.
 2. An inspection officer will be assigned to your property.
 3. We will contact you within 24 hours to confirm your inspection slot.
@@ -674,8 +681,7 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure
-- Written condition and defect report- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
