@@ -166,6 +166,36 @@ app.get('/test-email', async (req, res) => {
   }
 });
 // ──────────────────────────────────────────────────────────
+// VIDEO UPLOAD
+// ──────────────────────────────────────────────────────────
+const multer = require('multer');
+const uploadMiddleware = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
+  fileFilter: function(req, file, cb) {
+    if (file.mimetype.startsWith('video/')) cb(null, true);
+    else cb(new Error('Only video files are allowed'));
+  }
+});
+app.post('/api/upload-video', uploadMiddleware.single('video'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No video file provided' });
+  try {
+    const fileName = `videos/${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+    const { data, error } = await supabase.storage
+      .from('property-media')
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false,
+      });
+    if (error) throw error;
+    const { data: urlData } = supabase.storage.from('property-media').getPublicUrl(fileName);
+    res.json({ url: urlData.publicUrl });
+  } catch (err) {
+    console.error('Video upload error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
 // ADMIN ENDPOINTS
 // ──────────────────────────────────────────────────────────
 // Get all agents (admin only)
@@ -211,8 +241,14 @@ app.post('/api/admin/approve-agent', async (req, res) => {
     if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { agentId } = req.body;
     if (!agentId) return res.status(400).json({ error: 'agentId required' });
-    const { error } = await supabase.from('profiles').update({ status: 'approved' }).eq('id', agentId);
+    // Update status to approved - this instantly unlocks the agent on next login
+    const { error } = await supabase
+      .from('profiles')
+      .update({ status: 'approved' })
+      .eq('id', agentId)
+      .eq('role', 'agent'); // Safety: only update agents, never customers/admins
     if (error) throw error;
+    console.log('Agent approved:', agentId);
     // Get agent email to notify them
     try {
       const { data: authUser } = await supabase.auth.admin.getUserById(agentId);
@@ -359,9 +395,9 @@ https://trygethome.online`
       confirmationRequired: !hasSession,
     });
   } catch (err) {
-  }
     console.error('Signup error:', err.message);
     return res.status(500).json({ error: 'Signup failed. Please try again.' });
+  }
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
@@ -528,9 +564,9 @@ app.get('/api/auth/me', async (req, res) => {
     } catch { /* profiles table not set up yet — safe default */ }
     res.status(200).json({ user: { id: user.id, email: user.email, role } });
   } catch (err) {
+  }
     console.error('/api/auth/me error:', err.message);
     res.status(500).json({ error: "Internal error fetching user profile." });
-  }
 });
 // ──────────────────────────────────────────────────────────
 // PROPERTIES
@@ -579,19 +615,23 @@ app.post('/api/upload-image', async (req, res) => {
   }
 });
 app.post('/api/properties', async (req, res) => {
-  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
+  const { title, location, price, image_url, video_url, description, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
     const { data, error } = await supabase.from('properties').insert([{
       title,
       location,
+      description:    description                || null,
       price:          parseFloat(price)          || 0,
       image_url:      image_url                  || null,
+      video_url:      video_url                  || null,
       rent:           parseFloat(rent)           || parseFloat(price) || 0,
       agency_fee:     parseFloat(agency_fee)     || 0,
       agreement_fee:  parseFloat(agreement_fee)  || 0,
       caution_fee:    parseFloat(caution_fee)    || 0,
       service_charge: parseFloat(service_charge) || 0,
+      is_featured:    is_featured === true || is_featured === 'true' || false,
+      created_by:     created_by || null,
     }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
@@ -600,7 +640,7 @@ app.post('/api/properties', async (req, res) => {
 // PUT /api/properties/:id  — update an existing listing
 app.put('/api/properties/:id', async (req, res) => {
   const { id } = req.params;
-  const { title, location, price, image_url, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
+  const { title, location, price, image_url, video_url, description, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
   if (!title || !location || !price) {
     return res.status(400).json({ error: "title, location, and price are required." });
   }
@@ -612,6 +652,8 @@ app.put('/api/properties/:id', async (req, res) => {
         location,
         price:          parseFloat(price)          || 0,
         image_url:      image_url                  || null,
+        video_url:      video_url                  || null,
+        description:    description                || null,
         rent:           parseFloat(rent)           || parseFloat(price) || 0,
         agency_fee:     parseFloat(agency_fee)     || 0,
         agreement_fee:  parseFloat(agreement_fee)  || 0,
@@ -684,7 +726,8 @@ Title      : ${property_title}
 Location   : ${property_location}
 ADD-ON SERVICES OPTED IN-------------------------
 ${addOnLines}
-REVENUE SUMMARY FOR THIS TRANSACTION-------------------------------------
+REVENUE SUMMARY FOR THIS TRANSACTION
+-------------------------------------
   Escrow Processing Fee (kept by platform) : ₦${Number(escrow_fee_naira || 0).toLocaleString('en-NG')}
   Cleaning commission (if opted in)        : ₦${add_ons.cleaning   ? '12,000' : '0'}
   Relocation commission (if opted in)      : ₦${add_ons.relocation ? '30,000' : '0'}
@@ -824,7 +867,8 @@ Paystack Reference : ${reference}
 Agent Email        : ${agent_email}
 New Tier           : ${t.label}
 Listing Limit      : ${t.limit} active listings
-ACTION REQUIRED---------------
+ACTION REQUIRED
+---------------
   1. Update this agent's tier in your admin records.
   2. If Agency plan: set up their dedicated Agency Profile page.
   3. Send a welcome email confirming their new plan.
@@ -865,8 +909,8 @@ app.post('/api/legal/accept', async (req, res) => {
     res.status(200).json({ success: true });
   } catch (err) {
     console.error('Legal acceptance error:', err.message);
-    res.status(500).json({ error: err.message });
   }
+    res.status(500).json({ error: err.message });
 });
 // ──────────────────────────────────────────────────────────
 // AGENT LISTING COUNT
