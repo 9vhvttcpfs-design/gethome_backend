@@ -203,26 +203,42 @@ app.get('/api/admin/agents', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    // Verify admin role
+    // Verify caller is admin
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
-    const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
-    if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-    // Fetch all agents with their profile info
+    const { data: callerProfile } = await supabase
+      .from('profiles').select('role').eq('id', user.id).single();
+    if (callerProfile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    // Fetch ALL agents from profiles - all statuses (pending, approved, rejected)
     const { data: agents, error } = await supabase
       .from('profiles')
       .select('id, role, status, is_unlimited, created_at')
       .eq('role', 'agent')
       .order('created_at', { ascending: false });
-    if (error) throw error;
-    // Get emails from auth.users for each agent
+    if (error) {
+      console.error('Profiles fetch error:', error.message);
+      throw error;
+    }
+    console.log(`Fetched ${agents?.length || 0} agents from profiles table`);
+    // Try to get emails using admin API - requires service role key
+    // If service role not available, use anon key and get what we can
+    const supabaseAdmin = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL,
+          process.env.SUPABASE_SERVICE_KEY
+        )
+      : null;
     const agentsWithEmail = await Promise.all((agents || []).map(async function(agent) {
-      try {
-        const { data: authUser } = await supabase.auth.admin.getUserById(agent.id);
-        return Object.assign({}, agent, { email: authUser?.user?.email || 'Unknown' });
-      } catch (e) {
-        return Object.assign({}, agent, { email: 'Unknown' });
+      let email = 'Email unavailable';
+      if (supabaseAdmin) {
+        try {
+          const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(agent.id);
+          email = authUser?.user?.email || 'Email unavailable';
+        } catch (e) {
+          console.error('Email lookup failed for', agent.id, e.message);
+        }
       }
+      return Object.assign({}, agent, { email });
     }));
     res.json(agentsWithEmail);
   } catch (err) {
@@ -801,8 +817,7 @@ A customer has paid for a GetHome Proxy Inspection.
 Please schedule a site visit within 24 hours.
 Paystack Reference : ${reference}
 Amount Paid (₦)    : ₦${Number(amount_naira).toLocaleString('en-NG')}
-CUSTOMER
---------
+CUSTOMER--------
 Email : ${user_email || 'N/A'}
 PROPERTY--------
 Listing ID : ${property_id}
@@ -834,8 +849,7 @@ Reference    : ${reference}
 Property     : ${property_title}
 Location     : ${property_location}
 Amount Paid  : NGN ${Number(amount_naira).toLocaleString('en-NG')}
-WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector
-- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
+WHAT YOU WILL RECEIVE----------------------- A full physical site visit by a GetHome inspector- HD video walkthrough of all rooms and building structure- Written condition and defect report- Delivered to this email address within 48 hours
 You do not need to travel or be present. We handle everything.
 For any questions, contact us via WhatsApp: +2349077246534
 Thank you for choosing GetHome.
@@ -936,8 +950,8 @@ app.get('/api/agent/listing-count/:userId', async (req, res) => {
     res.status(200).json({ count: count || 0 });
   } catch (err) {
     console.error('Listing count error:', err.message);
-    res.status(500).json({ error: err.message });
   }
+    res.status(500).json({ error: err.message });
 });
 // ──────────────────────────────────────────────────────────
 // START SERVER
