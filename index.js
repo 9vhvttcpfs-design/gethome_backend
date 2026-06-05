@@ -203,14 +203,28 @@ app.get('/api/admin/agents', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    // Verify caller is admin
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
-    const { data: callerProfile } = await supabase
+    // Verify caller is admin using token
+    const { data: userData, error: authError } = await supabase.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) {
+      console.error('Admin auth error:', authError?.message);
+      return res.status(401).json({ error: 'Unauthorized - invalid token' });
+    }
+    // Check admin role using service key client if available, else anon
+    const adminClient = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: callerProfile, error: profileErr } = await adminClient
       .from('profiles').select('role').eq('id', user.id).single();
-    if (callerProfile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-    // Fetch ALL agents from profiles - all statuses (pending, approved, rejected)
-    const { data: agents, error } = await supabase
+    console.log('Admin check - user:', user.id, 'role:', callerProfile?.role, 'error:', profileErr?.message);
+    if (!callerProfile || callerProfile.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required. Your role: ' + (callerProfile?.role || 'unknown') });
+    }
+    // Fetch ALL agents - use adminClient to bypass RLS
+    const { data: agents, error } = await adminClient
       .from('profiles')
       .select('id, role, status, is_unlimited, created_at')
       .eq('role', 'agent')
@@ -235,9 +249,9 @@ app.get('/api/admin/agents', async (req, res) => {
           const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(agent.id);
           email = authUser?.user?.email || 'Email unavailable';
         } catch (e) {
-          console.error('Email lookup failed for', agent.id, e.message);
-        }
       }
+        }
+          console.error('Email lookup failed for', agent.id, e.message);
       return Object.assign({}, agent, { email });
     }));
     res.json(agentsWithEmail);
@@ -251,18 +265,25 @@ app.post('/api/admin/approve-agent', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    const { data: userData2, error: authError } = await supabase.auth.getUser(token);
+    const user = userData2?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
-    const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+    const adminClient2 = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: profile } = await adminClient2.from('profiles').select('role').eq('id', user.id).single();
     if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { agentId } = req.body;
     if (!agentId) return res.status(400).json({ error: 'agentId required' });
-    // Update status to approved - this instantly unlocks the agent on next login
-    const { error } = await supabase
+    // Update status using adminClient to bypass RLS
+    const { error } = await adminClient2
       .from('profiles')
       .update({ status: 'approved' })
       .eq('id', agentId)
-      .eq('role', 'agent'); // Safety: only update agents, never customers/admins
+      .eq('role', 'agent');
     if (error) throw error;
     console.log('Agent approved:', agentId);
     // Get agent email to notify them
@@ -297,13 +318,20 @@ app.post('/api/admin/reject-agent', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    const { data: userData3, error: authError } = await supabase.auth.getUser(token);
+    const user = userData3?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
-    const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+    const adminClient3 = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: profile } = await adminClient3.from('profiles').select('role').eq('id', user.id).single();
     if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { agentId } = req.body;
     if (!agentId) return res.status(400).json({ error: 'agentId required' });
-    const { error } = await supabase.from('profiles').update({ status: 'rejected' }).eq('id', agentId);
+    const { error } = await adminClient3.from('profiles').update({ status: 'rejected' }).eq('id', agentId);
     if (error) throw error;
     res.json({ success: true, message: 'Agent rejected' });
   } catch (err) {
@@ -415,9 +443,9 @@ https://trygethome.online`
       confirmationRequired: !hasSession,
     });
   } catch (err) {
+  }
     console.error('Signup error:', err.message);
     return res.status(500).json({ error: 'Signup failed. Please try again.' });
-  }
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
@@ -950,8 +978,8 @@ app.get('/api/agent/listing-count/:userId', async (req, res) => {
     res.status(200).json({ count: count || 0 });
   } catch (err) {
     console.error('Listing count error:', err.message);
-  }
     res.status(500).json({ error: err.message });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // START SERVER
