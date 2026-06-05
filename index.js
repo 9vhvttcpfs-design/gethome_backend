@@ -367,8 +367,8 @@ app.get('/api/admin/agents', async (req, res) => {
         } catch (e) {
           console.error('Email fallback lookup failed for', agent.id, e.message);
         }
-    }
       }));
+    }
     console.log('Returning', agentsWithEmail.length, 'agents to admin dashboard');
     res.json(agentsWithEmail);
   } catch (err) {
@@ -682,8 +682,8 @@ app.post('/api/auth/login', async (req, res) => {
       const msg = error.message.includes('Invalid login') ? 'Invalid email or password. Please try again.' :
                   error.message.includes('Email not confirmed') ? 'Please verify your email before logging in. Check your inbox.' :
                   error.message;
-    }
       return res.status(401).json({ error: msg });
+    }
     // Force fresh profile fetch - bypass any cache using service key if available
     let role = 'customer';
     let status = 'approved';
@@ -724,9 +724,9 @@ app.post('/api/auth/login', async (req, res) => {
       if (role === 'admin') status = 'approved';
       // CRITICAL: if agent status is still null/undefined, treat as pending not approved
       if (role === 'agent' && (!status || status === 'null')) {
-      }
         status = 'pending';
         console.log(`Agent ${email} has no status - treating as pending`);
+      }
     } catch (profileErr) {
       console.error('Profile fetch failed:', profileErr.message);
     }
