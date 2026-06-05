@@ -196,6 +196,108 @@ app.post('/api/upload-video', uploadMiddleware.single('video'), async (req, res)
   }
 });
 // ──────────────────────────────────────────────────────────
+// KYC DOCUMENT UPLOAD (Private bucket - admin read only)
+// ──────────────────────────────────────────────────────────
+const multerKYC = require('multer');
+const kycUpload = multerKYC({
+  storage: multerKYC.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: function(req, file, cb) {
+    var allowed = ['image/jpeg','image/png','image/webp','application/pdf'];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only images and PDFs allowed'));
+  }
+});
+app.post('/api/upload-kyc', kycUpload.single('file'), async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const { userId, fileName } = req.body;
+    const safeName = fileName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const filePath = `${userId || user.id}/${safeName}_${Date.now()}.${req.file.originalname.split('.').pop()}`;
+    // Upload to private KYC bucket - NOT public
+    const { data, error } = await supabase.storage
+      .from('agent-kyc-documents')
+      .upload(filePath, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false,
+      });
+    if (error) throw error;
+    // Return file path only - not a public URL (admin must use service key to view)
+    res.json({ url: filePath, path: data.path });
+  } catch (err) {
+    console.error('KYC upload error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// Agent submits verification data
+app.post('/api/agent/submit-verification', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { targetTier, phone, nin, selfieUrl, cacUrl, govIdUrl, propAuthUrl,
+            references, officeAddress, emergencyContact, guarantorInfo } = req.body;
+    const { error } = await supabase
+      .from('profiles')
+      .update({
+        phone,
+        nin_number: nin,
+        office_address: officeAddress || null,
+        emergency_contact: emergencyContact || null,
+        guarantor_info: guarantorInfo || null,
+        kyc_documents: { selfieUrl, cacUrl, govIdUrl, propAuthUrl },
+        references: references || [],
+        verification_requested_tier: targetTier,
+        verification_status: 'submitted',
+      })
+      .eq('id', user.id);
+    if (error) throw error;
+    // Notify admin
+    setImmediate(async function() {
+      try {
+        await sendAdminEmail(
+          'Agent Verification Submitted - GetHome',
+          `Agent ${user.email} has submitted verification documents for tier: ${targetTier}\n\nPlease review in the Admin Dashboard.`
+        );
+      } catch(e) { console.error('Admin notify error:', e.message); }
+    });
+    res.json({ success: true, message: 'Verification submitted successfully' });
+  } catch (err) {
+    console.error('Verification submit error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// Admin get signed URL for KYC document (service key required)
+app.post('/api/admin/kyc-url', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+    if (!process.env.SUPABASE_SERVICE_KEY) return res.status(500).json({ error: 'Service key not configured' });
+    const adminKYC = require('@supabase/supabase-js').createClient(
+      process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+      { auth: { autoRefreshToken: false, persistSession: false } }
+    );
+    const { data: callerP } = await adminKYC.from('profiles').select('role').eq('id', user.id).single();
+    if (callerP?.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    const { filePath } = req.body;
+    const { data, error } = await adminKYC.storage
+      .from('agent-kyc-documents')
+      .createSignedUrl(filePath, 300); // 5 min expiry
+    if (error) throw error;
+    res.json({ url: data.signedUrl });
+  } catch (err) {
+    console.error('KYC URL error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
 // ADMIN ENDPOINTS
 // ──────────────────────────────────────────────────────────
 // Get all agents (admin only)
@@ -226,7 +328,7 @@ app.get('/api/admin/agents', async (req, res) => {
     // Fetch ALL agents - use adminClient to bypass RLS
     const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('id, role, status, is_unlimited, created_at')
+      .select('id, role, status, is_unlimited, created_at, verification_level, verification_status, verification_requested_tier, nin_number, office_address, kyc_documents')
       .eq('role', 'agent')
       .order('created_at', { ascending: false });
     if (error) {
@@ -249,9 +351,9 @@ app.get('/api/admin/agents', async (req, res) => {
           const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(agent.id);
           email = authUser?.user?.email || 'Email unavailable';
         } catch (e) {
-      }
-        }
           console.error('Email lookup failed for', agent.id, e.message);
+        }
+      }
       return Object.assign({}, agent, { email });
     }));
     res.json(agentsWithEmail);
@@ -278,10 +380,13 @@ app.post('/api/admin/approve-agent', async (req, res) => {
     if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { agentId } = req.body;
     if (!agentId) return res.status(400).json({ error: 'agentId required' });
-    // Update status using adminClient to bypass RLS
+    const { verificationTier } = req.body;
+    const validTiers = ['basic', 'verified', 'premium'];
+    const tier = validTiers.includes(verificationTier) ? verificationTier : 'basic';
+    // Update status and verification level using adminClient to bypass RLS
     const { error } = await adminClient2
       .from('profiles')
-      .update({ status: 'approved' })
+      .update({ status: 'approved', verification_level: tier })
       .eq('id', agentId)
       .eq('role', 'agent');
     if (error) throw error;
@@ -335,9 +440,9 @@ app.post('/api/admin/reject-agent', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, message: 'Agent rejected' });
   } catch (err) {
+  }
     console.error('Reject agent error:', err.message);
     res.status(500).json({ error: err.message });
-  }
 });
 // Self-ping every 14 minutes to prevent Render free tier sleep
 setInterval(function() {
@@ -443,9 +548,9 @@ https://trygethome.online`
       confirmationRequired: !hasSession,
     });
   } catch (err) {
-  }
     console.error('Signup error:', err.message);
     return res.status(500).json({ error: 'Signup failed. Please try again.' });
+  }
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
@@ -616,9 +721,9 @@ app.get('/api/auth/me', async (req, res) => {
     } catch { /* profiles table not set up yet — safe default */ }
     res.status(200).json({ user: { id: user.id, email: user.email, role } });
   } catch (err) {
+  }
     console.error('/api/auth/me error:', err.message);
     res.status(500).json({ error: "Internal error fetching user profile." });
-  }
 });
 // ──────────────────────────────────────────────────────────
 // PROPERTIES
@@ -778,7 +883,8 @@ Title      : ${property_title}
 Location   : ${property_location}
 ADD-ON SERVICES OPTED IN-------------------------
 ${addOnLines}
-REVENUE SUMMARY FOR THIS TRANSACTION-------------------------------------
+REVENUE SUMMARY FOR THIS TRANSACTION
+-------------------------------------
   Escrow Processing Fee (kept by platform) : ₦${Number(escrow_fee_naira || 0).toLocaleString('en-NG')}
   Cleaning commission (if opted in)        : ₦${add_ons.cleaning   ? '12,000' : '0'}
   Relocation commission (if opted in)      : ₦${add_ons.relocation ? '30,000' : '0'}
@@ -918,7 +1024,8 @@ Paystack Reference : ${reference}
 Agent Email        : ${agent_email}
 New Tier           : ${t.label}
 Listing Limit      : ${t.limit} active listings
-ACTION REQUIRED---------------
+ACTION REQUIRED
+---------------
   1. Update this agent's tier in your admin records.
   2. If Agency plan: set up their dedicated Agency Profile page.
   3. Send a welcome email confirming their new plan.
@@ -959,8 +1066,8 @@ app.post('/api/legal/accept', async (req, res) => {
     res.status(200).json({ success: true });
   } catch (err) {
     console.error('Legal acceptance error:', err.message);
-    res.status(500).json({ error: err.message });
   }
+    res.status(500).json({ error: err.message });
 });
 // ──────────────────────────────────────────────────────────
 // AGENT LISTING COUNT
