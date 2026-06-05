@@ -336,31 +336,39 @@ app.get('/api/admin/agents', async (req, res) => {
       throw error;
     }
     console.log(`Fetched ${agents?.length || 0} agents from profiles table`);
-    // Try to get emails using admin API - requires service role key
-    // If service role not available, use anon key and get what we can
-    const supabaseAdmin = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL,
-          process.env.SUPABASE_SERVICE_KEY
-        )
-      : null;
-    const agentsWithEmail = await Promise.all((agents || []).map(async function(agent) {
-      let email = 'Email unavailable';
-      if (supabaseAdmin) {
+    // Email is stored directly in profiles.email column
+    // Fall back to auth.admin lookup if email column not populated
+    let agentsWithEmail = (agents || []).map(function(agent) {
+      return Object.assign({}, agent, {
+        email: agent.email || 'Email unavailable'
+      });
+    });
+    // For agents missing email, try auth.admin lookup if service key available
+    const agentsMissingEmail = agentsWithEmail.filter(a => a.email === 'Email unavailable');
+    if (agentsMissingEmail.length > 0 && process.env.SUPABASE_SERVICE_KEY) {
+      const supabaseAdmin = require('@supabase/supabase-js').createClient(
+        process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY
+      );
+      await Promise.all(agentsMissingEmail.map(async function(agent) {
         try {
           const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(agent.id);
-          email = authUser?.user?.email || 'Email unavailable';
+          const foundEmail = authUser?.user?.email;
+          if (foundEmail) {
+            agent.email = foundEmail;
+            // Also update the profiles table so future calls are fast
+            supabase.from('profiles').update({ email: foundEmail }).eq('id', agent.id).then(() => {}).catch(() => {});
+          }
         } catch (e) {
-          console.error('Email lookup failed for', agent.id, e.message);
+          console.error('Email fallback lookup failed for', agent.id, e.message);
         }
-      }
-      return Object.assign({}, agent, { email });
-    }));
+      }));
+    }
+    console.log('Returning', agentsWithEmail.length, 'agents to admin dashboard');
     res.json(agentsWithEmail);
   } catch (err) {
+  }
     console.error('Fetch agents error:', err.message);
     res.status(500).json({ error: err.message });
-  }
 });
 // Approve agent (admin only)
 app.post('/api/admin/approve-agent', async (req, res) => {
@@ -440,9 +448,9 @@ app.post('/api/admin/reject-agent', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, message: 'Agent rejected' });
   } catch (err) {
-  }
     console.error('Reject agent error:', err.message);
     res.status(500).json({ error: err.message });
+  }
 });
 // Self-ping every 14 minutes to prevent Render free tier sleep
 setInterval(function() {
@@ -513,13 +521,13 @@ app.post('/api/auth/signup', async (req, res) => {
         console.error('User lookup error (non-blocking):', lookupErr.message);
       }
     }
-    // Create customer profile with explicit role and status
+    // Create customer profile with explicit role, status and email
     if (finalUserId) {
       supabase.from('profiles')
-        .upsert([{ id: finalUserId, role: 'customer', status: 'approved' }], { onConflict: 'id' })
+        .upsert([{ id: finalUserId, role: 'customer', status: 'approved', email: userEmail }], { onConflict: 'id' })
+    }
         .then(() => console.log('Customer profile created for:', userEmail))
         .catch(e => console.error('Profile error (non-blocking):', e.message));
-    }
     // Send welcome email - completely non-blocking, never affects response
     setImmediate(async function() {
       try {
@@ -585,15 +593,20 @@ app.post('/api/auth/agent-register', async (req, res) => {
       }
       console.error('Supabase email error for agent (non-blocking):', error.message);
     }
-    // Set role=agent and status=pending explicitly in profiles table
+    // Set role=agent, status=pending, and store email in profiles table
     const agentUserId = data?.user?.id || null;
     if (agentUserId) {
       try {
         const { error: profileErr } = await supabase
           .from('profiles')
-          .upsert([{ id: agentUserId, role: 'agent', status: 'pending' }], { onConflict: 'id' });
+          .upsert([{
+            id: agentUserId,
+            role: 'agent',
+            status: 'pending',
+            email: email,  // Store email so admin dashboard can show it without auth.admin
+          }], { onConflict: 'id' });
         if (profileErr) console.error('Agent profile error:', profileErr.message);
-        else console.log('Agent profile created: role=agent, status=pending for', email);
+        else console.log('Agent profile created: role=agent, status=pending, email:', email);
       } catch (profileErr) {
         console.error('Agent profile upsert failed:', profileErr.message);
       }
@@ -626,8 +639,8 @@ https://trygethome.online`
         );
         console.log('Agent welcome email sent to:', email);
       } catch (emailErr) {
-        console.error('Agent welcome email error:', emailErr.message);
       }
+        console.error('Agent welcome email error:', emailErr.message);
     });
     // Notify admin of new agent registration
     setImmediate(async function() {
@@ -665,28 +678,41 @@ app.post('/api/auth/login', async (req, res) => {
                   error.message;
       return res.status(401).json({ error: msg });
     }
-    // Fetch the user's role from your public 'profiles' table.
-    // Expected schema: profiles(id uuid references auth.users, role text)
-    // Role values: 'customer' (default), 'agent', 'admin'
+    // Force fresh profile fetch - bypass any cache using service key if available
     let role = 'customer';
     let status = 'approved';
     let is_unlimited = false;
     try {
-      const { data: profile } = await supabase
+      // Use service key client to bypass RLS and always get latest data
+      const profileClient = process.env.SUPABASE_SERVICE_KEY
+        ? require('@supabase/supabase-js').createClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_SERVICE_KEY,
+            { auth: { autoRefreshToken: false, persistSession: false } }
+          )
+        : supabase;
+      const { data: profile, error: profileError } = await profileClient
         .from('profiles')
-        .select('role, status, is_unlimited')
+        .select('role, status, is_unlimited, verification_level')
         .eq('id', data.user.id)
         .single();
-      if (profile?.role) role = profile.role;
-      if (profile?.status) status = profile.status;
-      if (profile?.is_unlimited) is_unlimited = profile.is_unlimited;
-      // Admins are always approved
+      if (profileError) {
+        console.error('Profile fetch error on login:', profileError.message);
+      } else if (profile) {
+        role         = profile.role         || 'customer';
+        status       = profile.status       || 'approved';
+        is_unlimited = profile.is_unlimited || false;
+        console.log(`Login profile fetched: ${email} | role=${role} | status=${status}`);
+      }
+      // Admins are always approved regardless of status field
       if (role === 'admin') status = 'approved';
-    } catch {
-      // profiles table may not exist yet - default to customer
+    } catch (profileErr) {
+      console.error('Profile fetch failed (non-blocking):', profileErr.message);
+      // Default to customer so login never fails due to profile issues
     }
     // If agent is pending - return special flag so frontend can block login
     const isPendingAgent = role === 'agent' && status === 'pending';
+    console.log(`Login response: ${email} | role=${role} | status=${status} | pending=${isPendingAgent}`);
     res.status(200).json({
       user:  { id: data.user.id, email: data.user.email, role, status, is_unlimited },
       pendingAgent: isPendingAgent,
@@ -711,19 +737,29 @@ app.get('/api/auth/me', async (req, res) => {
     const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) return res.status(401).json({ error: "Invalid or expired token." });
     let role = 'customer';
+    let status = 'approved';
+    let is_unlimited = false;
     try {
-      const { data: profile } = await supabase
+      // Use service key for fresh non-cached profile data
+      const meClient = process.env.SUPABASE_SERVICE_KEY
+        ? require('@supabase/supabase-js').createClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_SERVICE_KEY,
+            { auth: { autoRefreshToken: false, persistSession: false } }
+          )
+        : supabase;
+      const { data: profile } = await meClient
         .from('profiles')
-        .select('role')
+        .select('role, status, is_unlimited')
         .eq('id', user.id)
         .single();
       if (profile?.role) role = profile.role;
     } catch { /* profiles table not set up yet — safe default */ }
     res.status(200).json({ user: { id: user.id, email: user.email, role } });
   } catch (err) {
-  }
     console.error('/api/auth/me error:', err.message);
     res.status(500).json({ error: "Internal error fetching user profile." });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // PROPERTIES
@@ -768,8 +804,8 @@ app.post('/api/upload-image', async (req, res) => {
     res.status(200).json({ url: urlData.publicUrl });
   } catch (err) {
     console.error("Image upload error:", err.message);
-    res.status(500).json({ error: err.message });
   }
+    res.status(500).json({ error: err.message });
 });
 app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, video_url, description, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
@@ -883,12 +919,12 @@ Title      : ${property_title}
 Location   : ${property_location}
 ADD-ON SERVICES OPTED IN-------------------------
 ${addOnLines}
-REVENUE SUMMARY FOR THIS TRANSACTION
--------------------------------------
+REVENUE SUMMARY FOR THIS TRANSACTION-------------------------------------
   Escrow Processing Fee (kept by platform) : ₦${Number(escrow_fee_naira || 0).toLocaleString('en-NG')}
   Cleaning commission (if opted in)        : ₦${add_ons.cleaning   ? '12,000' : '0'}
   Relocation commission (if opted in)      : ₦${add_ons.relocation ? '30,000' : '0'}
-NEXT STEPS----------
+NEXT STEPS
+----------
   1. Verify payment on the Paystack dashboard (ref above).
   2. Assign an inspection officer to this listing.
   3. Contact the customer to confirm their inspection slot.
@@ -1024,8 +1060,7 @@ Paystack Reference : ${reference}
 Agent Email        : ${agent_email}
 New Tier           : ${t.label}
 Listing Limit      : ${t.limit} active listings
-ACTION REQUIRED
----------------
+ACTION REQUIRED---------------
   1. Update this agent's tier in your admin records.
   2. If Agency plan: set up their dedicated Agency Profile page.
   3. Send a welcome email confirming their new plan.
@@ -1066,8 +1101,8 @@ app.post('/api/legal/accept', async (req, res) => {
     res.status(200).json({ success: true });
   } catch (err) {
     console.error('Legal acceptance error:', err.message);
-  }
     res.status(500).json({ error: err.message });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // AGENT LISTING COUNT
