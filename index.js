@@ -139,7 +139,13 @@ async function sendSMS(phone, message) {
 // HEALTH CHECK
 // ──────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'GetHome Backend is LIVE', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    message: 'GetHome Backend is LIVE',
+    timestamp: new Date().toISOString(),
+    supabase_configured: !!(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY),
+    service_key_configured: !!process.env.SUPABASE_SERVICE_KEY,
+  });
 });
 // Test email endpoint - visit /test-email?to=youremail@gmail.com to test
 app.get('/test-email', async (req, res) => {
@@ -361,14 +367,14 @@ app.get('/api/admin/agents', async (req, res) => {
         } catch (e) {
           console.error('Email fallback lookup failed for', agent.id, e.message);
         }
-      }));
     }
+      }));
     console.log('Returning', agentsWithEmail.length, 'agents to admin dashboard');
     res.json(agentsWithEmail);
   } catch (err) {
-  }
     console.error('Fetch agents error:', err.message);
     res.status(500).json({ error: err.message });
+  }
 });
 // Approve agent (admin only)
 app.post('/api/admin/approve-agent', async (req, res) => {
@@ -525,9 +531,9 @@ app.post('/api/auth/signup', async (req, res) => {
     if (finalUserId) {
       supabase.from('profiles')
         .upsert([{ id: finalUserId, role: 'customer', status: 'approved', email: userEmail }], { onConflict: 'id' })
-    }
         .then(() => console.log('Customer profile created for:', userEmail))
         .catch(e => console.error('Profile error (non-blocking):', e.message));
+    }
     // Send welcome email - completely non-blocking, never affects response
     setImmediate(async function() {
       try {
@@ -639,8 +645,8 @@ https://trygethome.online`
         );
         console.log('Agent welcome email sent to:', email);
       } catch (emailErr) {
-      }
         console.error('Agent welcome email error:', emailErr.message);
+      }
     });
     // Notify admin of new agent registration
     setImmediate(async function() {
@@ -676,8 +682,8 @@ app.post('/api/auth/login', async (req, res) => {
       const msg = error.message.includes('Invalid login') ? 'Invalid email or password. Please try again.' :
                   error.message.includes('Email not confirmed') ? 'Please verify your email before logging in. Check your inbox.' :
                   error.message;
-      return res.status(401).json({ error: msg });
     }
+      return res.status(401).json({ error: msg });
     // Force fresh profile fetch - bypass any cache using service key if available
     let role = 'customer';
     let status = 'approved';
@@ -698,17 +704,31 @@ app.post('/api/auth/login', async (req, res) => {
         .single();
       if (profileError) {
         console.error('Profile fetch error on login:', profileError.message);
+        // If profile missing entirely, create one so future logins work
+        if (profileError.code === 'PGRST116') { // not found
+          console.log('Profile missing for user - creating default customer profile');
+          await profileClient.from('profiles').upsert([{
+            id: data.user.id,
+            role: 'customer',
+            status: 'approved',
+            email: email,
+          }], { onConflict: 'id' }).catch(e => console.error('Profile create failed:', e.message));
+        }
       } else if (profile) {
         role         = profile.role         || 'customer';
         status       = profile.status       || 'approved';
         is_unlimited = profile.is_unlimited || false;
-        console.log(`Login profile fetched: ${email} | role=${role} | status=${status}`);
+        console.log(`Login: ${email} | role=${role} | status=${status} | unlimited=${is_unlimited}`);
       }
-      // Admins are always approved regardless of status field
+      // Admins are always approved
       if (role === 'admin') status = 'approved';
+      // CRITICAL: if agent status is still null/undefined, treat as pending not approved
+      if (role === 'agent' && (!status || status === 'null')) {
+      }
+        status = 'pending';
+        console.log(`Agent ${email} has no status - treating as pending`);
     } catch (profileErr) {
-      console.error('Profile fetch failed (non-blocking):', profileErr.message);
-      // Default to customer so login never fails due to profile issues
+      console.error('Profile fetch failed:', profileErr.message);
     }
     // If agent is pending - return special flag so frontend can block login
     const isPendingAgent = role === 'agent' && status === 'pending';
@@ -804,8 +824,8 @@ app.post('/api/upload-image', async (req, res) => {
     res.status(200).json({ url: urlData.publicUrl });
   } catch (err) {
     console.error("Image upload error:", err.message);
-  }
     res.status(500).json({ error: err.message });
+  }
 });
 app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, video_url, description, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
@@ -910,7 +930,8 @@ app.post('/api/escrow-notify', async (req, res) => {
 Paystack Reference : ${reference}
 Amount Paid (₦)    : ₦${Number(amount_naira).toLocaleString('en-NG')}
 Escrow Fee (₦)     : ₦${Number(escrow_fee_naira || 0).toLocaleString('en-NG')}
-CUSTOMER--------
+CUSTOMER
+--------
 User ID    : ${user_id    || 'N/A'}
 User Email : ${user_email || 'N/A'}
 PROPERTY--------
@@ -923,8 +944,7 @@ REVENUE SUMMARY FOR THIS TRANSACTION-------------------------------------
   Escrow Processing Fee (kept by platform) : ₦${Number(escrow_fee_naira || 0).toLocaleString('en-NG')}
   Cleaning commission (if opted in)        : ₦${add_ons.cleaning   ? '12,000' : '0'}
   Relocation commission (if opted in)      : ₦${add_ons.relocation ? '30,000' : '0'}
-NEXT STEPS
-----------
+NEXT STEPS----------
   1. Verify payment on the Paystack dashboard (ref above).
   2. Assign an inspection officer to this listing.
   3. Contact the customer to confirm their inspection slot.
