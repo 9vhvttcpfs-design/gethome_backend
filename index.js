@@ -8,18 +8,25 @@ const PORT = process.env.PORT || 5000;
 const allowedOrigins = [
   'https://trygethome.online',
   'https://www.trygethome.online',
+  'https://gethome.online',
+  'https://www.gethome.online',
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://localhost:3000',
 ];
 app.use(cors({
   origin: function(origin, callback) {
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+    // Allow requests with no origin (mobile apps, curl, Render health checks)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      return callback(null, true);
     }
+    const msg = 'The CORS policy for this site does not allow access from: ' + origin;
+    return callback(new Error(msg), false);
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json());
 // ── Supabase ───────────────────────────────────────────────
@@ -321,7 +328,8 @@ app.get('/api/admin/agents', async (req, res) => {
     // Check admin role using service key client if available, else anon
     const adminClient = process.env.SUPABASE_SERVICE_KEY
       ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          process.env.SUPABASE_URL,
+          process.env.SUPABASE_SERVICE_KEY,
           { auth: { autoRefreshToken: false, persistSession: false } }
         )
       : supabase;
@@ -596,9 +604,9 @@ app.post('/api/auth/agent-register', async (req, res) => {
                            error.message.toLowerCase().includes('confirmation');
       if (!isEmailError) {
         return res.status(400).json({ error: error.message });
+    }
       }
       console.error('Supabase email error for agent (non-blocking):', error.message);
-    }
     // Set role=agent, status=pending, and store email in profiles table
     const agentUserId = data?.user?.id || null;
     if (agentUserId) {
@@ -930,8 +938,7 @@ app.post('/api/escrow-notify', async (req, res) => {
 Paystack Reference : ${reference}
 Amount Paid (₦)    : ₦${Number(amount_naira).toLocaleString('en-NG')}
 Escrow Fee (₦)     : ₦${Number(escrow_fee_naira || 0).toLocaleString('en-NG')}
-CUSTOMER
---------
+CUSTOMER--------
 User ID    : ${user_id    || 'N/A'}
 User Email : ${user_email || 'N/A'}
 PROPERTY--------
