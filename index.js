@@ -318,21 +318,20 @@ app.get('/api/admin/agents', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    // Verify caller is admin using token
-    const { data: userData, error: authError } = await supabase.auth.getUser(token);
-    const user = userData?.user;
-    if (authError || !user) {
-      console.error('Admin auth error:', authError?.message);
-      return res.status(401).json({ error: 'Unauthorized - invalid token' });
-    }
-    // Check admin role using service key client if available, else anon
+    // Use service key client for reliable token verification
     const adminClient = process.env.SUPABASE_SERVICE_KEY
       ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL,
-          process.env.SUPABASE_SERVICE_KEY,
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
           { auth: { autoRefreshToken: false, persistSession: false } }
         )
       : supabase;
+    // Verify token - use adminClient for reliability
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) {
+      console.error('Admin auth error:', authError?.message, '| Token length:', token?.length);
+      return res.status(401).json({ error: 'Unauthorized - please log out and log back in to refresh your session' });
+    }
     const { data: callerProfile, error: profileErr } = await adminClient
       .from('profiles').select('role').eq('id', user.id).single();
     console.log('Admin check - user:', user.id, 'role:', callerProfile?.role, 'error:', profileErr?.message);
@@ -342,7 +341,7 @@ app.get('/api/admin/agents', async (req, res) => {
     // Fetch ALL agents - use adminClient to bypass RLS
     const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('id, role, status, is_unlimited, created_at, verification_level, verification_status, verification_requested_tier, nin_number, office_address, kyc_documents')
+      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, kyc_documents')
       .eq('role', 'agent')
       .order('created_at', { ascending: false });
     if (error) {
@@ -389,9 +388,15 @@ app.post('/api/admin/approve-agent', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const { data: userData2, error: authError } = await supabase.auth.getUser(token);
-    const user = userData2?.user;
-    if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const serviceClient_approve = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: userData_approve, error: authError } = await serviceClient_approve.auth.getUser(token);
+    const user = userData_approve?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
     const adminClient2 = process.env.SUPABASE_SERVICE_KEY
       ? require('@supabase/supabase-js').createClient(
           process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
@@ -445,9 +450,15 @@ app.post('/api/admin/reject-agent', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const { data: userData3, error: authError } = await supabase.auth.getUser(token);
-    const user = userData3?.user;
-    if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const serviceClient_reject = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: userData_reject, error: authError } = await serviceClient_reject.auth.getUser(token);
+    const user = userData_reject?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
     const adminClient3 = process.env.SUPABASE_SERVICE_KEY
       ? require('@supabase/supabase-js').createClient(
           process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
@@ -517,9 +528,9 @@ app.post('/api/auth/signup', async (req, res) => {
       if (!isEmailError) {
         return res.status(400).json({ error: error.message });
       }
+    }
       // Email error - log and continue, account was created
       console.error('Supabase email error (account still created):', error.message);
-    }
     // Safely get user info - data.user may be null if email error occurred
     const userId    = data?.user?.id    || null;
     const userEmail = data?.user?.email || email;
@@ -554,7 +565,8 @@ VERIFY YOUR EMAIL:
 Please check your inbox for a separate verification email from GetHome and click the confirmation link inside it.
 Once verified, sign in to your account here:
 https://trygethome.online
-On the GetHome app you can:- Browse verified properties with full fee breakdown- Book inspections- Secure listings with escrow protection
+On the GetHome app you can:- Browse verified properties with full fee breakdown
+- Book inspections- Secure listings with escrow protection
 Questions? WhatsApp us: https://wa.me/2349077246534
 The GetHome Team
 https://trygethome.online`
@@ -576,7 +588,7 @@ https://trygethome.online`
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, fullName, phone, address, experience, specialty, nin, cac, about } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
   // Block disposable emails
@@ -604,9 +616,9 @@ app.post('/api/auth/agent-register', async (req, res) => {
                            error.message.toLowerCase().includes('confirmation');
       if (!isEmailError) {
         return res.status(400).json({ error: error.message });
-    }
       }
       console.error('Supabase email error for agent (non-blocking):', error.message);
+    }
     // Set role=agent, status=pending, and store email in profiles table
     const agentUserId = data?.user?.id || null;
     if (agentUserId) {
@@ -617,7 +629,15 @@ app.post('/api/auth/agent-register', async (req, res) => {
             id: agentUserId,
             role: 'agent',
             status: 'pending',
-            email: email,  // Store email so admin dashboard can show it without auth.admin
+            email: email,
+            full_name: fullName || null,
+            phone: phone || null,
+            office_address: address || null,
+            experience: experience || null,
+            specialty: specialty || null,
+            nin_number: nin || null,
+            cac_number: cac || null,
+            about: about || null,
           }], { onConflict: 'id' });
         if (profileErr) console.error('Agent profile error:', profileErr.message);
         else console.log('Agent profile created: role=agent, status=pending, email:', email);
@@ -831,18 +851,20 @@ app.post('/api/upload-image', async (req, res) => {
       .getPublicUrl(fileName);
     res.status(200).json({ url: urlData.publicUrl });
   } catch (err) {
+  }
     console.error("Image upload error:", err.message);
     res.status(500).json({ error: err.message });
-  }
 });
 app.post('/api/properties', async (req, res) => {
-  const { title, location, price, image_url, video_url, description, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
+  const { title, location, price, image_url, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
     const { data, error } = await supabase.from('properties').insert([{
       title,
       location,
       description:    description                || null,
+      bedrooms:       bedrooms                   || null,
+      bathrooms:      bathrooms                  || null,
       price:          parseFloat(price)          || 0,
       image_url:      image_url                  || null,
       video_url:      video_url                  || null,
@@ -861,7 +883,7 @@ app.post('/api/properties', async (req, res) => {
 // PUT /api/properties/:id  — update an existing listing
 app.put('/api/properties/:id', async (req, res) => {
   const { id } = req.params;
-  const { title, location, price, image_url, video_url, description, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
+  const { title, location, price, image_url, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
   if (!title || !location || !price) {
     return res.status(400).json({ error: "title, location, and price are required." });
   }
@@ -875,6 +897,8 @@ app.put('/api/properties/:id', async (req, res) => {
         image_url:      image_url                  || null,
         video_url:      video_url                  || null,
         description:    description                || null,
+        bedrooms:       bedrooms                   || null,
+        bathrooms:      bathrooms                  || null,
         rent:           parseFloat(rent)           || parseFloat(price) || 0,
         agency_fee:     parseFloat(agency_fee)     || 0,
         agreement_fee:  parseFloat(agreement_fee)  || 0,
