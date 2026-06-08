@@ -5,6 +5,21 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const PORT = process.env.PORT || 5000;
+// ── Environment Variable Validation ────────────────────
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
+const MISSING_ENV = REQUIRED_ENV.filter(k => !process.env[k]);
+if (MISSING_ENV.length > 0) {
+  console.error('FATAL: Missing environment variables:', MISSING_ENV.join(', '));
+  console.error('Please set them in Render environment settings.');
+  process.exit(1);
+}
+console.log('ENV check passed:', {
+  SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
+  SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY ? 'SET' : 'MISSING',
+  SUPABASE_SERVICE_KEY: process.env.SUPABASE_SERVICE_KEY ? 'SET' : 'MISSING',
+  RESEND_API_KEY: process.env.RESEND_API_KEY ? 'SET' : 'MISSING',
+  ADMIN_EMAIL: process.env.ADMIN_EMAIL ? 'SET' : 'MISSING',
+});
 const allowedOrigins = [
   'https://trygethome.online',
   'https://www.trygethome.online',
@@ -14,20 +29,25 @@ const allowedOrigins = [
   'http://localhost:5174',
   'http://localhost:3000',
 ];
+// ── CORS - must be before all routes ───────────────────
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, Render health checks)
+    // Allow requests with no origin (mobile, curl, Render health checks)
     if (!origin) return callback(null, true);
     if (allowedOrigins.indexOf(origin) !== -1) {
       return callback(null, true);
     }
-    const msg = 'The CORS policy for this site does not allow access from: ' + origin;
-    return callback(new Error(msg), false);
+    console.error('CORS blocked request from origin:', origin);
+    return callback(new Error('Not allowed by CORS: ' + origin), false);
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range'],
+  maxAge: 86400, // 24 hours preflight cache
 }));
+// Handle OPTIONS preflight explicitly
+app.options('*', cors());
 app.use(express.json());
 // ── Supabase ───────────────────────────────────────────────
 const supabase = createClient(
@@ -528,9 +548,9 @@ app.post('/api/auth/signup', async (req, res) => {
       if (!isEmailError) {
         return res.status(400).json({ error: error.message });
       }
-    }
       // Email error - log and continue, account was created
       console.error('Supabase email error (account still created):', error.message);
+    }
     // Safely get user info - data.user may be null if email error occurred
     const userId    = data?.user?.id    || null;
     const userEmail = data?.user?.email || email;
@@ -550,9 +570,9 @@ app.post('/api/auth/signup', async (req, res) => {
     if (finalUserId) {
       supabase.from('profiles')
         .upsert([{ id: finalUserId, role: 'customer', status: 'approved', email: userEmail }], { onConflict: 'id' })
+    }
         .then(() => console.log('Customer profile created for:', userEmail))
         .catch(e => console.error('Profile error (non-blocking):', e.message));
-    }
     // Send welcome email - completely non-blocking, never affects response
     setImmediate(async function() {
       try {
@@ -565,8 +585,7 @@ VERIFY YOUR EMAIL:
 Please check your inbox for a separate verification email from GetHome and click the confirmation link inside it.
 Once verified, sign in to your account here:
 https://trygethome.online
-On the GetHome app you can:- Browse verified properties with full fee breakdown
-- Book inspections- Secure listings with escrow protection
+On the GetHome app you can:- Browse verified properties with full fee breakdown- Book inspections- Secure listings with escrow protection
 Questions? WhatsApp us: https://wa.me/2349077246534
 The GetHome Team
 https://trygethome.online`
@@ -814,8 +833,15 @@ app.get('/api/auth/me', async (req, res) => {
 // ──────────────────────────────────────────────────────────
 app.get('/api/properties', async (req, res) => {
   try {
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+      console.error('Properties fetch: Supabase env vars missing');
+      return res.status(500).json({ error: 'Database not configured on server' });
+    }
     const { data, error } = await supabase.from('properties').select('*').order('id', { ascending: false });
-    if (error) throw error;
+    if (error) {
+      console.error('Supabase properties error:', error.message, '| code:', error.code);
+      return res.status(500).json({ error: error.message });
+    }
     const out = data.map(p => {
       const rent    = parseFloat(p.rent)           || 0;
       const agency  = parseFloat(p.agency_fee)     || 0;
@@ -851,9 +877,9 @@ app.post('/api/upload-image', async (req, res) => {
       .getPublicUrl(fileName);
     res.status(200).json({ url: urlData.publicUrl });
   } catch (err) {
-  }
     console.error("Image upload error:", err.message);
     res.status(500).json({ error: err.message });
+  }
 });
 app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
@@ -911,9 +937,9 @@ app.put('/api/properties/:id', async (req, res) => {
     if (!data || data.length === 0) return res.status(404).json({ error: "Property not found." });
     res.status(200).json(data[0]);
   } catch (err) {
+  }
     console.error("Error updating property:", err.message);
     res.status(500).json({ error: err.message });
-  }
 });
 // DELETE /api/properties/:id  — permanently remove a listing
 app.delete('/api/properties/:id', async (req, res) => {
@@ -1177,4 +1203,16 @@ app.get('/api/agent/listing-count/:userId', async (req, res) => {
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
+// Global error handler - catches all unhandled errors
+app.use(function(err, req, res, next) {
+  console.error('Unhandled error:', err.message, '| Origin:', req.headers.origin);
+  if (err.message && err.message.toLowerCase().includes('cors')) {
+    return res.status(403).json({ error: 'CORS blocked this request', origin: req.headers.origin || 'unknown' });
+  }
+  res.status(500).json({ error: err.message || 'Internal server error' });
+});
+// 404 handler
+app.use(function(req, res) {
+  res.status(404).json({ error: 'Route not found: ' + req.method + ' ' + req.path });
+});
 app.listen(PORT, () => console.log(` GetHome backend running on port ${PORT}`));
