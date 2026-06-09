@@ -570,9 +570,9 @@ app.post('/api/auth/signup', async (req, res) => {
     if (finalUserId) {
       supabase.from('profiles')
         .upsert([{ id: finalUserId, role: 'customer', status: 'approved', email: userEmail }], { onConflict: 'id' })
-    }
         .then(() => console.log('Customer profile created for:', userEmail))
         .catch(e => console.error('Profile error (non-blocking):', e.message));
+    }
     // Send welcome email - completely non-blocking, never affects response
     setImmediate(async function() {
       try {
