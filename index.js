@@ -936,10 +936,10 @@ app.put('/api/properties/:id', async (req, res) => {
     if (error) throw error;
     if (!data || data.length === 0) return res.status(404).json({ error: "Property not found." });
     res.status(200).json(data[0]);
-  } catch (err) {
+  } catch (error) {
+    console.error("Error updating property:", error.message);
+    res.status(500).json({ error: error.message });
   }
-    console.error("Error updating property:", err.message);
-    res.status(500).json({ error: err.message });
 });
 // DELETE /api/properties/:id  — permanently remove a listing
 app.delete('/api/properties/:id', async (req, res) => {
