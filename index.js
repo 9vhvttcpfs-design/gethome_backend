@@ -500,6 +500,39 @@ app.post('/api/admin/reject-agent', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// Toggle featured status for a property (admin only)
+app.patch('/api/admin/properties/:id/feature', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const adminClient = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
+    const { data: profile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
+    if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { id } = req.params;
+    const { is_featured } = req.body;
+    if (typeof is_featured !== 'boolean') return res.status(400).json({ error: 'is_featured must be a boolean' });
+    const { data, error } = await adminClient
+      .from('properties')
+      .update({ is_featured })
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Property not found' });
+    return res.json({ success: true, message: 'Featured status updated successfully', property: data });
+  } catch (err) {
+    console.error('Feature toggle error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // Self-ping every 14 minutes to prevent Render free tier sleep
 setInterval(function() {
   try {
