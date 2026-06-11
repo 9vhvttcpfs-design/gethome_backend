@@ -274,7 +274,8 @@ app.post('/api/agent/submit-verification', async (req, res) => {
     const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
     if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
     const { targetTier, phone, nin, selfieUrl, cacUrl, govIdUrl, propAuthUrl,
-            references, officeAddress, emergencyContact, guarantorInfo } = req.body;
+            references, officeAddress, emergencyContact, guarantorInfo,
+            ghana_card_number, orc_number } = req.body;
     const { error } = await supabase
       .from('profiles')
       .update({
@@ -287,6 +288,8 @@ app.post('/api/agent/submit-verification', async (req, res) => {
         references: references || [],
         verification_requested_tier: targetTier,
         verification_status: 'submitted',
+        ghana_card_number: ghana_card_number || null,
+        orc_number: orc_number || null,
       })
       .eq('id', user.id);
     if (error) throw error;
