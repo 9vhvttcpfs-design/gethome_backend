@@ -992,6 +992,23 @@ app.delete('/api/properties/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// PATCH /api/properties/:id/toggle-featured  — set is_featured directly
+app.patch('/api/properties/:id/toggle-featured', async (req, res) => {
+  const { id } = req.params;
+  const { is_featured } = req.body;
+  if (typeof is_featured !== 'boolean') {
+    return res.status(400).json({ error: 'is_featured must be a boolean' });
+  }
+  const { data, error } = await supabase
+    .from('properties')
+    .update({ is_featured })
+    .eq('id', id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'Property not found' });
+  return res.json({ success: true, updated: data });
+});
 // ──────────────────────────────────────────────────────────
 // ESCROW NOTIFICATION
 // Called by frontend after Paystack escrow payment success.
