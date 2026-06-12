@@ -54,6 +54,13 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
+// Service-role client — bypasses RLS for trusted server-side writes.
+// Auth is still enforced manually (we verify the JWT before using this).
+const serviceClient = process.env.SUPABASE_SERVICE_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
+  : supabase;
 // ── Nodemailer ─────────────────────────────────────────────
 // Render env vars needed: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ADMIN_EMAIL
 const transporter = nodemailer.createTransport({
@@ -214,14 +221,15 @@ app.post('/api/upload-video', uploadMiddleware.single('video'), async (req, res)
   if (!req.file) return res.status(400).json({ error: 'No video file provided' });
   try {
     const fileName = `videos/${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-    const { data, error } = await supabase.storage
+    console.log('Uploading video:', { fileName, bucket: 'property-media' });
+    const { data, error } = await serviceClient.storage
       .from('property-media')
       .upload(fileName, req.file.buffer, {
         contentType: req.file.mimetype,
         upsert: false,
       });
     if (error) throw error;
-    const { data: urlData } = supabase.storage.from('property-media').getPublicUrl(fileName);
+    const { data: urlData } = serviceClient.storage.from('property-media').getPublicUrl(fileName);
     res.json({ url: urlData.publicUrl });
   } catch (err) {
     console.error('Video upload error:', err.message);
@@ -523,11 +531,13 @@ app.patch('/api/admin/properties/:id/feature', async (req, res) => {
       .from('properties')
       .update({ is_featured })
       .eq('id', id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data) return res.status(404).json({ error: 'Property not found' });
-    return res.json({ success: true, message: 'Featured status updated successfully', property: data });
+      .select();
+    if (error) {
+      console.error('admin toggleFeatured error:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+    if (!data || data.length === 0) return res.status(404).json({ error: 'Property not found' });
+    return res.json({ success: true, message: 'Featured status updated successfully', property: data[0] });
   } catch (err) {
     console.error('Feature toggle error:', err.message);
     res.status(500).json({ error: err.message });
@@ -900,7 +910,8 @@ app.post('/api/upload-image', async (req, res) => {
     // Strip base64 prefix (data:image/jpeg;base64,XXXX)
     const base64Data = fileData.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
-    const { data, error } = await supabase.storage
+    console.log('Uploading image:', { fileName, bucket: 'property-images' });
+    const { data, error } = await serviceClient.storage
       .from('property-images')
       .upload(fileName, buffer, {
         contentType: fileType,
@@ -908,7 +919,7 @@ app.post('/api/upload-image', async (req, res) => {
       });
     if (error) throw error;
     // Get public URL
-    const { data: urlData } = supabase.storage
+    const { data: urlData } = serviceClient.storage
       .from('property-images')
       .getPublicUrl(fileName);
     res.status(200).json({ url: urlData.publicUrl });
@@ -921,7 +932,25 @@ app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
-    const { data, error } = await supabase.from('properties').insert([{
+    // Resolve agent ID and build a JWT-scoped client so RLS sees auth.uid()
+    let agentId = created_by || null;
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (token) {
+      const { data: userData, error: authErr } = await supabase.auth.getUser(token);
+      if (!authErr && userData?.user?.id) {
+        agentId = userData.user.id;
+      } else if (authErr) {
+        console.error('uploadProperty auth lookup error:', authErr.message);
+      }
+    }
+    // Authenticated client: passes the user's JWT so Supabase RLS evaluates
+    // auth.uid() correctly for this request.
+    const userSupabase = token
+      ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+          global: { headers: { Authorization: 'Bearer ' + token } },
+        })
+      : serviceClient;
+    const { data, error } = await userSupabase.from('properties').insert([{
       title,
       location,
       description:    description                || null,
@@ -936,11 +965,17 @@ app.post('/api/properties', async (req, res) => {
       caution_fee:    parseFloat(caution_fee)    || 0,
       service_charge: parseFloat(service_charge) || 0,
       is_featured:    is_featured === true || is_featured === 'true' || false,
-      created_by:     created_by || null,
+      created_by:     agentId,
     }]).select();
-    if (error) throw error;
+    if (error) {
+      console.error('uploadProperty insert error:', error.message, error.code, error.details, error.hint);
+      throw error;
+    }
     res.status(201).json(data[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('uploadProperty unexpected error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 // PUT /api/properties/:id  — update an existing listing
 app.put('/api/properties/:id', async (req, res) => {
@@ -999,15 +1034,22 @@ app.patch('/api/properties/:id/toggle-featured', async (req, res) => {
   if (typeof is_featured !== 'boolean') {
     return res.status(400).json({ error: 'is_featured must be a boolean' });
   }
-  const { data, error } = await supabase
-    .from('properties')
-    .update({ is_featured })
-    .eq('id', id)
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(404).json({ error: 'Property not found' });
-  return res.json({ success: true, updated: data });
+  try {
+    const { data, error } = await supabase
+      .from('properties')
+      .update({ is_featured })
+      .eq('id', id)
+      .select();
+    if (error) {
+      console.error('toggleFeatured error:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+    if (!data || data.length === 0) return res.status(404).json({ error: 'Property not found' });
+    return res.json({ success: true, updated: data[0] });
+  } catch (err) {
+    console.error('toggleFeatured unexpected error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
 });
 // ──────────────────────────────────────────────────────────
 // ESCROW NOTIFICATION
