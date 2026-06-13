@@ -974,6 +974,15 @@ app.post('/api/properties', async (req, res) => {
           global: { headers: { Authorization: 'Bearer ' + token } },
         })
       : serviceClient;
+    const cleanedImageUrls = Array.isArray(image_urls) && image_urls.length > 0
+      ? image_urls.filter(function(u) { return u && u.trim(); })
+      : (image_url ? [image_url] : []);
+    console.log('POST /api/properties:', {
+      title,
+      imageCount: cleanedImageUrls.length,
+      hasVideo: !!video_url,
+      purpose: purpose || 'rent',
+    });
     const { data, error } = await userSupabase.from('properties').insert([{
       title,
       location,
@@ -981,8 +990,8 @@ app.post('/api/properties', async (req, res) => {
       bedrooms:       bedrooms                   || null,
       bathrooms:      bathrooms                  || null,
       price:          parseFloat(price)          || 0,
-      image_url:      image_url                  || null,
-      image_urls:     Array.isArray(image_urls) && image_urls.length > 0 ? image_urls : (image_url ? [image_url] : []),
+      image_url:      (Array.isArray(image_urls) && image_urls[0]) || image_url || null,
+      image_urls:     cleanedImageUrls,
       video_url:      video_url                  || null,
       rent:           parseFloat(rent)           || parseFloat(price) || 0,
       agency_fee:     parseFloat(agency_fee)     || 0,
@@ -990,8 +999,8 @@ app.post('/api/properties', async (req, res) => {
       caution_fee:    parseFloat(caution_fee)    || 0,
       service_charge: parseFloat(service_charge) || 0,
       is_featured:    is_featured === true || is_featured === 'true' || false,
-      purpose:        purpose                    || null,
-      cost_per_night: cost_per_night             || null,
+      purpose:        purpose                    || 'rent',
+      cost_per_night: parseFloat(cost_per_night) || 0,
       created_by:     agentId,
     }]).select();
     if (error) {
@@ -1012,25 +1021,28 @@ app.put('/api/properties/:id', async (req, res) => {
     return res.status(400).json({ error: "title, location, and price are required." });
   }
   try {
+    const cleanedImageUrlsPut = Array.isArray(image_urls) && image_urls.length > 0
+      ? image_urls.filter(function(u) { return u && u.trim(); })
+      : (image_url ? [image_url] : []);
     const { data, error } = await supabase
       .from('properties')
       .update({
         title,
         location,
         price:          parseFloat(price)          || 0,
-        image_url:      image_url                  || null,
-        image_urls:     Array.isArray(image_urls) && image_urls.length > 0 ? image_urls : (image_url ? [image_url] : []),
+        image_url:      (Array.isArray(image_urls) && image_urls[0]) || image_url || null,
+        image_urls:     cleanedImageUrlsPut,
         video_url:      video_url                  || null,
         description:    description                || null,
         bedrooms:       bedrooms                   || null,
         bathrooms:      bathrooms                  || null,
-        purpose:        purpose                    || null,
+        purpose:        purpose                    || 'rent',
         rent:           parseFloat(rent)           || parseFloat(price) || 0,
         agency_fee:     parseFloat(agency_fee)     || 0,
         agreement_fee:  parseFloat(agreement_fee)  || 0,
         caution_fee:    parseFloat(caution_fee)    || 0,
         service_charge: parseFloat(service_charge) || 0,
-        cost_per_night: cost_per_night             || null,
+        cost_per_night: parseFloat(cost_per_night) || 0,
       })
       .eq('id', id)
       .select();
