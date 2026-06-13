@@ -61,6 +61,9 @@ const serviceClient = process.env.SUPABASE_SERVICE_KEY
       auth: { autoRefreshToken: false, persistSession: false },
     })
   : supabase;
+const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
+const KYC_BUCKET  = process.env.SUPABASE_KYC_BUCKET     || 'agent-kyc-documents';
+console.log('Storage bucket:', BUCKET_NAME);
 // ── Nodemailer ─────────────────────────────────────────────
 // Render env vars needed: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ADMIN_EMAIL
 const transporter = nodemailer.createTransport({
@@ -219,17 +222,22 @@ const uploadMiddleware = multer({
 });
 app.post('/api/upload-video', uploadMiddleware.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video file provided' });
+  if (!req.file.buffer) return res.status(400).json({ error: 'No file buffer received' });
   try {
     const fileName = `videos/${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-    console.log('Uploading video:', { fileName, bucket: 'property-media' });
+    console.log('Uploading video:', { fileName, bucket: BUCKET_NAME });
     const { data, error } = await serviceClient.storage
-      .from('property-media')
+      .from(BUCKET_NAME)
       .upload(fileName, req.file.buffer, {
         contentType: req.file.mimetype,
+        cacheControl: '3600',
         upsert: false,
       });
-    if (error) throw error;
-    const { data: urlData } = serviceClient.storage.from('property-media').getPublicUrl(fileName);
+    if (error) {
+      console.error('Upload failed for bucket:', BUCKET_NAME, '| error:', error.message, '| code:', error.statusCode);
+      return res.status(500).json({ error: 'Bucket upload error: ' + error.message + ' | Bucket tried: ' + BUCKET_NAME });
+    }
+    const { data: urlData } = serviceClient.storage.from(BUCKET_NAME).getPublicUrl(data.path);
     res.json({ url: urlData.publicUrl });
   } catch (err) {
     console.error('Video upload error:', err.message);
@@ -256,17 +264,22 @@ app.post('/api/upload-kyc', kycUpload.single('file'), async (req, res) => {
     const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
     if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    if (!req.file.buffer) return res.status(400).json({ error: 'No file buffer received' });
     const { userId, fileName } = req.body;
     const safeName = fileName.replace(/[^a-zA-Z0-9_-]/g, '_');
     const filePath = `${userId || user.id}/${safeName}_${Date.now()}.${req.file.originalname.split('.').pop()}`;
     // Upload to private KYC bucket - NOT public
     const { data, error } = await supabase.storage
-      .from('agent-kyc-documents')
+      .from(KYC_BUCKET)
       .upload(filePath, req.file.buffer, {
         contentType: req.file.mimetype,
+        cacheControl: '3600',
         upsert: false,
       });
-    if (error) throw error;
+    if (error) {
+      console.error('KYC upload failed for bucket:', KYC_BUCKET, '| error:', error.message, '| code:', error.statusCode);
+      return res.status(500).json({ error: 'Bucket upload error: ' + error.message + ' | Bucket tried: ' + KYC_BUCKET });
+    }
     // Return file path only - not a public URL (admin must use service key to view)
     res.json({ url: filePath, path: data.path });
   } catch (err) {
@@ -910,18 +923,20 @@ app.post('/api/upload-image', async (req, res) => {
     // Strip base64 prefix (data:image/jpeg;base64,XXXX)
     const base64Data = fileData.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
-    console.log('Uploading image:', { fileName, bucket: 'property-images' });
+    if (!buffer || buffer.length === 0) return res.status(400).json({ error: 'No file buffer received' });
+    console.log('Uploading image:', { fileName, bucket: BUCKET_NAME });
     const { data, error } = await serviceClient.storage
-      .from('property-images')
+      .from(BUCKET_NAME)
       .upload(fileName, buffer, {
         contentType: fileType,
+        cacheControl: '3600',
         upsert: true,
       });
-    if (error) throw error;
-    // Get public URL
-    const { data: urlData } = serviceClient.storage
-      .from('property-images')
-      .getPublicUrl(fileName);
+    if (error) {
+      console.error('Upload failed for bucket:', BUCKET_NAME, '| error:', error.message, '| code:', error.statusCode);
+      return res.status(500).json({ error: 'Bucket upload error: ' + error.message + ' | Bucket tried: ' + BUCKET_NAME });
+    }
+    const { data: urlData } = serviceClient.storage.from(BUCKET_NAME).getPublicUrl(data.path);
     const newUrl = urlData.publicUrl;
     const existingUrls = Array.isArray(image_urls) ? image_urls : [];
     const urls_array = [...existingUrls, newUrl];
@@ -938,12 +953,16 @@ app.post('/api/upload-images', multiImageUpload.array('images', 10), async (req,
     const urls = [];
     for (let i = 0; i < req.files.length; i++) {
       const file = req.files[i];
-      const fileName = `images/${Date.now()}-${i}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+      if (!file.buffer) return res.status(400).json({ error: 'No file buffer received for file ' + i });
+      const fileName = `images/${Date.now()}_${i}_${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
       const { data, error } = await serviceClient.storage
-        .from('property-media')
-        .upload(fileName, file.buffer, { contentType: file.mimetype, upsert: false });
-      if (error) throw error;
-      const { data: urlData } = serviceClient.storage.from('property-media').getPublicUrl(fileName);
+        .from(BUCKET_NAME)
+        .upload(fileName, file.buffer, { contentType: file.mimetype, cacheControl: '3600', upsert: false });
+      if (error) {
+        console.error('Upload failed for bucket:', BUCKET_NAME, '| file:', i, '| error:', error.message, '| code:', error.statusCode);
+        return res.status(500).json({ error: 'Bucket upload error: ' + error.message + ' | Bucket tried: ' + BUCKET_NAME });
+      }
+      const { data: urlData } = serviceClient.storage.from(BUCKET_NAME).getPublicUrl(data.path);
       urls.push(urlData.publicUrl);
     }
     res.json({ urls });
