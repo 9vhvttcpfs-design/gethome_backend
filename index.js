@@ -902,7 +902,7 @@ app.get('/api/properties', async (req, res) => {
 // POST /api/upload-image
 // Receives base64 image data, uploads to Supabase Storage, returns public URL
 app.post('/api/upload-image', async (req, res) => {
-  const { fileName, fileType, fileData } = req.body;
+  const { fileName, fileType, fileData, image_urls } = req.body;
   if (!fileName || !fileType || !fileData) {
     return res.status(400).json({ error: "fileName, fileType, and fileData are required." });
   }
@@ -922,14 +922,17 @@ app.post('/api/upload-image', async (req, res) => {
     const { data: urlData } = serviceClient.storage
       .from('property-images')
       .getPublicUrl(fileName);
-    res.status(200).json({ url: urlData.publicUrl });
+    const newUrl = urlData.publicUrl;
+    const existingUrls = Array.isArray(image_urls) ? image_urls : [];
+    const urls_array = [...existingUrls, newUrl];
+    res.status(200).json({ url: newUrl, urls_array });
   } catch (err) {
     console.error("Image upload error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 app.post('/api/properties', async (req, res) => {
-  const { title, location, price, image_url, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
+  const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
     // Resolve agent ID and build a JWT-scoped client so RLS sees auth.uid()
@@ -958,6 +961,7 @@ app.post('/api/properties', async (req, res) => {
       bathrooms:      bathrooms                  || null,
       price:          parseFloat(price)          || 0,
       image_url:      image_url                  || null,
+      image_urls:     image_urls                 || [],
       video_url:      video_url                  || null,
       rent:           parseFloat(rent)           || parseFloat(price) || 0,
       agency_fee:     parseFloat(agency_fee)     || 0,
@@ -980,7 +984,7 @@ app.post('/api/properties', async (req, res) => {
 // PUT /api/properties/:id  — update an existing listing
 app.put('/api/properties/:id', async (req, res) => {
   const { id } = req.params;
-  const { title, location, price, image_url, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
+  const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
   if (!title || !location || !price) {
     return res.status(400).json({ error: "title, location, and price are required." });
   }
@@ -992,6 +996,7 @@ app.put('/api/properties/:id', async (req, res) => {
         location,
         price:          parseFloat(price)          || 0,
         image_url:      image_url                  || null,
+        image_urls:     image_urls                 || [],
         video_url:      video_url                  || null,
         description:    description                || null,
         bedrooms:       bedrooms                   || null,
