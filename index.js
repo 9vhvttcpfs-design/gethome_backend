@@ -931,8 +931,29 @@ app.post('/api/upload-image', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+const multiImageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+app.post('/api/upload-images', multiImageUpload.array('images', 10), async (req, res) => {
+  if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No image files provided' });
+  try {
+    const urls = [];
+    for (let i = 0; i < req.files.length; i++) {
+      const file = req.files[i];
+      const fileName = `images/${Date.now()}-${i}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+      const { data, error } = await serviceClient.storage
+        .from('property-media')
+        .upload(fileName, file.buffer, { contentType: file.mimetype, upsert: false });
+      if (error) throw error;
+      const { data: urlData } = serviceClient.storage.from('property-media').getPublicUrl(fileName);
+      urls.push(urlData.publicUrl);
+    }
+    res.json({ urls });
+  } catch (err) {
+    console.error('Multi-image upload error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.post('/api/properties', async (req, res) => {
-  const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, created_by } = req.body;
+  const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, purpose, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, cost_per_night, created_by } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
     // Resolve agent ID and build a JWT-scoped client so RLS sees auth.uid()
@@ -961,7 +982,7 @@ app.post('/api/properties', async (req, res) => {
       bathrooms:      bathrooms                  || null,
       price:          parseFloat(price)          || 0,
       image_url:      image_url                  || null,
-      image_urls:     image_urls                 || [],
+      image_urls:     Array.isArray(image_urls) && image_urls.length > 0 ? image_urls : (image_url ? [image_url] : []),
       video_url:      video_url                  || null,
       rent:           parseFloat(rent)           || parseFloat(price) || 0,
       agency_fee:     parseFloat(agency_fee)     || 0,
@@ -969,6 +990,8 @@ app.post('/api/properties', async (req, res) => {
       caution_fee:    parseFloat(caution_fee)    || 0,
       service_charge: parseFloat(service_charge) || 0,
       is_featured:    is_featured === true || is_featured === 'true' || false,
+      purpose:        purpose                    || null,
+      cost_per_night: cost_per_night             || null,
       created_by:     agentId,
     }]).select();
     if (error) {
@@ -984,7 +1007,7 @@ app.post('/api/properties', async (req, res) => {
 // PUT /api/properties/:id  — update an existing listing
 app.put('/api/properties/:id', async (req, res) => {
   const { id } = req.params;
-  const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured } = req.body;
+  const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, purpose, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, cost_per_night } = req.body;
   if (!title || !location || !price) {
     return res.status(400).json({ error: "title, location, and price are required." });
   }
@@ -996,16 +1019,18 @@ app.put('/api/properties/:id', async (req, res) => {
         location,
         price:          parseFloat(price)          || 0,
         image_url:      image_url                  || null,
-        image_urls:     image_urls                 || [],
+        image_urls:     Array.isArray(image_urls) && image_urls.length > 0 ? image_urls : (image_url ? [image_url] : []),
         video_url:      video_url                  || null,
         description:    description                || null,
         bedrooms:       bedrooms                   || null,
         bathrooms:      bathrooms                  || null,
+        purpose:        purpose                    || null,
         rent:           parseFloat(rent)           || parseFloat(price) || 0,
         agency_fee:     parseFloat(agency_fee)     || 0,
         agreement_fee:  parseFloat(agreement_fee)  || 0,
         caution_fee:    parseFloat(caution_fee)    || 0,
         service_charge: parseFloat(service_charge) || 0,
+        cost_per_night: cost_per_night             || null,
       })
       .eq('id', id)
       .select();
