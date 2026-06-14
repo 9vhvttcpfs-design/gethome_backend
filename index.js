@@ -993,6 +993,39 @@ app.post('/api/properties', async (req, res) => {
           global: { headers: { Authorization: 'Bearer ' + token } },
         })
       : serviceClient;
+    // Check listing limit for free tier agents
+    if (agentId) {
+      const { data: profileData } = await supabase
+        .from('profiles')
+        .select('verification_level, is_unlimited, role')
+        .eq('id', agentId)
+        .single();
+
+      const isAdmin     = profileData?.role === 'admin';
+      const isUnlimited = profileData?.is_unlimited === true;
+      const level       = profileData?.verification_level || 'basic';
+      const limits      = { basic: 3, verified: 15, premium: 999 };
+      const limit       = limits[level] || 3;
+
+      if (!isAdmin && !isUnlimited) {
+        const { count } = await supabase
+          .from('properties')
+          .select('id', { count: 'exact', head: true })
+          .eq('created_by', agentId);
+
+        console.log('Listing limit check:', { agentId, tier: level, current: count, limit });
+
+        if (count >= limit) {
+          return res.status(403).json({
+            error: 'Listing limit reached. Your ' + level + ' tier allows up to ' + limit + ' listings. Please contact admin to upgrade your verification tier.',
+            limit,
+            current: count,
+            tier: level,
+          });
+        }
+      }
+    }
+
     const cleanedImageUrls = Array.isArray(image_urls) && image_urls.length > 0
       ? image_urls.filter(function(u) { return u && u.trim(); })
       : (image_url ? [image_url] : []);
