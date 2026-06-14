@@ -569,6 +569,9 @@ app.post('/api/agent/bank-details', async (req, res) => {
     if (!bank_name || !account_number || !account_name) {
       return res.status(400).json({ error: 'bank_name, account_number, and account_name are required' });
     }
+    if (!/^\d{10}$/.test(account_number)) {
+      return res.status(400).json({ error: 'account_number must be exactly 10 digits' });
+    }
     const { error } = await serviceClient
       .from('profiles')
       .update({ bank_name, account_number, account_name })
@@ -630,20 +633,15 @@ app.post('/api/admin/mark-sold', async (req, res) => {
           try {
             await sendCustomerEmail(
               agentProfile.email,
-              'Your Property Has Been Marked as Sold - GetHome',
+              'Property Sold - Commission Due to GetHome',
               `Hello ${agentProfile.full_name || 'Agent'},
 
-Congratulations! Your property listing "${property.title}" has been marked as sold.
+Your property listing "${property.title}" at ${property.location} has been marked as sold.
 
-SALE DETAILS
-Property    : ${property.title}
-Location    : ${property.location}
-Sold Price  : ₦${Number(sold_price).toLocaleString('en-NG')}
-
-COMMISSION OWED TO GETHOME
+COMMISSION DUE TO GETHOME
 Commission Amount : ₦${Number(commission).toLocaleString('en-NG')}
 
-Please process the commission payment to GetHome at your earliest convenience.
+To receive payment and for us to process commission settlement, please add your bank details in your agent portal at https://trygethome.online.
 
 Thank you for working with GetHome.
 The GetHome Team
@@ -653,7 +651,7 @@ https://trygethome.online`
         });
       }
     }
-    res.json({ success: true, property: updated });
+    res.json({ success: true, property: updated, commission_amount: commission });
   } catch (err) {
     console.error('Mark sold error:', err.message);
     res.status(500).json({ error: err.message });
@@ -765,6 +763,69 @@ https://trygethome.online`
     res.json({ success: true, commission_reference });
   } catch (err) {
     console.error('Mark commission paid error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
+// GET ALL LISTINGS (admin only)
+// ──────────────────────────────────────────────────────────
+app.get('/api/admin/all-listings', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const adminClient = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
+    const { data: callerProfile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
+    if (callerProfile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { data: properties, error: propsErr } = await adminClient
+      .from('properties')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (propsErr) throw propsErr;
+    const agentIds = [...new Set((properties || []).map(p => p.created_by).filter(Boolean))];
+    let agentMap = {};
+    if (agentIds.length > 0) {
+      const { data: agents } = await adminClient
+        .from('profiles')
+        .select('id, email, full_name')
+        .in('id', agentIds);
+      (agents || []).forEach(function(a) { agentMap[a.id] = a; });
+    }
+    const enriched = (properties || []).map(function(p) {
+      return Object.assign({}, p, { agent: agentMap[p.created_by] || null });
+    });
+    res.json(enriched);
+  } catch (err) {
+    console.error('Get all listings error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
+// GET AGENT SOLD LISTINGS
+// ──────────────────────────────────────────────────────────
+app.get('/api/agent/sold-listings', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { data, error } = await serviceClient
+      .from('properties')
+      .select('*')
+      .eq('created_by', user.id)
+      .eq('is_sold', true)
+      .order('sold_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    console.error('Get agent sold listings error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
