@@ -829,6 +829,141 @@ app.get('/api/agent/sold-listings', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// ──────────────────────────────────────────────────────────
+// DEPOSIT INTENT
+// ──────────────────────────────────────────────────────────
+app.post('/api/deposit-intent', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { property_id, property_title, property_location, deposit_amount, user_email } = req.body;
+    if (!property_id || !deposit_amount) return res.status(400).json({ error: 'property_id and deposit_amount are required' });
+    const reference = 'GH-DEP-' + Date.now();
+    const { error: updateErr } = await serviceClient
+      .from('properties')
+      .update({
+        deposit_status: 'pending',
+        depositor_email: user_email,
+        deposit_date: new Date().toISOString(),
+        deposit_reference: reference,
+        deposit_amount: parseFloat(deposit_amount),
+      })
+      .eq('id', property_id);
+    if (updateErr) throw updateErr;
+    setImmediate(async function() {
+      try {
+        await sendAdminEmail(
+          'New Deposit Intent - GetHome',
+          `NEW DEPOSIT INTENT
+==================
+Reference        : ${reference}
+Property ID      : ${property_id}
+Property Title   : ${property_title || 'N/A'}
+Location         : ${property_location || 'N/A'}
+Deposit Amount   : ₦${Number(deposit_amount).toLocaleString('en-NG')}
+Customer Email   : ${user_email || 'N/A'}
+
+Please review and confirm this deposit in the Admin Dashboard.`
+        );
+      } catch (e) { console.error('Deposit intent admin email error:', e.message); }
+    });
+    res.json({ success: true, reference });
+  } catch (err) {
+    console.error('Deposit intent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
+// ADMIN DEPOSITS
+// ──────────────────────────────────────────────────────────
+app.get('/api/admin/deposits', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const adminClient = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
+    const { data: callerProfile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
+    if (callerProfile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { data: deposits, error: depositsErr } = await adminClient
+      .from('properties')
+      .select('*')
+      .not('deposit_status', 'is', null)
+      .neq('deposit_status', 'none')
+      .order('deposit_date', { ascending: false });
+    if (depositsErr) throw depositsErr;
+    res.json(deposits || []);
+  } catch (err) {
+    console.error('Get deposits error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ──────────────────────────────────────────────────────────
+// ADMIN CONFIRM DEPOSIT
+// ──────────────────────────────────────────────────────────
+app.post('/api/admin/confirm-deposit', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const adminClient = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
+    const { data: callerProfile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
+    if (callerProfile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { property_id } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+    const { error: updateErr } = await adminClient
+      .from('properties')
+      .update({ deposit_confirmed: true, deposit_status: 'confirmed' })
+      .eq('id', property_id);
+    if (updateErr) throw updateErr;
+    const { data: property, error: fetchErr } = await adminClient
+      .from('properties')
+      .select('title, depositor_email, deposit_reference')
+      .eq('id', property_id)
+      .single();
+    if (fetchErr) throw fetchErr;
+    if (property?.depositor_email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            property.depositor_email,
+            'GetHome - Your Deposit Has Been Confirmed',
+            `Hello,
+
+Your deposit for the property "${property.title || 'N/A'}" has been confirmed by the GetHome team.
+
+You will be contacted shortly to finalize the transaction.
+
+Your reference number is: ${property.deposit_reference || 'N/A'}
+
+Thank you for choosing GetHome.
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('Confirm deposit customer email error:', e.message); }
+      });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Confirm deposit error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // Self-ping every 14 minutes to prevent Render free tier sleep
 setInterval(function() {
   try {
