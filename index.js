@@ -1318,6 +1318,104 @@ app.post('/api/sa/assign-gha', verifyStaffToken, async (req, res) => {
   }
 });
 
+// POST /api/sa/add-gha
+app.post('/api/sa/add-gha', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+    const { full_name, email, phone, location, password } = req.body;
+    if (!full_name || !email || !password) return res.status(400).json({ error: 'full_name, email and password are required' });
+
+    const { count } = await serviceClient
+      .from('gha_agents')
+      .select('id', { count: 'exact', head: true });
+    const gha_code = 'GHA' + String((count || 0) + 1).padStart(4, '0');
+    const password_hash = await bcrypt.hash(password, 10);
+
+    const { data, error } = await serviceClient
+      .from('gha_agents')
+      .insert([{ full_name, email, phone: phone || null, location: location || null, sa_id: saId, gha_code, password_hash, status: 'active' }])
+      .select()
+      .single();
+    if (error) throw error;
+
+    const result = Object.assign({}, data);
+    delete result.password_hash;
+    res.status(201).json(result);
+  } catch (err) {
+    console.error('SA add-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/search-agent
+app.get('/api/sa/search-agent', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ error: 'email query param required' });
+
+    const { data: agent, error } = await serviceClient
+      .from('profiles')
+      .select('id, full_name, email, phone, status, gha_id, sa_id, verification_level')
+      .eq('email', email.trim().toLowerCase())
+      .eq('role', 'agent')
+      .single();
+    if (error || !agent) return res.status(404).json({ error: 'No registered agent found with that email' });
+
+    res.json(agent);
+  } catch (err) {
+    console.error('SA search-agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/assign-agent-to-gha
+app.post('/api/sa/assign-agent-to-gha', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { agent_id, gha_id } = req.body;
+    if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
+
+    // Verify GHA belongs to this SA
+    const { data: ghaCheck } = await serviceClient
+      .from('gha_agents').select('id, gha_code, full_name').eq('id', gha_id).eq('sa_id', saId).single();
+    if (!ghaCheck) return res.status(403).json({ error: 'This GHA does not belong to you' });
+
+    const { error } = await serviceClient
+      .from('profiles').update({ gha_id, sa_id: saId }).eq('id', agent_id);
+    if (error) throw error;
+
+    const { data: agent } = await serviceClient
+      .from('profiles').select('email, full_name').eq('id', agent_id).single();
+    if (agent?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            agent.email,
+            'GetHome - You Have Been Assigned to a GHA',
+            `Hello ${agent.full_name || 'Agent'},
+
+You have been assigned to GHA ${ghaCheck.gha_code} (${ghaCheck.full_name || ''}).
+
+Please log in to your GetHome agent portal for more details.
+
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('SA assign-agent-to-gha email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true, gha_code: ghaCheck.gha_code, gha_name: ghaCheck.full_name });
+  } catch (err) {
+    console.error('SA assign-agent-to-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/sa/subscriptions
 app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
   try {
@@ -1884,21 +1982,167 @@ app.post('/api/admin/deactivate-sa', async (req, res) => {
     const { sa_id } = req.body;
     if (!sa_id) return res.status(400).json({ error: 'sa_id is required' });
 
-    const { error: saErr } = await serviceClient
-      .from('service_agents')
-      .update({ status: 'inactive' })
-      .eq('id', sa_id);
+    const { data: sa } = await serviceClient.from('service_agents').select('email, full_name, sa_code').eq('id', sa_id).single();
+
+    const { error: saErr } = await serviceClient.from('service_agents').update({ status: 'inactive' }).eq('id', sa_id);
     if (saErr) throw saErr;
 
-    const { error: ghaErr } = await serviceClient
-      .from('gha_agents')
-      .update({ status: 'inactive' })
-      .eq('sa_id', sa_id);
+    const { data: deactivatedGhas, error: ghaErr } = await serviceClient
+      .from('gha_agents').update({ status: 'inactive' }).eq('sa_id', sa_id).select('id, gha_code');
     if (ghaErr) throw ghaErr;
+
+    if (sa?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(sa.email, 'GetHome - Account Deactivated',
+`Hello ${sa.full_name || 'Service Agent'},
+
+Your GetHome SA account (${sa.sa_code || ''}) has been deactivated by admin.
+
+If you believe this is an error, please contact GetHome support.
+
+The GetHome Team
+https://trygethome.online`);
+        } catch (e) { console.error('SA deactivate email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true, ghas_deactivated: (deactivatedGhas || []).length });
+  } catch (err) {
+    console.error('Admin deactivate-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/reactivate-sa
+app.post('/api/admin/reactivate-sa', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { sa_id } = req.body;
+    if (!sa_id) return res.status(400).json({ error: 'sa_id is required' });
+
+    const { data: sa } = await serviceClient.from('service_agents').select('email, full_name, sa_code').eq('id', sa_id).single();
+
+    const { error } = await serviceClient.from('service_agents').update({ status: 'active' }).eq('id', sa_id);
+    if (error) throw error;
+
+    if (sa?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(sa.email, 'GetHome - Account Reactivated',
+`Hello ${sa.full_name || 'Service Agent'},
+
+Your GetHome SA account (${sa.sa_code || ''}) has been reactivated. You can now log in again.
+
+The GetHome Team
+https://trygethome.online`);
+        } catch (e) { console.error('SA reactivate email error:', e.message); }
+      });
+    }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Admin deactivate-sa error:', err.message);
+    console.error('Admin reactivate-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/deactivate-gha
+app.post('/api/admin/deactivate-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { gha_id } = req.body;
+    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+
+    const { data: gha } = await serviceClient.from('gha_agents').select('email, full_name, gha_code, sa_id').eq('id', gha_id).single();
+    if (!gha) return res.status(404).json({ error: 'GHA not found' });
+
+    const { error: ghaErr } = await serviceClient.from('gha_agents').update({ status: 'inactive' }).eq('id', gha_id);
+    if (ghaErr) throw ghaErr;
+
+    const { data: unassignedAgents, error: agentErr } = await serviceClient
+      .from('profiles').update({ gha_id: null }).eq('gha_id', gha_id).select('id, full_name, email');
+    if (agentErr) throw agentErr;
+
+    if (gha.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(gha.email, 'GetHome - GHA Account Deactivated',
+`Hello ${gha.full_name || 'GHA'},
+
+Your GetHome GHA account (${gha.gha_code || ''}) has been deactivated by admin.
+
+If you believe this is an error, contact GetHome support.
+
+The GetHome Team
+https://trygethome.online`);
+        } catch (e) { console.error('GHA deactivate email error:', e.message); }
+      });
+    }
+
+    if (gha.sa_id) {
+      const { data: saInfo } = await serviceClient.from('service_agents').select('email, full_name').eq('id', gha.sa_id).single();
+      if (saInfo?.email) {
+        setImmediate(async function() {
+          try {
+            await sendCustomerEmail(saInfo.email, 'GetHome - GHA Deactivated Under Your SA',
+`Hello ${saInfo.full_name || 'SA'},
+
+GHA ${gha.gha_code || gha_id} (${gha.full_name || ''}) has been deactivated by admin.
+
+${(unassignedAgents || []).length} agent(s) under this GHA have been unassigned and are now available for reassignment to another GHA.
+
+Please log in to your SA dashboard to reassign them.
+
+The GetHome Team
+https://trygethome.online`);
+          } catch (e) { console.error('SA notification email error:', e.message); }
+        });
+      }
+    }
+
+    res.json({ success: true, unassigned_agents: unassignedAgents || [] });
+  } catch (err) {
+    console.error('Admin deactivate-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/reactivate-gha
+app.post('/api/admin/reactivate-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { gha_id } = req.body;
+    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+
+    const { data: gha } = await serviceClient.from('gha_agents').select('email, full_name, gha_code').eq('id', gha_id).single();
+
+    const { error } = await serviceClient.from('gha_agents').update({ status: 'active' }).eq('id', gha_id);
+    if (error) throw error;
+
+    if (gha?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(gha.email, 'GetHome - GHA Account Reactivated',
+`Hello ${gha.full_name || 'GHA'},
+
+Your GetHome GHA account (${gha.gha_code || ''}) has been reactivated. You can now log in again.
+
+The GetHome Team
+https://trygethome.online`);
+        } catch (e) { console.error('GHA reactivate email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin reactivate-gha error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1929,7 +2173,8 @@ app.post('/api/admin/mark-sa-paid', async (req, res) => {
         try {
           await sendCustomerEmail(
             sa.email,
-            'GetHome - Your Commission Has Been Paid',
+          
+          'GetHome - Your Commission Has Been Paid',
             `Hello ${sa.full_name || 'Service Agent'},
 
 Your GetHome commission for ${month_year} has been processed and paid to your account.
@@ -2074,6 +2319,406 @@ app.get('/api/admin/earnings-summary', async (req, res) => {
     });
   } catch (err) {
     console.error('Admin earnings-summary error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/create-inspection
+app.post('/api/sa/create-inspection', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { gha_id, property_id, inspection_date, customer_name, customer_email, customer_phone, property_address, notes } = req.body;
+    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+
+    const { data: ghaCheck } = await serviceClient
+      .from('gha_agents').select('id, gha_code, full_name, email').eq('id', gha_id).eq('sa_id', saId).single();
+    if (!ghaCheck) return res.status(403).json({ error: 'This GHA does not belong to you' });
+
+    const { data: inspection, error } = await serviceClient
+      .from('inspections')
+      .insert([{
+        gha_id,
+        property_id: property_id || null,
+        inspection_date: inspection_date || null,
+        customer_name: customer_name || null,
+        customer_email: customer_email || null,
+        customer_phone: customer_phone || null,
+        property_address: property_address || null,
+        notes: notes || null,
+        assigned_by_sa: saId,
+        status: 'pending',
+      }])
+      .select()
+      .single();
+    if (error) throw error;
+
+    if (ghaCheck.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            ghaCheck.email,
+            'GetHome - New Inspection Assigned to You',
+            `Hello ${ghaCheck.full_name || 'GHA'},
+
+A new property inspection has been assigned to you.
+
+INSPECTION DETAILS
+------------------
+Customer Name    : ${customer_name || 'N/A'}
+Customer Email   : ${customer_email || 'N/A'}
+Customer Phone   : ${customer_phone || 'N/A'}
+Property Address : ${property_address || 'N/A'}
+Inspection Date  : ${inspection_date || 'TBD'}
+${notes ? 'Notes            : ' + notes : ''}
+
+Please log in to your GHA dashboard to view and manage this inspection.
+
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('SA create-inspection GHA email error:', e.message); }
+      });
+    }
+
+    res.status(201).json(inspection);
+  } catch (err) {
+    console.error('SA create-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/inspections
+app.get('/api/sa/inspections', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { data: inspections, error } = await serviceClient
+      .from('inspections')
+      .select('*')
+      .eq('assigned_by_sa', saId)
+      .order('inspection_date', { ascending: false });
+    if (error) throw error;
+
+    const ghaIds = [...new Set((inspections || []).map(function(i) { return i.gha_id; }).filter(Boolean))];
+    const propertyIds = [...new Set((inspections || []).map(function(i) { return i.property_id; }).filter(Boolean))];
+
+    let ghaMap = {}, propertyMap = {};
+    if (ghaIds.length > 0) {
+      const { data: ghas } = await serviceClient
+        .from('gha_agents').select('id, full_name, gha_code').in('id', ghaIds);
+      (ghas || []).forEach(function(g) { ghaMap[g.id] = g; });
+    }
+    if (propertyIds.length > 0) {
+      const { data: props } = await serviceClient
+        .from('properties').select('id, title, location').in('id', propertyIds);
+      (props || []).forEach(function(p) { propertyMap[p.id] = p; });
+    }
+
+    const enriched = (inspections || []).map(function(i) {
+      const gha = ghaMap[i.gha_id] || {};
+      const prop = propertyMap[i.property_id] || {};
+      return Object.assign({}, i, {
+        gha_name: gha.full_name || null,
+        gha_code: gha.gha_code || null,
+        property_title: prop.title || null,
+        property_location: prop.location || null,
+      });
+    });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('SA inspections error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/confirm-inspection
+app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { inspection_id } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
+
+    const { data: existing } = await serviceClient
+      .from('inspections').select('id').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
+    if (!existing) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
+
+    const { error } = await serviceClient
+      .from('inspections')
+      .update({ status: 'confirmed', sa_confirmed: true, sa_confirmed_at: new Date().toISOString() })
+      .eq('id', inspection_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('SA confirm-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/mark-inspection-done
+app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { inspection_id, notes } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
+    if (!notes || notes.trim().length < 20) {
+      return res.status(400).json({ error: 'Please provide detailed inspection notes of at least 20 characters' });
+    }
+
+    const { data: inspection } = await serviceClient
+      .from('inspections').select('*').eq('id', inspection_id).eq('gha_id', ghaId).single();
+    if (!inspection) return res.status(403).json({ error: 'Inspection not found or not assigned to your GHA' });
+
+    const { error } = await serviceClient
+      .from('inspections')
+      .update({ status: 'done', notes: notes.trim(), gha_done_at: new Date().toISOString() })
+      .eq('id', inspection_id);
+    if (error) throw error;
+
+    if (inspection.assigned_by_sa) {
+      const [{ data: sa }, { data: ghaInfo }] = await Promise.all([
+        serviceClient.from('service_agents').select('email, full_name').eq('id', inspection.assigned_by_sa).single(),
+        serviceClient.from('gha_agents').select('full_name').eq('id', ghaId).single(),
+      ]);
+      const ghaName = ghaInfo?.full_name || 'GHA';
+      const notePreview = notes.trim().slice(0, 100) + (notes.trim().length > 100 ? '...' : '');
+
+      setImmediate(async function() {
+        try {
+          await serviceClient.from('notifications').insert([{
+            recipient_type: 'SA',
+            recipient_id: inspection.assigned_by_sa,
+            type: 'inspection_done',
+            title: 'GHA Completed Inspection',
+            message: `${ghaName} has completed the inspection for ${inspection.customer_name || 'N/A'} at ${inspection.property_address || 'N/A'}. Notes: ${notePreview}`,
+            is_read: false,
+          }]);
+        } catch (e) { console.error('GHA mark-done notification insert error:', e.message); }
+        if (sa?.email) {
+          try {
+            await sendCustomerEmail(
+              sa.email,
+              'GetHome - GHA Has Completed an Inspection',
+              `Hello ${sa.full_name || 'SA'},
+
+${ghaName} has completed the inspection for the following:
+
+Customer     : ${inspection.customer_name || 'N/A'}
+Property     : ${inspection.property_address || 'N/A'}
+Notes        : ${notes.trim()}
+
+Please log in to your SA dashboard to review and confirm this inspection.
+
+The GetHome Team
+https://trygethome.online`
+            );
+          } catch (e) { console.error('GHA mark-inspection-done SA email error:', e.message); }
+        }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('GHA mark-inspection-done error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/assign-gha-to-sa
+app.post('/api/admin/assign-gha-to-sa', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { gha_id, sa_id } = req.body;
+    if (!gha_id || !sa_id) return res.status(400).json({ error: 'gha_id and sa_id are required' });
+
+    const { error } = await serviceClient
+      .from('gha_agents').update({ sa_id }).eq('id', gha_id);
+    if (error) throw error;
+
+    res.json({ success: true, message: 'GHA assigned to SA successfully' });
+  } catch (err) {
+    console.error('Admin assign-gha-to-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/property-sa/:propertyId
+app.get('/api/property-sa/:propertyId', async (req, res) => {
+  try {
+    const { propertyId } = req.params;
+    const { data: property } = await serviceClient
+      .from('properties').select('created_by').eq('id', propertyId).single();
+    if (!property?.created_by) return res.json({ fallback: true });
+
+    const { data: profile } = await serviceClient
+      .from('profiles').select('sa_id').eq('id', property.created_by).single();
+    if (!profile?.sa_id) return res.json({ fallback: true });
+
+    const { data: sa } = await serviceClient
+      .from('service_agents').select('full_name, email, sa_code, whatsapp, phone').eq('id', profile.sa_id).single();
+    if (!sa) return res.json({ fallback: true });
+
+    res.json({
+      sa_name: sa.full_name || null,
+      sa_email: sa.email || null,
+      sa_code: sa.sa_code || null,
+      sa_whatsapp: sa.whatsapp || sa.phone || null,
+      fallback: false,
+    });
+  } catch (err) {
+    console.error('property-sa error:', err.message);
+    res.json({ fallback: true });
+  }
+});
+
+// GET /api/sa/notifications
+app.get('/api/sa/notifications', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { data: notifications, error } = await serviceClient
+      .from('notifications')
+      .select('*')
+      .eq('recipient_type', 'SA')
+      .eq('recipient_id', saId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const unread_count = (notifications || []).filter(function(n) { return !n.is_read; }).length;
+    res.json({ notifications: notifications || [], unread_count });
+  } catch (err) {
+    console.error('SA notifications error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha/notifications
+app.get('/api/gha/notifications', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { data: notifications, error } = await serviceClient
+      .from('notifications')
+      .select('*')
+      .eq('recipient_type', 'GHA')
+      .eq('recipient_id', ghaId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+
+    const unread_count = (notifications || []).filter(function(n) { return !n.is_read; }).length;
+    res.json({ notifications: notifications || [], unread_count });
+  } catch (err) {
+    console.error('GHA notifications error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/assign-inspection
+app.post('/api/sa/assign-inspection', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { gha_id, notification_id, customer_name, customer_email, customer_phone, property_id, inspection_date, notes } = req.body;
+    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+
+    const { data: ghaCheck } = await serviceClient
+      .from('gha_agents').select('id, gha_code, full_name, email').eq('id', gha_id).eq('sa_id', saId).single();
+    if (!ghaCheck) return res.status(403).json({ error: 'This GHA does not belong to you' });
+
+    const { data: inspection, error: insertErr } = await serviceClient
+      .from('inspections')
+      .insert([{
+        gha_id,
+        property_id: property_id || null,
+        inspection_date: inspection_date || null,
+        customer_name: customer_name || null,
+        customer_email: customer_email || null,
+        customer_phone: customer_phone || null,
+        notes: notes || null,
+        assigned_by_sa: saId,
+        status: 'pending',
+      }])
+      .select()
+      .single();
+    if (insertErr) throw insertErr;
+
+    if (notification_id) {
+      await serviceClient.from('notifications').update({ is_read: true }).eq('id', notification_id);
+    }
+
+    await serviceClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: gha_id,
+      type: 'inspection_request',
+      title: 'New Inspection Assigned',
+      message: `You have been assigned a new inspection for customer "${customer_name || 'N/A'}". Inspection date: ${inspection_date || 'TBD'}.`,
+      is_read: false,
+    }]);
+
+    if (ghaCheck.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            ghaCheck.email,
+            'GetHome - New Inspection Assigned to You',
+            `Hello ${ghaCheck.full_name || 'GHA'},
+
+A new property inspection has been assigned to you.
+
+INSPECTION DETAILS
+------------------
+Customer Name   : ${customer_name || 'N/A'}
+Customer Email  : ${customer_email || 'N/A'}
+Customer Phone  : ${customer_phone || 'N/A'}
+Inspection Date : ${inspection_date || 'TBD'}
+${notes ? 'Notes           : ' + notes : ''}
+
+Please log in to your GHA dashboard to view and manage this inspection.
+
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('SA assign-inspection GHA email error:', e.message); }
+      });
+    }
+
+    res.status(201).json(inspection);
+  } catch (err) {
+    console.error('SA assign-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/mark-notification-read
+app.post('/api/mark-notification-read', verifyStaffToken, async (req, res) => {
+  try {
+    const { notification_id } = req.body;
+    if (!notification_id) return res.status(400).json({ error: 'notification_id is required' });
+
+    const { error } = await serviceClient
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('id', notification_id)
+      .eq('recipient_id', req.staffSession.staff_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('mark-notification-read error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2818,6 +3463,27 @@ The GetHome Team`
       user_email,
       `GetHome: Proxy Inspection booked for ${property_title}. Ref: ${reference}. Your video report will be delivered within 48hrs to your email.`
     );
+    // Notify SA if property's agent belongs to one
+    setImmediate(async function() {
+      try {
+        const { data: prop } = await serviceClient
+          .from('properties').select('created_by').eq('id', property_id).single();
+        if (prop?.created_by) {
+          const { data: profile } = await serviceClient
+            .from('profiles').select('sa_id').eq('id', prop.created_by).single();
+          if (profile?.sa_id) {
+            await serviceClient.from('notifications').insert([{
+              recipient_type: 'SA',
+              recipient_id: profile.sa_id,
+              type: 'proxy_payment',
+              title: 'Proxy Inspection Payment Received',
+              message: `Customer ${user_email || 'N/A'} paid ₦${Number(amount_naira).toLocaleString('en-NG')} for a proxy inspection of "${property_title || 'N/A'}". Reference: ${reference}.`,
+              is_read: false,
+            }]);
+          }
+        }
+      } catch (e) { console.error('SA proxy-payment notification error:', e.message); }
+    });
     console.log(`Inspection notification sent. Ref: ${reference}`);
     res.status(200).json({ success: true });
   } catch (err) {
