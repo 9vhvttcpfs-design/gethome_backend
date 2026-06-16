@@ -2552,6 +2552,195 @@ app.post('/api/admin/assign-gha-to-sa', async (req, res) => {
   }
 });
 
+// GET /api/admin/inspections
+app.get('/api/admin/inspections', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: inspections, error } = await serviceClient
+      .from('inspections')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const saIds = [...new Set((inspections || []).map(function(i) { return i.assigned_by_sa; }).filter(Boolean))];
+    const ghaIds = [...new Set((inspections || []).map(function(i) { return i.gha_id; }).filter(Boolean))];
+    const propertyIds = [...new Set((inspections || []).map(function(i) { return i.property_id; }).filter(Boolean))];
+
+    let saMap = {}, ghaMap = {}, propertyMap = {};
+
+    if (saIds.length > 0) {
+      const { data: sas } = await serviceClient
+        .from('service_agents')
+        .select('id, sa_code, full_name')
+        .in('id', saIds);
+      (sas || []).forEach(function(s) { saMap[s.id] = s; });
+    }
+    if (ghaIds.length > 0) {
+      const { data: ghas } = await serviceClient
+        .from('gha_agents')
+        .select('id, gha_code, full_name')
+        .in('id', ghaIds);
+      (ghas || []).forEach(function(g) { ghaMap[g.id] = g; });
+    }
+    if (propertyIds.length > 0) {
+      const { data: props } = await serviceClient
+        .from('properties')
+        .select('id, title, location')
+        .in('id', propertyIds);
+      (props || []).forEach(function(p) { propertyMap[p.id] = p; });
+    }
+
+    const enriched = (inspections || []).map(function(i) {
+      const sa = saMap[i.assigned_by_sa] || {};
+      const gha = ghaMap[i.gha_id] || {};
+      const prop = propertyMap[i.property_id] || {};
+      return Object.assign({}, i, {
+        sa_code: sa.sa_code || null,
+        sa_name: sa.full_name || null,
+        gha_code: gha.gha_code || null,
+        gha_name: gha.full_name || null,
+        property_title: prop.title || null,
+        property_location: prop.location || null,
+      });
+    });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('Admin inspections error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/confirm-inspection
+app.post('/api/admin/confirm-inspection', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { inspection_id } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
+
+    const { error: updateErr } = await serviceClient
+      .from('inspections')
+      .update({ status: 'confirmed', sa_confirmed: true, sa_confirmed_at: new Date().toISOString() })
+      .eq('id', inspection_id);
+    if (updateErr) throw updateErr;
+
+    const { data: inspection } = await serviceClient
+      .from('inspections')
+      .select('customer_email, customer_name, property_id, property_address')
+      .eq('id', inspection_id)
+      .single();
+
+    let propertyTitle = null;
+    if (inspection?.property_id) {
+      const { data: prop } = await serviceClient
+        .from('properties')
+        .select('title')
+        .eq('id', inspection.property_id)
+        .single();
+      propertyTitle = prop?.title || null;
+    }
+
+    if (inspection?.customer_email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            inspection.customer_email,
+            'GetHome - Your Property Inspection Has Been Confirmed',
+            `Hello ${inspection.customer_name || ''},
+
+We are pleased to inform you that your property inspection has been completed and confirmed by the GetHome team.
+
+Property  : ${propertyTitle || inspection.property_address || 'N/A'}
+
+Our team will be in contact with you shortly with the full report and next steps.
+
+Thank you for choosing GetHome.
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('Admin confirm-inspection email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin confirm-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/reassign-inspection
+app.post('/api/admin/reassign-inspection', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { inspection_id, new_gha_id } = req.body;
+    if (!inspection_id || !new_gha_id) return res.status(400).json({ error: 'inspection_id and new_gha_id are required' });
+
+    const { data: ghaCheck } = await serviceClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, email')
+      .eq('id', new_gha_id)
+      .single();
+    if (!ghaCheck) return res.status(404).json({ error: 'GHA not found' });
+
+    const { data: inspection, error: updateErr } = await serviceClient
+      .from('inspections')
+      .update({ gha_id: new_gha_id, status: 'pending', gha_done_at: null, notes: null })
+      .eq('id', inspection_id)
+      .select()
+      .single();
+    if (updateErr) throw updateErr;
+    if (!inspection) return res.status(404).json({ error: 'Inspection not found' });
+
+    await serviceClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: new_gha_id,
+      type: 'inspection_request',
+      title: 'Inspection Reassigned to You',
+      message: `An inspection for customer "${inspection.customer_name || 'N/A'}" at ${inspection.property_address || 'N/A'} has been reassigned to you. Inspection date: ${inspection.inspection_date || 'TBD'}.`,
+      is_read: false,
+    }]);
+
+    if (ghaCheck.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            ghaCheck.email,
+            'GetHome - Inspection Reassigned to You',
+            `Hello ${ghaCheck.full_name || 'GHA'},
+
+An inspection has been reassigned to you by admin.
+
+INSPECTION DETAILS
+------------------
+Customer Name   : ${inspection.customer_name || 'N/A'}
+Customer Email  : ${inspection.customer_email || 'N/A'}
+Customer Phone  : ${inspection.customer_phone || 'N/A'}
+Property        : ${inspection.property_address || 'N/A'}
+Inspection Date : ${inspection.inspection_date || 'TBD'}
+
+Please log in to your GHA dashboard to view and manage this inspection.
+
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('Admin reassign-inspection GHA email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin reassign-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/property-sa/:propertyId
 app.get('/api/property-sa/:propertyId', async (req, res) => {
   try {
@@ -2719,6 +2908,41 @@ app.post('/api/mark-notification-read', verifyStaffToken, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('mark-notification-read error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/update-profile
+app.post('/api/sa/update-profile', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+    let { whatsapp_number, full_name, phone, location } = req.body;
+
+    if (whatsapp_number != null) {
+      whatsapp_number = String(whatsapp_number).replace(/[^0-9]/g, '');
+      if (whatsapp_number.startsWith('0')) whatsapp_number = '234' + whatsapp_number.substring(1);
+    }
+
+    const updates = {};
+    if (whatsapp_number != null) updates.whatsapp_number = whatsapp_number;
+    if (full_name      != null) updates.full_name      = String(full_name).trim();
+    if (phone          != null) updates.phone          = String(phone).trim();
+    if (location       != null) updates.location       = String(location).trim();
+
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    const { data, error } = await serviceClient
+      .from('service_agents')
+      .update(updates)
+      .eq('id', saId)
+      .select('id, staff_id, full_name, email, phone, location, whatsapp_number, role, created_at')
+      .single();
+    if (error) throw error;
+
+    res.json(data);
+  } catch (err) {
+    console.error('sa/update-profile error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
