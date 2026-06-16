@@ -1,6 +1,7 @@
 const express    = require('express');
 const cors       = require('cors');
 const nodemailer = require('nodemailer');
+const bcrypt     = require('bcrypt');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const app  = express();
@@ -385,7 +386,7 @@ app.get('/api/admin/agents', async (req, res) => {
     // Fetch ALL agents - use adminClient to bypass RLS
     const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, kyc_documents')
+      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, kyc_documents, bank_name, account_number, account_name')
       .eq('role', 'agent')
       .order('created_at', { ascending: false });
     if (error) {
@@ -794,12 +795,30 @@ app.get('/api/admin/all-listings', async (req, res) => {
     if (agentIds.length > 0) {
       const { data: agents } = await adminClient
         .from('profiles')
-        .select('id, email, full_name')
+        .select('id, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, status, bank_name, account_number, account_name, created_at')
         .in('id', agentIds);
       (agents || []).forEach(function(a) { agentMap[a.id] = a; });
     }
     const enriched = (properties || []).map(function(p) {
-      return Object.assign({}, p, { agent: agentMap[p.created_by] || null });
+      const profile = agentMap[p.created_by] || {};
+      return Object.assign({}, p, {
+        agent: profile,
+        agent_name: profile.full_name || null,
+        agent_email: profile.email || null,
+        agent_phone: profile.phone || null,
+        agent_address: profile.office_address || null,
+        agent_experience: profile.experience || null,
+        agent_specialty: profile.specialty || null,
+        agent_nin: profile.nin_number || null,
+        agent_cac: profile.cac_number || null,
+        agent_about: profile.about || null,
+        agent_verification: profile.verification_level || null,
+        agent_status: profile.status || null,
+        agent_bank_name: profile.bank_name || null,
+        agent_account_number: profile.account_number || null,
+        agent_account_name: profile.account_name || null,
+        agent_created_at: profile.created_at || null,
+      });
     });
     res.json(enriched);
   } catch (err) {
@@ -964,6 +983,1101 @@ https://trygethome.online`
     res.status(500).json({ error: err.message });
   }
 });
+// ──────────────────────────────────────────────────────────
+// STAFF AUTH HELPERS
+// ──────────────────────────────────────────────────────────
+
+async function verifyAdminToken(req) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+  if (!token) return null;
+  const { data: { user }, error } = await serviceClient.auth.getUser(token);
+  if (error || !user) return null;
+  const { data: profile } = await serviceClient
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .single();
+  if (profile?.role !== 'admin') return null;
+  return user;
+}
+
+async function verifyStaffToken(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+  if (!token) return res.status(401).json({ error: 'No token' });
+  const { data: session } = await serviceClient
+    .from('staff_sessions')
+    .select('*')
+    .eq('token', token)
+    .gt('expires_at', new Date().toISOString())
+    .single();
+  if (!session) return res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });
+  req.staffSession = session;
+  next();
+}
+
+// ──────────────────────────────────────────────────────────
+// STAFF ENDPOINTS
+// ──────────────────────────────────────────────────────────
+
+// POST /api/staff/login
+app.post('/api/staff/login', async (req, res) => {
+  try {
+    const { staffId, password, role } = req.body;
+    if (!staffId || !password || !role) return res.status(400).json({ error: 'staffId, password, and role are required' });
+
+    let table, codeField;
+    if (role === 'SA') {
+      table = 'service_agents';
+      codeField = 'sa_code';
+    } else if (role === 'GHA') {
+      table = 'gha_agents';
+      codeField = 'gha_code';
+    } else {
+      return res.status(400).json({ error: 'role must be SA or GHA' });
+    }
+
+    const { data: staff } = await serviceClient
+      .from(table)
+      .select('*')
+      .eq(codeField, staffId.toUpperCase().trim())
+      .single();
+
+    if (!staff) return res.status(401).json({ error: 'Invalid staff ID or password' });
+
+    if (staff.status === 'inactive') {
+      return res.status(403).json({ error: 'Your account has been deactivated. Contact admin.' });
+    }
+
+    let valid;
+    if (staff.password_hash) {
+      valid = await bcrypt.compare(password, staff.password_hash);
+    } else {
+      valid = password === staff.password_hash;
+    }
+    if (!valid) return res.status(401).json({ error: 'Invalid staff ID or password' });
+
+    const token = require('crypto').randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    await serviceClient.from('staff_sessions').insert([{
+      staff_id: staff.id,
+      staff_role: role,
+      staff_code: staffId.toUpperCase().trim(),
+      token,
+      expires_at: expiresAt,
+    }]);
+
+    await serviceClient.from(table).update({ last_login: new Date().toISOString() }).eq('id', staff.id);
+
+    res.json({
+      token,
+      user: {
+        id: staff.id,
+        code: role === 'SA' ? staff.sa_code : staff.gha_code,
+        full_name: staff.full_name,
+        email: staff.email,
+        phone: staff.phone,
+        location: staff.location,
+        role,
+        sa_id: staff.sa_id || null,
+      },
+    });
+  } catch (err) {
+    console.error('Staff login error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/staff/me
+app.get('/api/staff/me', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    const { data: session } = await serviceClient
+      .from('staff_sessions')
+      .select('*')
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+
+    if (!session) return res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });
+
+    let table, codeField;
+    if (session.staff_role === 'SA') {
+      table = 'service_agents';
+      codeField = 'sa_code';
+    } else {
+      table = 'gha_agents';
+      codeField = 'gha_code';
+    }
+
+    const { data: staff } = await serviceClient.from(table).select('*').eq('id', session.staff_id).single();
+    if (!staff) return res.status(404).json({ error: 'Staff record not found' });
+
+    res.json({
+      id: staff.id,
+      code: staff[codeField],
+      full_name: staff.full_name,
+      email: staff.email,
+      phone: staff.phone,
+      location: staff.location,
+      role: session.staff_role,
+      sa_id: staff.sa_id || null,
+    });
+  } catch (err) {
+    console.error('Staff me error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/my-ghas
+app.get('/api/sa/my-ghas', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { data: ghas, error } = await serviceClient
+      .from('gha_agents')
+      .select('*')
+      .eq('sa_id', saId);
+    if (error) throw error;
+
+    const now = new Date().toISOString();
+    const enriched = await Promise.all((ghas || []).map(async function(gha) {
+      const { count: agentCount } = await serviceClient
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id);
+
+      const { data: activeSubs } = await serviceClient
+        .from('profiles')
+        .select('subscription_amount')
+        .eq('gha_id', gha.id)
+        .gt('subscription_end', now);
+      const monthlyCommission = (activeSubs || []).reduce(function(sum, p) {
+        return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
+      }, 0);
+
+      return Object.assign({}, gha, {
+        password_hash: undefined,
+        gh_staff_token: undefined,
+        agent_count: agentCount || 0,
+        monthly_commission: monthlyCommission,
+      });
+    }));
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('SA my-ghas error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/my-agents
+app.get('/api/sa/my-agents', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { data: ghas } = await serviceClient
+      .from('gha_agents')
+      .select('id')
+      .eq('sa_id', saId);
+    const ghaIds = (ghas || []).map(function(g) { return g.id; });
+
+    if (ghaIds.length === 0) return res.json([]);
+
+    const { data: agents, error } = await serviceClient
+      .from('profiles')
+      .select('*')
+      .in('gha_id', ghaIds)
+      .eq('role', 'agent');
+    if (error) throw error;
+
+    const now = new Date();
+    const enriched = (agents || []).map(function(agent) {
+      return Object.assign({}, agent, {
+        is_expired: agent.subscription_end ? new Date(agent.subscription_end) < now : false,
+      });
+    }).sort(function(a, b) { return b.is_expired - a.is_expired; });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('SA my-agents error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/pending-agents
+app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { data: agents, error } = await serviceClient
+      .from('profiles')
+      .select('*')
+      .eq('sa_id', saId)
+      .eq('status', 'pending')
+      .eq('role', 'agent')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    res.json(agents || []);
+  } catch (err) {
+    console.error('SA pending-agents error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/approve-agent
+app.post('/api/sa/approve-agent', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { agent_id, gha_id } = req.body;
+    if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+
+    if (gha_id) {
+      const { data: ghaCheck } = await serviceClient
+        .from('gha_agents')
+        .select('id')
+        .eq('id', gha_id)
+        .eq('sa_id', saId)
+        .single();
+      if (!ghaCheck) return res.status(403).json({ error: 'GHA does not belong to your SA' });
+    }
+
+    const { error } = await serviceClient
+      .from('profiles')
+      .update({ status: 'approved', gha_id: gha_id || null, sa_id: saId })
+      .eq('id', agent_id);
+    if (error) throw error;
+
+    const { data: agent } = await serviceClient
+      .from('profiles')
+      .select('email, full_name')
+      .eq('id', agent_id)
+      .single();
+    if (agent?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            agent.email,
+            'Your GetHome Agent Account Has Been Approved!',
+            `Hello ${agent.full_name || 'Agent'},
+
+Your GetHome agent account has been approved. You can now log in and start listing properties.
+
+Sign in here: https://trygethome.online
+
+Welcome to the GetHome agent network!
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('SA approve-agent email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('SA approve-agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/assign-gha
+app.post('/api/sa/assign-gha', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { agent_id, gha_id } = req.body;
+    if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
+
+    const { data: ghaCheck } = await serviceClient
+      .from('gha_agents')
+      .select('id')
+      .eq('id', gha_id)
+      .eq('sa_id', saId)
+      .single();
+    if (!ghaCheck) return res.status(403).json({ error: 'GHA does not belong to your SA' });
+
+    const { error } = await serviceClient
+      .from('profiles')
+      .update({ gha_id })
+      .eq('id', agent_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('SA assign-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/subscriptions
+app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { data: ghas } = await serviceClient
+      .from('gha_agents')
+      .select('id')
+      .eq('sa_id', saId);
+    const ghaIds = (ghas || []).map(function(g) { return g.id; });
+
+    if (ghaIds.length === 0) return res.json({ agents: [], total_revenue: 0, sa_commission: 0, by_month: [] });
+
+    const { data: agents, error } = await serviceClient
+      .from('profiles')
+      .select('id, full_name, email, gha_id, subscription_tier, subscription_amount, subscription_start, subscription_end')
+      .in('gha_id', ghaIds)
+      .eq('role', 'agent');
+    if (error) throw error;
+
+    const { data: saEarnings } = await serviceClient
+      .from('sa_earnings')
+      .select('month_year, amount, is_paid')
+      .eq('sa_id', saId);
+    const earningsMap = {};
+    (saEarnings || []).forEach(function(e) { earningsMap[e.month_year] = e; });
+
+    const totalRevenue = (agents || []).reduce(function(sum, a) {
+      return sum + (parseFloat(a.subscription_amount) || 0);
+    }, 0);
+    const saCommission = totalRevenue * 0.07;
+
+    const byMonth = {};
+    (agents || []).forEach(function(a) {
+      if (!a.subscription_start) return;
+      const key = a.subscription_start.slice(0, 7);
+      if (!byMonth[key]) byMonth[key] = { month: key, revenue: 0, agent_count: 0, sa_commission: 0, is_paid: earningsMap[key]?.is_paid || false };
+      byMonth[key].revenue += parseFloat(a.subscription_amount) || 0;
+      byMonth[key].agent_count += 1;
+      byMonth[key].sa_commission = byMonth[key].revenue * 0.07;
+    });
+
+    res.json({
+      agents: agents || [],
+      total_revenue: totalRevenue,
+      sa_commission: saCommission,
+      by_month: Object.values(byMonth).sort(function(a, b) { return b.month.localeCompare(a.month); }),
+    });
+  } catch (err) {
+    console.error('SA subscriptions error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/deposits
+app.get('/api/sa/deposits', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { data: ghas } = await serviceClient.from('gha_agents').select('id').eq('sa_id', saId);
+    const ghaIds = (ghas || []).map(function(g) { return g.id; });
+    if (ghaIds.length === 0) return res.json([]);
+
+    const { data: agents } = await serviceClient
+      .from('profiles')
+      .select('id, full_name, email')
+      .in('gha_id', ghaIds)
+      .eq('role', 'agent');
+    const agentIds = (agents || []).map(function(a) { return a.id; });
+    const agentMap = {};
+    (agents || []).forEach(function(a) { agentMap[a.id] = a; });
+
+    if (agentIds.length === 0) return res.json([]);
+
+    const { data: deposits, error } = await serviceClient
+      .from('properties')
+      .select('*')
+      .in('created_by', agentIds)
+      .not('deposit_status', 'is', null)
+      .neq('deposit_status', 'none')
+      .order('deposit_date', { ascending: false });
+    if (error) throw error;
+
+    const enriched = (deposits || []).map(function(p) {
+      return Object.assign({}, p, { agent: agentMap[p.created_by] || null });
+    });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('SA deposits error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/confirm-deposit
+app.post('/api/sa/confirm-deposit', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+
+    const { property_id } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+
+    const { error: updateErr } = await serviceClient
+      .from('properties')
+      .update({ deposit_confirmed: true, deposit_status: 'confirmed' })
+      .eq('id', property_id);
+    if (updateErr) throw updateErr;
+
+    const { data: property } = await serviceClient
+      .from('properties')
+      .select('title, depositor_email, deposit_reference')
+      .eq('id', property_id)
+      .single();
+
+    if (property?.depositor_email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            property.depositor_email,
+            'GetHome - Your Deposit Has Been Confirmed',
+            `Hello,
+
+Your deposit for the property "${property.title || 'N/A'}" has been confirmed.
+
+You will be contacted shortly to finalize the transaction.
+
+Reference: ${property.deposit_reference || 'N/A'}
+
+Thank you for choosing GetHome.
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('SA confirm-deposit email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('SA confirm-deposit error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha/my-agents
+app.get('/api/gha/my-agents', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { data: agents, error } = await serviceClient
+      .from('profiles')
+      .select('id, full_name, phone, email, nin_number, experience, specialty, verification_level, status, subscription_tier, subscription_end, bank_name, account_number, gha_id, sa_id, created_at')
+      .eq('gha_id', ghaId)
+      .eq('role', 'agent')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const now = new Date();
+    const enriched = (agents || []).map(function(agent) {
+      return Object.assign({}, agent, {
+        nin_number: agent.nin_number
+          ? agent.nin_number.slice(0, 3) + '****' + agent.nin_number.slice(-3)
+          : null,
+        is_expired: agent.subscription_end ? new Date(agent.subscription_end) < now : false,
+      });
+    });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('GHA my-agents error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha/my-listings
+app.get('/api/gha/my-listings', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { data: agentRows } = await serviceClient
+      .from('profiles')
+      .select('id, full_name, email')
+      .eq('gha_id', ghaId)
+      .eq('role', 'agent');
+    const agentIds = (agentRows || []).map(function(a) { return a.id; });
+    if (agentIds.length === 0) return res.json([]);
+
+    const agentMap = {};
+    (agentRows || []).forEach(function(a) { agentMap[a.id] = a; });
+
+    const { data: properties, error } = await serviceClient
+      .from('properties')
+      .select('*')
+      .in('created_by', agentIds)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const enriched = (properties || []).map(function(p) {
+      const agent = agentMap[p.created_by] || {};
+      return Object.assign({}, p, {
+        agent_name: agent.full_name || null,
+        agent_email: agent.email || null,
+      });
+    });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('GHA my-listings error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/verify-listing
+app.post('/api/gha/verify-listing', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { property_id } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+
+    const { data: agentRows } = await serviceClient
+      .from('profiles')
+      .select('id')
+      .eq('gha_id', ghaId)
+      .eq('role', 'agent');
+    const agentIds = (agentRows || []).map(function(a) { return a.id; });
+
+    const { data: prop } = await serviceClient
+      .from('properties')
+      .select('id, created_by')
+      .eq('id', property_id)
+      .single();
+    if (!prop || !agentIds.includes(prop.created_by)) {
+      return res.status(403).json({ error: 'Property does not belong to an agent under your GHA' });
+    }
+
+    const { error } = await serviceClient
+      .from('properties')
+      .update({ gha_verified: true, gha_verified_at: new Date().toISOString() })
+      .eq('id', property_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('GHA verify-listing error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha/inspections
+app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { data: inspections, error } = await serviceClient
+      .from('inspections')
+      .select('*')
+      .eq('gha_id', ghaId)
+      .order('inspection_date', { ascending: false });
+    if (error) throw error;
+
+    const propertyIds = [...new Set((inspections || []).map(function(i) { return i.property_id; }).filter(Boolean))];
+    let propertyMap = {};
+    if (propertyIds.length > 0) {
+      const { data: props } = await serviceClient
+        .from('properties')
+        .select('id, title, location')
+        .in('id', propertyIds);
+      (props || []).forEach(function(p) { propertyMap[p.id] = p; });
+    }
+
+    const enriched = (inspections || []).map(function(i) {
+      const prop = propertyMap[i.property_id] || {};
+      return Object.assign({}, i, {
+        property_title: prop.title || null,
+        property_location: prop.location || null,
+      });
+    });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('GHA inspections error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/update-inspection
+app.post('/api/gha/update-inspection', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { inspection_id, status, notes } = req.body;
+    if (!inspection_id || !status) return res.status(400).json({ error: 'inspection_id and status are required' });
+
+    const { data: updated, error } = await serviceClient
+      .from('inspections')
+      .update({ status, notes: notes || null })
+      .eq('id', inspection_id)
+      .eq('gha_id', ghaId)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!updated) return res.status(404).json({ error: 'Inspection not found or not assigned to your GHA' });
+
+    if (status === 'completed' && updated.customer_email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            updated.customer_email,
+            'GetHome - Your Property Inspection Is Complete',
+            `Hello,
+
+Your property inspection has been completed by the GetHome team.
+
+Our representative will be in contact with you shortly with the full report and next steps.
+
+Thank you for choosing GetHome.
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('GHA update-inspection email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('GHA update-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha/earnings
+app.get('/api/gha/earnings', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    const { data: earnings, error } = await serviceClient
+      .from('gha_earnings')
+      .select('*')
+      .eq('gha_id', ghaId)
+      .order('month_year', { ascending: false });
+    if (error) throw error;
+
+    const total = (earnings || []).reduce(function(sum, e) {
+      return sum + (parseFloat(e.amount) || 0);
+    }, 0);
+
+    res.json({
+      earnings: earnings || [],
+      total_earned: total,
+      total_paid: (earnings || []).filter(function(e) { return e.is_paid; }).reduce(function(sum, e) { return sum + (parseFloat(e.amount) || 0); }, 0),
+      total_pending: (earnings || []).filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) { return sum + (parseFloat(e.amount) || 0); }, 0),
+    });
+  } catch (err) {
+    console.error('GHA earnings error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/create-sa
+app.post('/api/admin/create-sa', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { full_name, email, phone, location, password } = req.body;
+    if (!full_name || !email || !phone || !password) {
+      return res.status(400).json({ error: 'full_name, email, phone, and password are required' });
+    }
+
+    const { count } = await serviceClient
+      .from('service_agents')
+      .select('id', { count: 'exact', head: true });
+    const sa_code = 'SA' + String((count || 0) + 1).padStart(4, '0');
+    const password_hash = await bcrypt.hash(password, 10);
+
+    const { data, error } = await serviceClient
+      .from('service_agents')
+      .insert([{ full_name, email, phone, location: location || null, sa_code, password_hash }])
+      .select()
+      .single();
+    if (error) throw error;
+
+    const result = Object.assign({}, data);
+    delete result.password_hash;
+    delete result.gh_staff_token;
+    res.status(201).json(result);
+  } catch (err) {
+    console.error('Admin create-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/create-gha
+app.post('/api/admin/create-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { full_name, email, phone, location, sa_id, password } = req.body;
+    if (!full_name || !email || !phone || !password) {
+      return res.status(400).json({ error: 'full_name, email, phone, and password are required' });
+    }
+
+    if (sa_id) {
+      const { data: saCheck } = await serviceClient
+        .from('service_agents')
+        .select('id')
+        .eq('id', sa_id)
+        .single();
+      if (!saCheck) return res.status(400).json({ error: 'sa_id does not match any Service Agent' });
+    }
+
+    const { count } = await serviceClient
+      .from('gha_agents')
+      .select('id', { count: 'exact', head: true });
+    const gha_code = 'GHA' + String((count || 0) + 1).padStart(4, '0');
+    const password_hash = await bcrypt.hash(password, 10);
+
+    const { data, error } = await serviceClient
+      .from('gha_agents')
+      .insert([{ full_name, email, phone, location: location || null, sa_id: sa_id || null, gha_code, password_hash }])
+      .select()
+      .single();
+    if (error) throw error;
+
+    const result = Object.assign({}, data);
+    delete result.password_hash;
+    delete result.gh_staff_token;
+    res.status(201).json(result);
+  } catch (err) {
+    console.error('Admin create-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/all-sas
+app.get('/api/admin/all-sas', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: sas, error } = await serviceClient
+      .from('service_agents')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const now = new Date().toISOString();
+    const enriched = await Promise.all((sas || []).map(async function(sa) {
+      const { data: ghas } = await serviceClient
+        .from('gha_agents')
+        .select('id')
+        .eq('sa_id', sa.id);
+      const ghaIds = (ghas || []).map(function(g) { return g.id; });
+      const ghaCount = ghaIds.length;
+
+      let agentCount = 0;
+      let monthlyEarnings = 0;
+      if (ghaIds.length > 0) {
+        const { count } = await serviceClient
+          .from('profiles')
+          .select('id', { count: 'exact', head: true })
+          .in('gha_id', ghaIds)
+          .eq('role', 'agent');
+        agentCount = count || 0;
+
+        const { data: activeSubs } = await serviceClient
+          .from('profiles')
+          .select('subscription_amount')
+          .in('gha_id', ghaIds)
+          .gt('subscription_end', now);
+        monthlyEarnings = (activeSubs || []).reduce(function(sum, p) {
+          return sum + (parseFloat(p.subscription_amount) || 0) * 0.10;
+        }, 0);
+      }
+
+      const result = Object.assign({}, sa, {
+        gha_count: ghaCount,
+        agent_count: agentCount,
+        monthly_earnings: monthlyEarnings,
+      });
+      delete result.password_hash;
+      delete result.gh_staff_token;
+      return result;
+    }));
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('Admin all-sas error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/all-ghas
+app.get('/api/admin/all-ghas', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: ghas, error } = await serviceClient
+      .from('gha_agents')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const saIds = [...new Set((ghas || []).map(function(g) { return g.sa_id; }).filter(Boolean))];
+    let saMap = {};
+    if (saIds.length > 0) {
+      const { data: sas } = await serviceClient
+        .from('service_agents')
+        .select('id, full_name, email, sa_code')
+        .in('id', saIds);
+      (sas || []).forEach(function(s) { saMap[s.id] = s; });
+    }
+
+    const now = new Date().toISOString();
+    const enriched = await Promise.all((ghas || []).map(async function(gha) {
+      const { count: agentCount } = await serviceClient
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .eq('role', 'agent');
+
+      const { data: activeSubs } = await serviceClient
+        .from('profiles')
+        .select('subscription_amount')
+        .eq('gha_id', gha.id)
+        .gt('subscription_end', now);
+      const monthlyEarnings = (activeSubs || []).reduce(function(sum, p) {
+        return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
+      }, 0);
+
+      const result = Object.assign({}, gha, {
+        agent_count: agentCount || 0,
+        monthly_earnings: monthlyEarnings,
+        sa: gha.sa_id ? (saMap[gha.sa_id] || null) : null,
+      });
+      delete result.password_hash;
+      delete result.gh_staff_token;
+      return result;
+    }));
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('Admin all-ghas error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/deactivate-sa
+app.post('/api/admin/deactivate-sa', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { sa_id } = req.body;
+    if (!sa_id) return res.status(400).json({ error: 'sa_id is required' });
+
+    const { error: saErr } = await serviceClient
+      .from('service_agents')
+      .update({ status: 'inactive' })
+      .eq('id', sa_id);
+    if (saErr) throw saErr;
+
+    const { error: ghaErr } = await serviceClient
+      .from('gha_agents')
+      .update({ status: 'inactive' })
+      .eq('sa_id', sa_id);
+    if (ghaErr) throw ghaErr;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin deactivate-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/mark-sa-paid
+app.post('/api/admin/mark-sa-paid', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { sa_id, month_year } = req.body;
+    if (!sa_id || !month_year) return res.status(400).json({ error: 'sa_id and month_year are required' });
+
+    const { error } = await serviceClient
+      .from('sa_earnings')
+      .update({ is_paid: true, paid_at: new Date().toISOString(), paid_by: admin.id })
+      .eq('sa_id', sa_id)
+      .eq('month_year', month_year);
+    if (error) throw error;
+
+    const { data: sa } = await serviceClient
+      .from('service_agents')
+      .select('email, full_name')
+      .eq('id', sa_id)
+      .single();
+    if (sa?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            sa.email,
+            'GetHome - Your Commission Has Been Paid',
+            `Hello ${sa.full_name || 'Service Agent'},
+
+Your GetHome commission for ${month_year} has been processed and paid to your account.
+
+Thank you for your continued partnership.
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('SA mark-paid email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin mark-sa-paid error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/mark-gha-paid
+app.post('/api/admin/mark-gha-paid', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { gha_id, month_year } = req.body;
+    if (!gha_id || !month_year) return res.status(400).json({ error: 'gha_id and month_year are required' });
+
+    const { error } = await serviceClient
+      .from('gha_earnings')
+      .update({ is_paid: true, paid_at: new Date().toISOString(), paid_by: admin.id })
+      .eq('gha_id', gha_id)
+      .eq('month_year', month_year);
+    if (error) throw error;
+
+    const { data: gha } = await serviceClient
+      .from('gha_agents')
+      .select('email, full_name')
+      .eq('id', gha_id)
+      .single();
+    if (gha?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            gha.email,
+            'GetHome - Your Salary Has Been Processed',
+            `Hello ${gha.full_name || 'GHA'},
+
+Your GetHome salary for ${month_year} has been processed and paid to your account.
+
+Thank you for your continued service.
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('GHA paid email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin mark-gha-paid error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/earnings-summary
+app.get('/api/admin/earnings-summary', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const now = new Date();
+    const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const month_year = req.query.month_year || defaultMonth;
+
+    const [{ data: ghaEarnings, error: ghaErr }, { data: saEarnings, error: saErr }] = await Promise.all([
+      serviceClient.from('gha_earnings').select('*').eq('month_year', month_year),
+      serviceClient.from('sa_earnings').select('*').eq('month_year', month_year),
+    ]);
+    if (ghaErr) throw ghaErr;
+    if (saErr) throw saErr;
+
+    const ghaIds = [...new Set((ghaEarnings || []).map(function(r) { return r.gha_id; }).filter(Boolean))];
+    const saIds  = [...new Set((saEarnings  || []).map(function(r) { return r.sa_id;  }).filter(Boolean))];
+
+    let ghaStaffMap = {}, saStaffMap = {};
+    if (ghaIds.length > 0) {
+      const { data: ghaStaff } = await serviceClient
+        .from('gha_agents')
+        .select('id, full_name, email, gha_code')
+        .in('id', ghaIds);
+      (ghaStaff || []).forEach(function(g) { ghaStaffMap[g.id] = g; });
+    }
+    if (saIds.length > 0) {
+      const { data: saStaff } = await serviceClient
+        .from('service_agents')
+        .select('id, full_name, email, sa_code')
+        .in('id', saIds);
+      (saStaff || []).forEach(function(s) { saStaffMap[s.id] = s; });
+    }
+
+    const ghaMap = {};
+    (ghaEarnings || []).forEach(function(row) {
+      if (!ghaMap[row.gha_id]) {
+        ghaMap[row.gha_id] = {
+          gha_id: row.gha_id,
+          staff: ghaStaffMap[row.gha_id] || null,
+          total_earned: 0,
+          is_paid: row.is_paid,
+          paid_at: row.paid_at || null,
+        };
+      }
+      ghaMap[row.gha_id].total_earned += parseFloat(row.commission_amount || row.amount) || 0;
+    });
+
+    const saMap = {};
+    (saEarnings || []).forEach(function(row) {
+      if (!saMap[row.sa_id]) {
+        saMap[row.sa_id] = {
+          sa_id: row.sa_id,
+          staff: saStaffMap[row.sa_id] || null,
+          total_earned: 0,
+          is_paid: row.is_paid,
+          paid_at: row.paid_at || null,
+        };
+      }
+      saMap[row.sa_id].total_earned += parseFloat(row.commission_amount || row.amount) || 0;
+    });
+
+    const ghaTotals = Object.values(ghaMap);
+    const saTotals  = Object.values(saMap);
+    const grandTotalGHA = ghaTotals.reduce(function(s, r) { return s + r.total_earned; }, 0);
+    const grandTotalSA  = saTotals.reduce(function(s, r) { return s + r.total_earned; }, 0);
+
+    res.json({
+      month_year,
+      gha_totals: ghaTotals,
+      sa_totals: saTotals,
+      grand_total_gha: grandTotalGHA,
+      grand_total_sa: grandTotalSA,
+      grand_total_all: grandTotalGHA + grandTotalSA,
+    });
+  } catch (err) {
+    console.error('Admin earnings-summary error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Self-ping every 14 minutes to prevent Render free tier sleep
 setInterval(function() {
   try {
