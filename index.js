@@ -2240,85 +2240,35 @@ https://trygethome.online`
   }
 });
 
-// GET /api/admin/earnings-summary
-app.get('/api/admin/earnings-summary', async (req, res) => {
+// GET /api/admin/earnings
+app.get('/api/admin/earnings', async (req, res) => {
   try {
-    const admin = await verifyAdminToken(req);
-    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    var token = (req.headers.authorization || '').replace('Bearer ', '');
+    var adminClient = require('@supabase/supabase-js').createClient(
+      process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+      { auth: { autoRefreshToken: false, persistSession: false } }
+    );
+    var { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    if (authError || !userData.user) return res.status(401).json({ error: 'Unauthorized' });
 
-    const now = new Date();
-    const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    const month_year = req.query.month_year || defaultMonth;
+    var month = req.query.month || new Date().toISOString().slice(0, 7);
 
-    const [{ data: ghaEarnings, error: ghaErr }, { data: saEarnings, error: saErr }] = await Promise.all([
-      serviceClient.from('gha_earnings').select('*').eq('month_year', month_year),
-      serviceClient.from('sa_earnings').select('*').eq('month_year', month_year),
-    ]);
-    if (ghaErr) throw ghaErr;
-    if (saErr) throw saErr;
+    var { data: ghaEarnings } = await adminClient.from('gha_earnings').select('*').eq('month_year', month);
+    var { data: saEarnings } = await adminClient.from('sa_earnings').select('*').eq('month_year', month);
 
-    const ghaIds = [...new Set((ghaEarnings || []).map(function(r) { return r.gha_id; }).filter(Boolean))];
-    const saIds  = [...new Set((saEarnings  || []).map(function(r) { return r.sa_id;  }).filter(Boolean))];
-
-    let ghaStaffMap = {}, saStaffMap = {};
-    if (ghaIds.length > 0) {
-      const { data: ghaStaff } = await serviceClient
-        .from('gha_agents')
-        .select('id, full_name, email, gha_code')
-        .in('id', ghaIds);
-      (ghaStaff || []).forEach(function(g) { ghaStaffMap[g.id] = g; });
-    }
-    if (saIds.length > 0) {
-      const { data: saStaff } = await serviceClient
-        .from('service_agents')
-        .select('id, full_name, email, sa_code')
-        .in('id', saIds);
-      (saStaff || []).forEach(function(s) { saStaffMap[s.id] = s; });
-    }
-
-    const ghaMap = {};
-    (ghaEarnings || []).forEach(function(row) {
-      if (!ghaMap[row.gha_id]) {
-        ghaMap[row.gha_id] = {
-          gha_id: row.gha_id,
-          staff: ghaStaffMap[row.gha_id] || null,
-          total_earned: 0,
-          is_paid: row.is_paid,
-          paid_at: row.paid_at || null,
-        };
-      }
-      ghaMap[row.gha_id].total_earned += parseFloat(row.commission_amount || row.amount) || 0;
-    });
-
-    const saMap = {};
-    (saEarnings || []).forEach(function(row) {
-      if (!saMap[row.sa_id]) {
-        saMap[row.sa_id] = {
-          sa_id: row.sa_id,
-          staff: saStaffMap[row.sa_id] || null,
-          total_earned: 0,
-          is_paid: row.is_paid,
-          paid_at: row.paid_at || null,
-        };
-      }
-      saMap[row.sa_id].total_earned += parseFloat(row.commission_amount || row.amount) || 0;
-    });
-
-    const ghaTotals = Object.values(ghaMap);
-    const saTotals  = Object.values(saMap);
-    const grandTotalGHA = ghaTotals.reduce(function(s, r) { return s + r.total_earned; }, 0);
-    const grandTotalSA  = saTotals.reduce(function(s, r) { return s + r.total_earned; }, 0);
+    var ghaTotal = (ghaEarnings || []).reduce(function(sum, e) { return sum + (parseFloat(e.commission_amount) || 0); }, 0);
+    var saTotal = (saEarnings || []).reduce(function(sum, e) { return sum + (parseFloat(e.commission_amount) || 0); }, 0);
 
     res.json({
-      month_year,
-      gha_totals: ghaTotals,
-      sa_totals: saTotals,
-      grand_total_gha: grandTotalGHA,
-      grand_total_sa: grandTotalSA,
-      grand_total_all: grandTotalGHA + grandTotalSA,
+      month: month,
+      gha_earnings: ghaEarnings || [],
+      sa_earnings: saEarnings || [],
+      gha_total: ghaTotal,
+      sa_total: saTotal,
+      grand_total: ghaTotal + saTotal,
     });
-  } catch (err) {
-    console.error('Admin earnings-summary error:', err.message);
+  } catch(err) {
+    console.error('Earnings fetch error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
