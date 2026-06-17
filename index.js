@@ -2243,32 +2243,73 @@ https://trygethome.online`
 // GET /api/admin/earnings
 app.get('/api/admin/earnings', async (req, res) => {
   try {
-    var token = (req.headers.authorization || '').replace('Bearer ', '');
-    var adminClient = require('@supabase/supabase-js').createClient(
-      process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-      { auth: { autoRefreshToken: false, persistSession: false } }
-    );
-    var { data: userData, error: authError } = await adminClient.auth.getUser(token);
-    if (authError || !userData.user) return res.status(401).json({ error: 'Unauthorized' });
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token provided' });
 
-    var month = req.query.month || new Date().toISOString().slice(0, 7);
+    const adminClient = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
 
-    var { data: ghaEarnings } = await adminClient.from('gha_earnings').select('*').eq('month_year', month);
-    var { data: saEarnings } = await adminClient.from('sa_earnings').select('*').eq('month_year', month);
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    if (authError || !userData?.user) {
+      return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
+    }
 
-    var ghaTotal = (ghaEarnings || []).reduce(function(sum, e) { return sum + (parseFloat(e.commission_amount) || 0); }, 0);
-    var saTotal = (saEarnings || []).reduce(function(sum, e) { return sum + (parseFloat(e.commission_amount) || 0); }, 0);
+    const { data: callerProfile } = await adminClient
+      .from('profiles').select('role').eq('id', userData.user.id).single();
+    if (!callerProfile || callerProfile.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    const { data: ghaEarnings } = await adminClient
+      .from('gha_earnings').select('*').eq('month_year', month);
+    const { data: saEarnings } = await adminClient
+      .from('sa_earnings').select('*').eq('month_year', month);
+
+    const ghaList = ghaEarnings || [];
+    const saList  = saEarnings  || [];
+
+    const ghaIds = [...new Set(ghaList.map(e => e.gha_id).filter(Boolean))];
+    const saIds  = [...new Set(saList.map(e => e.sa_id).filter(Boolean))];
+
+    let ghaMap = {};
+    if (ghaIds.length > 0) {
+      const { data: ghaStaff } = await adminClient.from('gha_agents').select('id, gha_code, full_name').in('id', ghaIds);
+      (ghaStaff || []).forEach(g => { ghaMap[g.id] = g; });
+    }
+    let saMap = {};
+    if (saIds.length > 0) {
+      const { data: saStaff } = await adminClient.from('service_agents').select('id, sa_code, full_name').in('id', saIds);
+      (saStaff || []).forEach(s => { saMap[s.id] = s; });
+    }
+
+    const enrichedGha = ghaList.map(e => Object.assign({}, e, {
+      gha_code: ghaMap[e.gha_id]?.gha_code || 'Unknown',
+      gha_name: ghaMap[e.gha_id]?.full_name || 'Unknown',
+    }));
+    const enrichedSa = saList.map(e => Object.assign({}, e, {
+      sa_code: saMap[e.sa_id]?.sa_code || 'Unknown',
+      sa_name: saMap[e.sa_id]?.full_name || 'Unknown',
+    }));
+
+    const ghaTotal = ghaList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    const saTotal  = saList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
 
     res.json({
-      month: month,
-      gha_earnings: ghaEarnings || [],
-      sa_earnings: saEarnings || [],
+      month,
+      gha_earnings: enrichedGha,
+      sa_earnings: enrichedSa,
       gha_total: ghaTotal,
       sa_total: saTotal,
       grand_total: ghaTotal + saTotal,
     });
-  } catch(err) {
-    console.error('Earnings fetch error:', err.message);
+  } catch (err) {
+    console.error('Earnings endpoint exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
