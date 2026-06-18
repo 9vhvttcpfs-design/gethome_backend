@@ -62,6 +62,8 @@ const serviceClient = process.env.SUPABASE_SERVICE_KEY
       auth: { autoRefreshToken: false, persistSession: false },
     })
   : supabase;
+const adminClient = serviceClient;
+console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
 const KYC_BUCKET  = process.env.SUPABASE_KYC_BUCKET     || 'agent-kyc-documents';
 console.log('Storage bucket:', BUCKET_NAME);
@@ -338,14 +340,10 @@ app.post('/api/admin/kyc-url', async (req, res) => {
     const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
     if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
     if (!process.env.SUPABASE_SERVICE_KEY) return res.status(500).json({ error: 'Service key not configured' });
-    const adminKYC = require('@supabase/supabase-js').createClient(
-      process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-      { auth: { autoRefreshToken: false, persistSession: false } }
-    );
-    const { data: callerP } = await adminKYC.from('profiles').select('role').eq('id', user.id).single();
+    const { data: callerP } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
     if (callerP?.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
     const { filePath } = req.body;
-    const { data, error } = await adminKYC.storage
+    const { data, error } = await adminClient.storage
       .from('agent-kyc-documents')
       .createSignedUrl(filePath, 300); // 5 min expiry
     if (error) throw error;
@@ -364,12 +362,6 @@ app.get('/api/admin/agents', async (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
     // Use service key client for reliable token verification
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     // Verify token - use adminClient for reliability
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
@@ -404,12 +396,9 @@ app.get('/api/admin/agents', async (req, res) => {
     // For agents missing email, try auth.admin lookup if service key available
     const agentsMissingEmail = agentsWithEmail.filter(a => a.email === 'Email unavailable');
     if (agentsMissingEmail.length > 0 && process.env.SUPABASE_SERVICE_KEY) {
-      const supabaseAdmin = require('@supabase/supabase-js').createClient(
-        process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY
-      );
       await Promise.all(agentsMissingEmail.map(async function(agent) {
         try {
-          const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(agent.id);
+          const { data: authUser } = await adminClient.auth.admin.getUserById(agent.id);
           const foundEmail = authUser?.user?.email;
           if (foundEmail) {
             agent.email = foundEmail;
@@ -433,22 +422,10 @@ app.post('/api/admin/approve-agent', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const serviceClient_approve = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
-    const { data: userData_approve, error: authError } = await serviceClient_approve.auth.getUser(token);
+    const { data: userData_approve, error: authError } = await adminClient.auth.getUser(token);
     const user = userData_approve?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
-    const adminClient2 = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
-    const { data: profile } = await adminClient2.from('profiles').select('role').eq('id', user.id).single();
+    const { data: profile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
     if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { agentId } = req.body;
     if (!agentId) return res.status(400).json({ error: 'agentId required' });
@@ -456,7 +433,7 @@ app.post('/api/admin/approve-agent', async (req, res) => {
     const validTiers = ['basic', 'verified', 'premium'];
     const tier = validTiers.includes(verificationTier) ? verificationTier : 'basic';
     // Update status and verification level using adminClient to bypass RLS
-    const { error } = await adminClient2
+    const { error } = await adminClient
       .from('profiles')
       .update({ status: 'approved', verification_level: tier })
       .eq('id', agentId)
@@ -495,26 +472,14 @@ app.post('/api/admin/reject-agent', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const serviceClient_reject = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
-    const { data: userData_reject, error: authError } = await serviceClient_reject.auth.getUser(token);
+    const { data: userData_reject, error: authError } = await adminClient.auth.getUser(token);
     const user = userData_reject?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
-    const adminClient3 = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
-    const { data: profile } = await adminClient3.from('profiles').select('role').eq('id', user.id).single();
+    const { data: profile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
     if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { agentId } = req.body;
     if (!agentId) return res.status(400).json({ error: 'agentId required' });
-    const { error } = await adminClient3.from('profiles').update({ status: 'rejected' }).eq('id', agentId);
+    const { error } = await adminClient.from('profiles').update({ status: 'rejected' }).eq('id', agentId);
     if (error) throw error;
     res.json({ success: true, message: 'Agent rejected' });
   } catch (err) {
@@ -527,12 +492,6 @@ app.patch('/api/admin/properties/:id/feature', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
@@ -591,12 +550,6 @@ app.post('/api/admin/mark-sold', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
@@ -665,12 +618,6 @@ app.get('/api/admin/transactions', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
@@ -706,12 +653,6 @@ app.post('/api/admin/mark-commission-paid', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
@@ -774,12 +715,6 @@ app.get('/api/admin/all-listings', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
@@ -901,12 +836,6 @@ app.get('/api/admin/deposits', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
@@ -932,12 +861,6 @@ app.post('/api/admin/confirm-deposit', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     const user = userData?.user;
     if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
@@ -2519,12 +2442,6 @@ app.post('/api/admin/reassign-gha', async (req, res) => {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     if (!token) return res.status(401).json({ error: 'No token' });
 
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
 
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     if (authError || !userData?.user) return res.status(401).json({ error: 'Unauthorized' });
@@ -2671,12 +2588,6 @@ app.get('/api/admin/earnings', async (req, res) => {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     if (!token) return res.status(401).json({ error: 'No token provided' });
 
-    const adminClient = process.env.SUPABASE_SERVICE_KEY
-      ? require('@supabase/supabase-js').createClient(
-          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
-          { auth: { autoRefreshToken: false, persistSession: false } }
-        )
-      : supabase;
 
     const { data: userData, error: authError } = await adminClient.auth.getUser(token);
     if (authError || !userData?.user) {
@@ -3627,14 +3538,7 @@ app.post('/api/auth/login', async (req, res) => {
     let is_unlimited = false;
     try {
       // Use service key client to bypass RLS and always get latest data
-      const profileClient = process.env.SUPABASE_SERVICE_KEY
-        ? require('@supabase/supabase-js').createClient(
-            process.env.SUPABASE_URL,
-            process.env.SUPABASE_SERVICE_KEY,
-            { auth: { autoRefreshToken: false, persistSession: false } }
-          )
-        : supabase;
-      const { data: profile, error: profileError } = await profileClient
+      const { data: profile, error: profileError } = await adminClient
         .from('profiles')
         .select('role, status, is_unlimited, verification_level')
         .eq('id', data.user.id)
@@ -3644,7 +3548,7 @@ app.post('/api/auth/login', async (req, res) => {
         // If profile missing entirely, create one so future logins work
         if (profileError.code === 'PGRST116') { // not found
           console.log('Profile missing for user - creating default customer profile');
-          await profileClient.from('profiles').upsert([{
+          await adminClient.from('profiles').upsert([{
             id: data.user.id,
             role: 'customer',
             status: 'approved',
@@ -3698,14 +3602,7 @@ app.get('/api/auth/me', async (req, res) => {
     let is_unlimited = false;
     try {
       // Use service key for fresh non-cached profile data
-      const meClient = process.env.SUPABASE_SERVICE_KEY
-        ? require('@supabase/supabase-js').createClient(
-            process.env.SUPABASE_URL,
-            process.env.SUPABASE_SERVICE_KEY,
-            { auth: { autoRefreshToken: false, persistSession: false } }
-          )
-        : supabase;
-      const { data: profile } = await meClient
+      const { data: profile } = await adminClient
         .from('profiles')
         .select('role, status, is_unlimited')
         .eq('id', user.id)
