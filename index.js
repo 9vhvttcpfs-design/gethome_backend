@@ -1219,12 +1219,29 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
       .from('profiles')
       .select('*')
       .eq('sa_id', saId)
-      .eq('status', 'pending')
       .eq('role', 'agent')
+      .in('status', ['pending', 'pending_gha_inspection'])
       .order('created_at', { ascending: false });
     if (error) throw error;
 
-    res.json(agents || []);
+    // Enrich agents that have a gha_id with GHA details
+    const ghaIds = [...new Set((agents || []).map(a => a.gha_id).filter(Boolean))];
+    let ghaMap = {};
+    if (ghaIds.length > 0) {
+      const { data: ghas } = await serviceClient
+        .from('gha_agents')
+        .select('id, gha_code, full_name')
+        .in('id', ghaIds);
+      for (const g of (ghas || [])) ghaMap[g.id] = g;
+    }
+
+    const enriched = (agents || []).map(a => ({
+      ...a,
+      gha_code: a.gha_id ? (ghaMap[a.gha_id]?.gha_code || null) : null,
+      gha_name: a.gha_id ? (ghaMap[a.gha_id]?.full_name || null) : null,
+    }));
+
+    res.json(enriched);
   } catch (err) {
     console.error('SA pending-agents error:', err.message);
     res.status(500).json({ error: err.message });
@@ -1239,6 +1256,18 @@ app.post('/api/sa/approve-agent', verifyStaffToken, async (req, res) => {
 
     const { agent_id, gha_id } = req.body;
     if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+
+    // Fetch agent to check gha_verified before approving
+    const { data: agentCheck } = await serviceClient
+      .from('profiles')
+      .select('id, gha_verified, gha_id')
+      .eq('id', agent_id)
+      .single();
+    if (!agentCheck) return res.status(404).json({ error: 'Agent not found' });
+
+    if (agentCheck.gha_id && !agentCheck.gha_verified) {
+      return res.status(400).json({ error: 'Cannot approve agent. GHA inspection has not been completed yet. Wait for GHA to confirm the inspection.' });
+    }
 
     if (gha_id) {
       const { data: ghaCheck } = await serviceClient
@@ -1284,6 +1313,78 @@ https://trygethome.online`
     res.json({ success: true });
   } catch (err) {
     console.error('SA approve-agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/send-to-gha
+app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { agent_id, gha_id } = req.body;
+    if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
+
+    // Verify GHA belongs to this SA
+    const { data: gha } = await serviceClient
+      .from('gha_agents')
+      .select('id, email, full_name, gha_code')
+      .eq('id', gha_id)
+      .eq('sa_id', saId)
+      .single();
+    if (!gha) return res.status(403).json({ error: 'This GHA does not belong to your team' });
+
+    // Fetch agent details
+    const { data: agent } = await serviceClient
+      .from('profiles')
+      .select('id, full_name, email')
+      .eq('id', agent_id)
+      .single();
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    // Update agent status and assign to GHA
+    const { error: updateErr } = await serviceClient
+      .from('profiles')
+      .update({ status: 'pending_gha_inspection', gha_id })
+      .eq('id', agent_id);
+    if (updateErr) throw updateErr;
+
+    // Insert notification for GHA
+    await serviceClient.from('notifications').insert({
+      recipient_type: 'GHA',
+      recipient_id: gha_id,
+      type: 'inspection_request',
+      title: 'New Agent to Verify',
+      message: `Please verify agent ${agent.full_name || agent_id} registration details and confirm to SA.`,
+      is_read: false,
+    });
+
+    // Email GHA
+    if (gha.email) {
+      setImmediate(async function () {
+        try {
+          await sendCustomerEmail(gha.email, 'GetHome - New Agent Inspection Request',
+`Hello ${gha.full_name || 'GHA'},
+
+An agent has been sent to you for inspection and verification.
+
+Agent Name: ${agent.full_name || 'N/A'}
+Agent Email: ${agent.email || 'N/A'}
+
+Please review the agent's registration details, conduct the necessary inspection, and confirm to your SA once done.
+
+Log in to your GHA dashboard to action this request.
+
+The GetHome Team
+https://trygethome.online`);
+        } catch (e) { console.error('send-to-gha email error:', e.message); }
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('SA send-to-gha error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2147,6 +2248,149 @@ https://trygethome.online`);
   }
 });
 
+// POST /api/admin/close-sa — deactivate SA and transfer all GHAs + their agents to another SA
+app.post('/api/admin/close-sa', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { sa_id, target_sa_id } = req.body;
+    if (!sa_id || !target_sa_id) return res.status(400).json({ error: 'sa_id and target_sa_id are required' });
+    if (sa_id === target_sa_id) return res.status(400).json({ error: 'target_sa_id must be different from sa_id' });
+
+    const [{ data: sa }, { data: targetSa }] = await Promise.all([
+      serviceClient.from('service_agents').select('email, full_name, sa_code').eq('id', sa_id).single(),
+      serviceClient.from('service_agents').select('email, full_name, sa_code').eq('id', target_sa_id).single(),
+    ]);
+    if (!sa) return res.status(404).json({ error: 'SA not found' });
+    if (!targetSa) return res.status(404).json({ error: 'Target SA not found' });
+
+    // Get all GHAs under the closing SA
+    const { data: ghas, error: ghaFetchErr } = await serviceClient
+      .from('gha_agents').select('id').eq('sa_id', sa_id);
+    if (ghaFetchErr) throw ghaFetchErr;
+
+    const ghaIds = (ghas || []).map(g => g.id);
+
+    // Transfer GHAs to target SA
+    if (ghaIds.length > 0) {
+      const { error: ghaTransferErr } = await serviceClient
+        .from('gha_agents').update({ sa_id: target_sa_id }).eq('sa_id', sa_id);
+      if (ghaTransferErr) throw ghaTransferErr;
+
+      // Update sa_id on all agents under those GHAs
+      const { error: agentTransferErr } = await serviceClient
+        .from('profiles').update({ sa_id: target_sa_id }).in('gha_id', ghaIds);
+      if (agentTransferErr) throw agentTransferErr;
+    }
+
+    // Close the SA
+    const { error: saCloseErr } = await serviceClient
+      .from('service_agents').update({ status: 'inactive' }).eq('id', sa_id);
+    if (saCloseErr) throw saCloseErr;
+
+    setImmediate(async function () {
+      try {
+        if (sa.email) {
+          await sendCustomerEmail(sa.email, 'GetHome - SA Account Closed',
+`Hello ${sa.full_name || 'Service Agent'},
+
+Your GetHome SA account (${sa.sa_code || ''}) has been closed by admin.
+
+All GHAs and agents under your account have been transferred to SA ${targetSa.sa_code || target_sa_id}.
+
+If you believe this is an error, please contact GetHome support.
+
+The GetHome Team
+https://trygethome.online`);
+        }
+        if (targetSa.email) {
+          await sendCustomerEmail(targetSa.email, 'GetHome - GHAs Transferred to Your SA Account',
+`Hello ${targetSa.full_name || 'Service Agent'},
+
+${ghaIds.length} GHA(s) and their agents have been transferred to your SA account (${targetSa.sa_code || ''}) from the closed SA account (${sa.sa_code || ''}).
+
+Please log in to your SA dashboard to review and manage the newly assigned GHAs and agents.
+
+The GetHome Team
+https://trygethome.online`);
+        }
+      } catch (e) { console.error('close-sa email error:', e.message); }
+    });
+
+    res.json({ success: true, ghas_transferred: ghaIds.length });
+  } catch (err) {
+    console.error('Admin close-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/close-gha — deactivate GHA and transfer all its agents to another GHA
+app.post('/api/admin/close-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { gha_id, target_gha_id } = req.body;
+    if (!gha_id || !target_gha_id) return res.status(400).json({ error: 'gha_id and target_gha_id are required' });
+    if (gha_id === target_gha_id) return res.status(400).json({ error: 'target_gha_id must be different from gha_id' });
+
+    const [{ data: gha }, { data: targetGha }] = await Promise.all([
+      serviceClient.from('gha_agents').select('email, full_name, gha_code, sa_id').eq('id', gha_id).single(),
+      serviceClient.from('gha_agents').select('email, full_name, gha_code, sa_id').eq('id', target_gha_id).single(),
+    ]);
+    if (!gha) return res.status(404).json({ error: 'GHA not found' });
+    if (!targetGha) return res.status(404).json({ error: 'Target GHA not found' });
+
+    // Transfer all agents to the target GHA (also update sa_id to target GHA's sa_id)
+    const { data: transferredAgents, error: agentTransferErr } = await serviceClient
+      .from('profiles')
+      .update({ gha_id: target_gha_id, sa_id: targetGha.sa_id })
+      .eq('gha_id', gha_id)
+      .select('id, full_name, email');
+    if (agentTransferErr) throw agentTransferErr;
+
+    // Close the GHA
+    const { error: ghaCloseErr } = await serviceClient
+      .from('gha_agents').update({ status: 'inactive' }).eq('id', gha_id);
+    if (ghaCloseErr) throw ghaCloseErr;
+
+    setImmediate(async function () {
+      try {
+        if (gha.email) {
+          await sendCustomerEmail(gha.email, 'GetHome - GHA Account Closed',
+`Hello ${gha.full_name || 'GHA'},
+
+Your GetHome GHA account (${gha.gha_code || ''}) has been closed by admin.
+
+All agents under your account have been transferred to GHA ${targetGha.gha_code || target_gha_id}.
+
+If you believe this is an error, please contact GetHome support.
+
+The GetHome Team
+https://trygethome.online`);
+        }
+        if (targetGha.email) {
+          await sendCustomerEmail(targetGha.email, 'GetHome - Agents Transferred to Your GHA Account',
+`Hello ${targetGha.full_name || 'GHA'},
+
+${(transferredAgents || []).length} agent(s) have been transferred to your GHA account (${targetGha.gha_code || ''}) from the closed GHA account (${gha.gha_code || ''}).
+
+Please log in to your GHA dashboard to review and manage the newly assigned agents.
+
+The GetHome Team
+https://trygethome.online`);
+        }
+      } catch (e) { console.error('close-gha email error:', e.message); }
+    });
+
+    res.json({ success: true, agents_transferred: (transferredAgents || []).length });
+  } catch (err) {
+    console.error('Admin close-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/admin/mark-sa-paid
 app.post('/api/admin/mark-sa-paid', async (req, res) => {
   try {
@@ -2923,13 +3167,23 @@ app.post('/api/sa/update-profile', verifyStaffToken, async (req, res) => {
 
     if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'No fields to update' });
 
-    const { data, error } = await serviceClient
-      .from('service_agents')
-      .update(updates)
-      .eq('id', saId)
-      .select('id, staff_id, full_name, email, phone, location, whatsapp_number, role, created_at')
-      .single();
-    if (error) throw error;
+    let data;
+    try {
+      const result = await serviceClient
+        .from('service_agents')
+        .update(updates)
+        .eq('id', saId)
+        .select('id, full_name, email, phone, location, whatsapp_number, sa_code, created_at')
+        .single();
+      if (result.error) {
+        console.error('sa/update-profile DB error (full):', JSON.stringify(result.error));
+        throw result.error;
+      }
+      data = result.data;
+    } catch (dbErr) {
+      console.error('sa/update-profile update threw:', JSON.stringify(dbErr));
+      throw dbErr;
+    }
 
     res.json(data);
   } catch (err) {
