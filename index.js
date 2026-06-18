@@ -1080,6 +1080,7 @@ app.post('/api/staff/login', async (req, res) => {
         location: staff.location,
         role,
         sa_id: staff.sa_id || null,
+        whatsapp_number: staff.whatsapp_number || null,
       },
     });
   } catch (err) {
@@ -1124,6 +1125,7 @@ app.get('/api/staff/me', async (req, res) => {
       location: staff.location,
       role: session.staff_role,
       sa_id: staff.sa_id || null,
+      whatsapp_number: staff.whatsapp_number || null,
     });
   } catch (err) {
     console.error('Staff me error:', err.message);
@@ -2484,6 +2486,29 @@ https://trygethome.online`);
     res.json({ success: true, agents_transferred: (transferredAgents || []).length });
   } catch (err) {
     console.error('Admin close-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/reassign-gha — assign a GHA to a different SA
+app.post('/api/admin/reassign-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { ghaId, newSaId } = req.body;
+    if (!ghaId || !newSaId) return res.status(400).json({ error: 'ghaId and newSaId are required' });
+
+    const { data, error } = await serviceClient.rpc('assign_gha_to_sa', {
+      target_gha_id: ghaId,
+      target_sa_id: newSaId,
+    });
+
+    if (error) throw error;
+
+    return res.status(200).json({ success: true, message: 'GHA and all underlying agents reassigned successfully.' });
+  } catch (err) {
+    console.error('Admin reassign-gha error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
