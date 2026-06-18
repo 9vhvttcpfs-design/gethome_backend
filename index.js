@@ -1348,29 +1348,55 @@ app.get('/api/sa/search-agent', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     if (!token) return res.status(401).json({ error: 'No token' });
-    const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
-    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const email = (req.query.email || '').trim().toLowerCase();
-    if (!email) return res.status(400).json({ error: 'Email is required' });
+    const { data: session } = await adminClient
+      .from('staff_sessions')
+      .select('*')
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+    if (!session || session.staff_role !== 'SA') {
+      return res.status(403).json({ error: 'SA access required' });
+    }
 
-    console.log('SA searching for agent email:', email);
+    const searchEmail = (req.query.email || '').trim().toLowerCase();
+    if (!searchEmail) return res.status(400).json({ error: 'Email is required' });
 
+    console.log('SA searching agent by email:', searchEmail);
+
+    // Search by email with role=agent only - NO status filter
     const { data: agent, error } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, office_address, experience, specialty, nin_number, cac_number, about')
-      .ilike('email', email)
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, experience, specialty, nin_number, cac_number, about, created_at')
+      .ilike('email', searchEmail)
       .eq('role', 'agent')
       .single();
 
     if (error || !agent) {
-      console.log('Agent not found for email:', email, '| error:', error?.message);
-      return res.status(404).json({ error: 'No registered agent found with that email. Make sure the agent has signed up on GetHome first.' });
+      console.log('Agent not found:', searchEmail, '| DB error:', error?.message);
+      return res.status(404).json({
+        error: 'No registered agent found with that email. Make sure the agent has signed up on GetHome as an agent first.'
+      });
     }
 
-    console.log('Agent found:', agent.email, 'status:', agent.status);
-    res.json({ agent });
+    console.log('Agent found:', agent.email, '| status:', agent.status, '| gha_id:', agent.gha_id);
+
+    // Check if already assigned to a different GHA under a different SA
+    if (agent.gha_id && agent.sa_id && agent.sa_id !== session.staff_id) {
+      return res.status(400).json({
+        error: 'This agent is already assigned to a GHA under a different SA. Contact admin to reassign them.'
+      });
+    }
+
+    // If assigned to a GHA under THIS SA that is fine - return agent with a note
+    var alreadyAssigned = !!(agent.gha_id && agent.sa_id === session.staff_id);
+
+    res.json({
+      agent: Object.assign({}, agent, {
+        already_assigned: alreadyAssigned,
+        assigned_gha_code: agent.gha_code || null,
+      })
+    });
   } catch (err) {
     console.error('Search agent exception:', err.message);
     res.status(500).json({ error: err.message });
