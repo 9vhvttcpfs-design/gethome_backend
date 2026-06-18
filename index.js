@@ -2074,6 +2074,103 @@ app.get('/api/admin/all-ghas', async (req, res) => {
   }
 });
 
+// GET /api/admin/search-sa?q=SA001
+app.get('/api/admin/search-sa', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const q = (req.query.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'Query parameter q is required' });
+
+    const { data: sas, error } = await serviceClient
+      .from('service_agents')
+      .select('*')
+      .ilike('sa_code', `%${q}%`)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const now = new Date().toISOString();
+    const enriched = await Promise.all((sas || []).map(async function(sa) {
+      const { data: ghas } = await serviceClient
+        .from('gha_agents').select('id').eq('sa_id', sa.id);
+      const ghaIds = (ghas || []).map(function(g) { return g.id; });
+
+      let agentCount = 0;
+      if (ghaIds.length > 0) {
+        const { count } = await serviceClient
+          .from('profiles')
+          .select('id', { count: 'exact', head: true })
+          .in('gha_id', ghaIds)
+          .eq('role', 'agent');
+        agentCount = count || 0;
+      }
+
+      const result = Object.assign({}, sa, {
+        gha_count: ghaIds.length,
+        agent_count: agentCount,
+      });
+      delete result.password_hash;
+      delete result.gh_staff_token;
+      return result;
+    }));
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('Admin search-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/search-gha?q=GHA001
+app.get('/api/admin/search-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const q = (req.query.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'Query parameter q is required' });
+
+    const { data: ghas, error } = await serviceClient
+      .from('gha_agents')
+      .select('*')
+      .ilike('gha_code', `%${q}%`)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const saIds = [...new Set((ghas || []).map(function(g) { return g.sa_id; }).filter(Boolean))];
+    let saMap = {};
+    if (saIds.length > 0) {
+      const { data: sas } = await serviceClient
+        .from('service_agents')
+        .select('id, full_name, email, sa_code')
+        .in('id', saIds);
+      (sas || []).forEach(function(s) { saMap[s.id] = s; });
+    }
+
+    const enriched = await Promise.all((ghas || []).map(async function(gha) {
+      const { count: agentCount } = await serviceClient
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .eq('role', 'agent');
+
+      const result = Object.assign({}, gha, {
+        agent_count: agentCount || 0,
+        sa: gha.sa_id ? (saMap[gha.sa_id] || null) : null,
+      });
+      delete result.password_hash;
+      delete result.gh_staff_token;
+      return result;
+    }));
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('Admin search-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/admin/deactivate-sa
 app.post('/api/admin/deactivate-sa', async (req, res) => {
   try {
@@ -2776,9 +2873,23 @@ app.post('/api/admin/assign-gha-to-sa', async (req, res) => {
     const { gha_id, sa_id } = req.body;
     if (!gha_id || !sa_id) return res.status(400).json({ error: 'gha_id and sa_id are required' });
 
-    const { error } = await serviceClient
+    const { data: gha } = await serviceClient
+      .from('gha_agents').select('id, sa_id').eq('id', gha_id).single();
+    if (!gha) return res.status(404).json({ error: 'GHA not found' });
+
+    const { data: sa } = await serviceClient
+      .from('service_agents').select('id').eq('id', sa_id).single();
+    if (!sa) return res.status(404).json({ error: 'SA not found' });
+
+    // Reassign GHA to new SA
+    const { error: ghaErr } = await serviceClient
       .from('gha_agents').update({ sa_id }).eq('id', gha_id);
-    if (error) throw error;
+    if (ghaErr) throw ghaErr;
+
+    // Cascade sa_id update to all agents under this GHA
+    const { error: agentErr } = await serviceClient
+      .from('profiles').update({ sa_id }).eq('gha_id', gha_id);
+    if (agentErr) throw agentErr;
 
     res.json({ success: true, message: 'GHA assigned to SA successfully' });
   } catch (err) {
