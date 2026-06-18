@@ -2490,25 +2490,60 @@ https://trygethome.online`);
   }
 });
 
-// POST /api/admin/reassign-gha — assign a GHA to a different SA
 app.post('/api/admin/reassign-gha', async (req, res) => {
   try {
-    const admin = await verifyAdminToken(req);
-    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    const adminClient = process.env.SUPABASE_SERVICE_KEY
+      ? require('@supabase/supabase-js').createClient(
+          process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY,
+          { auth: { autoRefreshToken: false, persistSession: false } }
+        )
+      : supabase;
+
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    if (authError || !userData?.user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: profile } = await adminClient
+      .from('profiles').select('role').eq('id', userData.user.id).single();
+    if (!profile || profile.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
 
     const { ghaId, newSaId } = req.body;
+    console.log('Reassign GHA request - ghaId:', ghaId, 'newSaId:', newSaId);
     if (!ghaId || !newSaId) return res.status(400).json({ error: 'ghaId and newSaId are required' });
 
-    const { data, error } = await serviceClient.rpc('assign_gha_to_sa', {
-      target_gha_id: ghaId,
-      target_sa_id: newSaId,
+    // Try direct update first
+    const { data: updateData, error: updateErr } = await adminClient
+      .from('gha_agents')
+      .update({ sa_id: newSaId })
+      .eq('id', ghaId)
+      .select();
+
+    if (updateErr) {
+      console.error('Direct update failed:', updateErr.message, '| Trying RPC...');
+      // Fallback to RPC function
+      const { error: rpcErr } = await adminClient.rpc('assign_gha_to_sa', {
+        target_gha_id: ghaId,
+        target_sa_id: newSaId,
+      });
+      if (rpcErr) {
+        console.error('RPC also failed:', rpcErr.message);
+        return res.status(500).json({ error: rpcErr.message });
+      }
+    }
+
+    console.log('GHA reassigned successfully. Updated rows:', updateData?.length || 'via RPC');
+
+    const { data: gha } = await adminClient.from('gha_agents').select('gha_code, full_name').eq('id', ghaId).single();
+    const { data: sa } = await adminClient.from('service_agents').select('sa_code, full_name').eq('id', newSaId).single();
+
+    res.json({
+      success: true,
+      message: (gha?.gha_code || 'GHA') + ' has been reassigned to ' + (sa?.sa_code || 'SA') + ' - ' + (sa?.full_name || ''),
     });
-
-    if (error) throw error;
-
-    return res.status(200).json({ success: true, message: 'GHA and all underlying agents reassigned successfully.' });
   } catch (err) {
-    console.error('Admin reassign-gha error:', err.message);
+    console.error('Reassign GHA exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
