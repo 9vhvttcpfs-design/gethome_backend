@@ -1391,36 +1391,36 @@ app.get('/api/sa/search-agent', async (req, res) => {
     console.log('SA searching agent by email:', searchEmail);
 
     // Search by email with role=agent only - NO status filter
-    const { data: agent, error } = await adminClient
+    const { data: foundAgent, error } = await adminClient
       .from('profiles')
       .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, experience, specialty, nin_number, cac_number, about, created_at')
       .ilike('email', searchEmail)
       .eq('role', 'agent')
       .single();
 
-    if (error || !agent) {
+    if (error || !foundAgent) {
       console.log('Agent not found:', searchEmail, '| DB error:', error?.message);
       return res.status(404).json({
         error: 'No registered agent found with that email. Make sure the agent has signed up on GetHome as an agent first.'
       });
     }
 
-    console.log('Agent found:', agent.email, '| status:', agent.status, '| gha_id:', agent.gha_id);
+    console.log('Agent found:', foundAgent.email, '| status:', foundAgent.status, '| gha_id:', foundAgent.gha_id);
 
     // Check if already assigned to a different GHA under a different SA
-    if (agent.gha_id && agent.sa_id && agent.sa_id !== session.staff_id) {
+    if (foundAgent.gha_id && foundAgent.sa_id && foundAgent.sa_id !== session.staff_id) {
       return res.status(400).json({
         error: 'This agent is already assigned to a GHA under a different SA. Contact admin to reassign them.'
       });
     }
 
     // If assigned to a GHA under THIS SA that is fine - return agent with a note
-    var alreadyAssigned = !!(agent.gha_id && agent.sa_id === session.staff_id);
+    var alreadyAssigned = !!(foundAgent.gha_id && foundAgent.sa_id === session.staff_id);
 
     res.json({
-      agent: Object.assign({}, agent, {
+      agent: Object.assign({}, foundAgent, {
         already_assigned: alreadyAssigned,
-        assigned_gha_code: agent.gha_code || null,
+        assigned_gha_code: foundAgent.gha_code || null,
       })
     });
   } catch (err) {
