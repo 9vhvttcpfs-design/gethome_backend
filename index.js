@@ -1133,23 +1133,43 @@ app.get('/api/sa/my-agents', async (req, res) => {
       .single();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
+    const { data: saRecord } = await adminClient.from('service_agents')
+      .select('location').eq('id', session.staff_id).single();
+    const saLocation = saRecord?.location || '';
+    console.log('SA location for filtering:', saLocation);
+
     const { data: agents, error } = await adminClient
       .rpc('get_sa_localized_agents', { sa_uuid: session.staff_id });
 
-    if (error) {
-      console.error('Localized agents RPC error:', error.message);
-      const { data: fallback } = await adminClient
-        .from('profiles')
-        .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, experience, specialty, about, created_at')
-        .eq('role', 'agent')
-        .order('created_at', { ascending: false });
-      return res.json(fallback || []);
+    if (error || !agents || agents.length === 0) {
+      console.log('RPC returned empty or failed, using relaxed fallback for location:', saLocation);
+
+      var locationWords = (saLocation || '').split(/[\s,]+/).filter(function(w) {
+        return w.length > 2;
+      });
+
+      var fallbackQuery = adminClient.from('profiles').select('*').eq('role', 'agent');
+
+      if (locationWords.length > 0) {
+        var orConditions = locationWords.map(function(word) {
+          return 'office_address.ilike.%' + word + '%';
+        }).join(',');
+        fallbackQuery = fallbackQuery.or(orConditions + ',office_address.is.null,office_address.eq.');
+      }
+
+      var { data: fallbackAgents } = await fallbackQuery.order('created_at', { ascending: false });
+      return res.json(fallbackAgents || []);
     }
 
     const enriched = (agents || []).map(function(a) {
+      var ghaId = a.assigned_gha_id || a.gha_id || null;
+      var saId  = a.assigned_sa_id  || a.sa_id  || null;
       return Object.assign({}, a, {
-        already_assigned: !!(a.gha_id && a.sa_id),
-        already_assigned_other_sa: !!(a.gha_id && a.sa_id && a.sa_id !== session.staff_id),
+        gha_id: ghaId,
+        sa_id: saId,
+        office_address: a.location || a.office_address || null,
+        already_assigned: !!(ghaId && saId),
+        already_assigned_other_sa: !!(ghaId && saId && saId !== session.staff_id),
       });
     });
 
