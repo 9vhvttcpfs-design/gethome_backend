@@ -1485,6 +1485,16 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
       );
     } catch(emailErr) { console.error('Assignment email failed:', emailErr.message); }
 
+    const agentName = agent?.full_name || agent?.email || 'New Agent';
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: gha_id,
+      type: 'agent_verification',
+      title: 'Confirm Agent Information',
+      message: 'SA has assigned agent ' + agentName + ' to your team. Please review their registration details and confirm their information so the SA can approve them.',
+      is_read: false,
+    }]).catch(e => console.error('GHA agent notification failed:', e.message));
+
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code + ' successfully' });
   } catch (err) {
     console.error('Assign agent exception:', err.message);
@@ -2844,15 +2854,25 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
     const { inspection_id } = req.body;
     if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
 
-    const { data: existing } = await serviceClient
-      .from('inspections').select('id').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
-    if (!existing) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
+    const { data: inspection } = await serviceClient
+      .from('inspections').select('*').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
+    if (!inspection) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
 
     const { error } = await serviceClient
       .from('inspections')
       .update({ status: 'confirmed', sa_confirmed: true, sa_confirmed_at: new Date().toISOString() })
       .eq('id', inspection_id);
     if (error) throw error;
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: inspection.gha_id,
+      type: 'inspection_passed',
+      title: 'Inspection Confirmed by SA',
+      message: 'Your inspection for customer ' + inspection.customer_name + ' has been reviewed and confirmed by your SA. Great work!',
+      inspection_id: inspection_id,
+      is_read: false,
+    }]).catch(e => console.error('GHA confirmed notification failed:', e.message));
 
     res.json({ success: true });
   } catch (err) {
@@ -2882,6 +2902,30 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
       .update({ status: 'done', notes: notes.trim(), gha_done_at: new Date().toISOString() })
       .eq('id', inspection_id);
     if (error) throw error;
+
+    // Notify SA that inspection is done
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'SA',
+      recipient_id: inspection.assigned_by_sa,
+      type: 'inspection_done',
+      title: 'Inspection Completed',
+      message: 'GHA has completed inspection for customer ' + inspection.customer_name + ' at ' + (inspection.property_address || 'property address') + '. Notes: ' + notes.substring(0, 100),
+      inspection_id: inspection_id,
+      customer_email: inspection.customer_email,
+      customer_phone: inspection.customer_phone || '',
+      is_read: false,
+    }]).catch(e => console.error('SA notification failed:', e.message));
+
+    // Also notify the GHA themselves as confirmation
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: req.staffSession.staff_id,
+      type: 'inspection_passed',
+      title: 'Inspection Submitted Successfully',
+      message: 'Your inspection report for customer ' + inspection.customer_name + ' has been submitted and is awaiting SA confirmation.',
+      inspection_id: inspection_id,
+      is_read: false,
+    }]).catch(e => console.error('GHA confirmation notification failed:', e.message));
 
     if (inspection.assigned_by_sa) {
       const [{ data: sa }, { data: ghaInfo }] = await Promise.all([
@@ -3207,22 +3251,23 @@ app.get('/api/sa/notifications', verifyStaffToken, async (req, res) => {
 });
 
 // GET /api/gha/notifications
-app.get('/api/gha/notifications', verifyStaffToken, async (req, res) => {
+app.get('/api/gha/notifications', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
-    const ghaId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
 
-    const { data: notifications, error } = await serviceClient
+    const { data: notifs } = await adminClient
       .from('notifications')
       .select('*')
       .eq('recipient_type', 'GHA')
-      .eq('recipient_id', ghaId)
+      .eq('recipient_id', session.staff_id)
       .order('created_at', { ascending: false })
       .limit(50);
-    if (error) throw error;
 
-    const unread_count = (notifications || []).filter(function(n) { return !n.is_read; }).length;
-    res.json({ notifications: notifications || [], unread_count });
+    const unread = (notifs || []).filter(function(n) { return !n.is_read; }).length;
+    res.json({ notifications: notifs || [], unread_count: unread });
   } catch (err) {
     console.error('GHA notifications error:', err.message);
     res.status(500).json({ error: err.message });
@@ -4218,6 +4263,27 @@ app.get('/api/agent/listing-count/:userId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post('/api/gha/mark-notifications-read', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { notification_id } = req.body;
+    if (notification_id) {
+      await adminClient.from('notifications').update({ is_read: true })
+        .eq('id', notification_id).eq('recipient_id', session.staff_id);
+    } else {
+      await adminClient.from('notifications').update({ is_read: true })
+        .eq('recipient_type', 'GHA').eq('recipient_id', session.staff_id).eq('is_read', false);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
