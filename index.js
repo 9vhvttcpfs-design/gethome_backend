@@ -487,6 +487,27 @@ app.post('/api/admin/reject-agent', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// Disapprove agent (admin only) - suspends a previously approved agent's ability to upload listings
+app.post('/api/admin/disapprove-agent', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
+    const { data: profile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
+    if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { agentId } = req.body;
+    if (!agentId) return res.status(400).json({ error: 'agentId required' });
+    const { error } = await adminClient.from('profiles').update({ status: 'disapproved' }).eq('id', agentId).eq('role', 'agent');
+    if (error) throw error;
+    console.log('Agent disapproved:', agentId);
+    res.json({ success: true, message: 'Agent disapproved. They can no longer upload listings.' });
+  } catch (err) {
+    console.error('Disapprove agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // Toggle featured status for a property (admin only)
 app.patch('/api/admin/properties/:id/feature', async (req, res) => {
   try {
@@ -1100,32 +1121,37 @@ app.get('/api/sa/my-ghas', verifyStaffToken, async (req, res) => {
 });
 
 // GET /api/sa/my-agents
-app.get('/api/sa/my-agents', verifyStaffToken, async (req, res) => {
+app.get('/api/sa/my-agents', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const saId = req.staffSession.staff_id;
-
-    const { data: ghas } = await serviceClient
-      .from('gha_agents')
-      .select('id')
-      .eq('sa_id', saId);
-    const ghaIds = (ghas || []).map(function(g) { return g.id; });
-
-    if (ghaIds.length === 0) return res.json([]);
-
-    const { data: agents, error } = await serviceClient
-      .from('profiles')
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const { data: session } = await adminClient
+      .from('staff_sessions')
       .select('*')
-      .in('gha_id', ghaIds)
-      .eq('role', 'agent');
-    if (error) throw error;
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const now = new Date();
-    const enriched = (agents || []).map(function(agent) {
-      return Object.assign({}, agent, {
-        is_expired: agent.subscription_end ? new Date(agent.subscription_end) < now : false,
+    const { data: agents, error } = await adminClient
+      .rpc('get_sa_localized_agents', { sa_uuid: session.staff_id });
+
+    if (error) {
+      console.error('Localized agents RPC error:', error.message);
+      const { data: fallback } = await adminClient
+        .from('profiles')
+        .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, experience, specialty, about, created_at')
+        .eq('role', 'agent')
+        .order('created_at', { ascending: false });
+      return res.json(fallback || []);
+    }
+
+    const enriched = (agents || []).map(function(a) {
+      return Object.assign({}, a, {
+        already_assigned: !!(a.gha_id && a.sa_id),
+        already_assigned_other_sa: !!(a.gha_id && a.sa_id && a.sa_id !== session.staff_id),
       });
-    }).sort(function(a, b) { return b.is_expired - a.is_expired; });
+    });
 
     res.json(enriched);
   } catch (err) {
@@ -1419,6 +1445,27 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     if (!gha) return res.status(404).json({ error: 'GHA not found' });
     if (gha.sa_id !== session.staff_id) return res.status(403).json({ error: 'This GHA does not belong to your team' });
 
+    const { data: agent } = await adminClient.from('profiles')
+      .select('id, gha_id, sa_id, gha_code').eq('id', agent_id).single();
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    // Check if agent is already assigned to a GHA under a DIFFERENT SA
+    if (agent.gha_id && agent.sa_id && agent.sa_id !== session.staff_id) {
+      return res.status(400).json({
+        error: 'This agent is already assigned to a GHA under a different SA. Only admin can change this assignment.',
+        locked: true,
+        current_gha_code: agent.gha_code || 'another GHA',
+      });
+    }
+
+    // Check if agent is already under THIS SA's GHA - allow reassignment within same SA
+    if (agent.gha_id && agent.sa_id === session.staff_id && agent.gha_id === gha_id) {
+      return res.status(400).json({
+        error: 'This agent is already assigned to this GHA.',
+        already_here: true,
+      });
+    }
+
     const { data: sa } = await adminClient.from('service_agents')
       .select('id, sa_code, full_name').eq('id', session.staff_id).single();
 
@@ -1476,7 +1523,7 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
     const totalRevenue = (agents || []).reduce(function(sum, a) {
       return sum + (parseFloat(a.subscription_amount) || 0);
     }, 0);
-    const saCommission = totalRevenue * 0.07;
+    const saCommission = totalRevenue * 0.05;
 
     const byMonth = {};
     (agents || []).forEach(function(a) {
@@ -1485,7 +1532,7 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
       if (!byMonth[key]) byMonth[key] = { month: key, revenue: 0, agent_count: 0, sa_commission: 0, is_paid: earningsMap[key]?.is_paid || false };
       byMonth[key].revenue += parseFloat(a.subscription_amount) || 0;
       byMonth[key].agent_count += 1;
-      byMonth[key].sa_commission = byMonth[key].revenue * 0.07;
+      byMonth[key].sa_commission = byMonth[key].revenue * 0.05;
     });
 
     res.json({
@@ -1877,7 +1924,7 @@ app.post('/api/admin/create-sa', async (req, res) => {
 
     const { data, error } = await serviceClient
       .from('service_agents')
-      .insert([{ full_name, email, phone, location: location || null, sa_code, password_hash }])
+      .insert([{ full_name, email, phone, location: location || null, sa_code, password_hash, commission_rate: 5 }])
       .select()
       .single();
     if (error) throw error;
@@ -1972,7 +2019,7 @@ app.get('/api/admin/all-sas', async (req, res) => {
           .in('gha_id', ghaIds)
           .gt('subscription_end', now);
         monthlyEarnings = (activeSubs || []).reduce(function(sum, p) {
-          return sum + (parseFloat(p.subscription_amount) || 0) * 0.10;
+          return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
         }, 0);
       }
 
@@ -3751,7 +3798,7 @@ app.post('/api/properties', async (req, res) => {
     if (agentId) {
       const { data: profileData } = await supabase
         .from('profiles')
-        .select('verification_level, is_unlimited, role')
+        .select('verification_level, is_unlimited, role, status')
         .eq('id', agentId)
         .single();
 
@@ -3760,6 +3807,13 @@ app.post('/api/properties', async (req, res) => {
       const level       = profileData?.verification_level || 'basic';
       const limits      = { basic: 3, verified: 15, premium: 999 };
       const limit       = limits[level] || 3;
+
+      if (!isAdmin && profileData?.status !== 'approved') {
+        const statusMsg = profileData?.status === 'disapproved'
+          ? 'Your agent account has been suspended. Please contact admin.'
+          : 'Your agent account is not yet approved. Please wait for admin approval.';
+        return res.status(403).json({ error: statusMsg, status: profileData?.status });
+      }
 
       if (!isAdmin && !isUnlimited) {
         const { count } = await supabase
