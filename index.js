@@ -1251,70 +1251,39 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
 });
 
 // POST /api/sa/approve-agent
-app.post('/api/sa/approve-agent', verifyStaffToken, async (req, res) => {
+app.post('/api/sa/approve-agent', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const saId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const { agent_id, gha_id } = req.body;
+    const { agent_id } = req.body;
     if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
 
-    // Fetch agent to check gha_verified before approving
-    const { data: agentCheck } = await serviceClient
-      .from('profiles')
-      .select('id, gha_verified, gha_id')
-      .eq('id', agent_id)
-      .single();
-    if (!agentCheck) return res.status(404).json({ error: 'Agent not found' });
+    const { data: agent } = await adminClient.from('profiles')
+      .select('*').eq('id', agent_id).single();
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
 
-    if (agentCheck.gha_id && !agentCheck.gha_verified) {
-      return res.status(400).json({ error: 'Cannot approve agent. GHA inspection has not been completed yet. Wait for GHA to confirm the inspection.' });
+    if (agent.gha_id && agent.gha_verified === false) {
+      return res.status(400).json({ error: 'GHA has not yet confirmed this agent. Please wait for GHA verification before approving.' });
     }
 
-    if (gha_id) {
-      const { data: ghaCheck } = await serviceClient
-        .from('gha_agents')
-        .select('id')
-        .eq('id', gha_id)
-        .eq('sa_id', saId)
-        .single();
-      if (!ghaCheck) return res.status(403).json({ error: 'GHA does not belong to your SA' });
-    }
+    const { error: updateErr } = await adminClient.from('profiles')
+      .update({ status: 'approved' }).eq('id', agent_id);
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
 
-    const { error } = await serviceClient
-      .from('profiles')
-      .update({ status: 'approved', gha_id: gha_id || null, sa_id: saId })
-      .eq('id', agent_id);
-    if (error) throw error;
+    try {
+      await sendCustomerEmail(
+        agent.email,
+        'Your GetHome Agent Account is Approved!',
+        `Hello ${agent.full_name || 'Agent'},\n\nCongratulations! Your GetHome agent account has been approved. You can now log in and start uploading property listings.\n\nWelcome to the GetHome family!\n\nGetHome Team`
+      );
+    } catch(emailErr) { console.error('Approval email failed:', emailErr.message); }
 
-    const { data: agent } = await serviceClient
-      .from('profiles')
-      .select('email, full_name')
-      .eq('id', agent_id)
-      .single();
-    if (agent?.email) {
-      setImmediate(async function() {
-        try {
-          await sendCustomerEmail(
-            agent.email,
-            'Your GetHome Agent Account Has Been Approved!',
-            `Hello ${agent.full_name || 'Agent'},
-
-Your GetHome agent account has been approved. You can now log in and start listing properties.
-
-Sign in here: https://trygethome.online
-
-Welcome to the GetHome agent network!
-The GetHome Team
-https://trygethome.online`
-          );
-        } catch (e) { console.error('SA approve-agent email error:', e.message); }
-      });
-    }
-
-    res.json({ success: true });
+    res.json({ success: true, message: 'Agent approved successfully' });
   } catch (err) {
-    console.error('SA approve-agent error:', err.message);
+    console.error('Approve agent exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1452,69 +1421,77 @@ app.post('/api/sa/add-gha', verifyStaffToken, async (req, res) => {
 });
 
 // GET /api/sa/search-agent
-app.get('/api/sa/search-agent', verifyStaffToken, async (req, res) => {
+app.get('/api/sa/search-agent', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const { email } = req.query;
-    if (!email) return res.status(400).json({ error: 'email query param required' });
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const { data: agent, error } = await serviceClient
+    const email = (req.query.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    console.log('SA searching for agent email:', email);
+
+    const { data: agent, error } = await adminClient
       .from('profiles')
-      .select('id, full_name, email, phone, status, gha_id, sa_id, verification_level')
-      .eq('email', email.trim().toLowerCase())
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, office_address, experience, specialty, nin_number, cac_number, about')
+      .ilike('email', email)
       .eq('role', 'agent')
       .single();
-    if (error || !agent) return res.status(404).json({ error: 'No registered agent found with that email' });
 
-    res.json(agent);
+    if (error || !agent) {
+      console.log('Agent not found for email:', email, '| error:', error?.message);
+      return res.status(404).json({ error: 'No registered agent found with that email. Make sure the agent has signed up on GetHome first.' });
+    }
+
+    console.log('Agent found:', agent.email, 'status:', agent.status);
+    res.json({ agent });
   } catch (err) {
-    console.error('SA search-agent error:', err.message);
+    console.error('Search agent exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // POST /api/sa/assign-agent-to-gha
-app.post('/api/sa/assign-agent-to-gha', verifyStaffToken, async (req, res) => {
+app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const saId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
     const { agent_id, gha_id } = req.body;
     if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
 
-    // Verify GHA belongs to this SA
-    const { data: ghaCheck } = await serviceClient
-      .from('gha_agents').select('id, gha_code, full_name').eq('id', gha_id).eq('sa_id', saId).single();
-    if (!ghaCheck) return res.status(403).json({ error: 'This GHA does not belong to you' });
+    const { data: gha } = await adminClient.from('gha_agents')
+      .select('id, gha_code, full_name, sa_id').eq('id', gha_id).single();
+    if (!gha) return res.status(404).json({ error: 'GHA not found' });
+    if (gha.sa_id !== session.staff_id) return res.status(403).json({ error: 'This GHA does not belong to your team' });
 
-    const { error } = await serviceClient
-      .from('profiles').update({ gha_id, sa_id: saId }).eq('id', agent_id);
-    if (error) throw error;
+    const { data: sa } = await adminClient.from('service_agents')
+      .select('id, sa_code, full_name').eq('id', session.staff_id).single();
 
-    const { data: agent } = await serviceClient
-      .from('profiles').select('email, full_name').eq('id', agent_id).single();
-    if (agent?.email) {
-      setImmediate(async function() {
-        try {
-          await sendCustomerEmail(
-            agent.email,
-            'GetHome - You Have Been Assigned to a GHA',
-            `Hello ${agent.full_name || 'Agent'},
+    const { error: updateErr } = await adminClient.from('profiles')
+      .update({ gha_id: gha_id, sa_id: session.staff_id, gha_code: gha.gha_code })
+      .eq('id', agent_id);
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
 
-You have been assigned to GHA ${ghaCheck.gha_code} (${ghaCheck.full_name || ''}).
+    const { data: agent } = await adminClient.from('profiles')
+      .select('email, full_name').eq('id', agent_id).single();
 
-Please log in to your GetHome agent portal for more details.
+    try {
+      await sendCustomerEmail(
+        agent?.email,
+        'You have been assigned to a GetHome team',
+        `Hello ${agent?.full_name || 'Agent'},\n\nYou have been assigned to GHA ${gha.gha_code} - ${gha.full_name} under SA ${sa?.sa_code}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
+      );
+    } catch(emailErr) { console.error('Assignment email failed:', emailErr.message); }
 
-The GetHome Team
-https://trygethome.online`
-          );
-        } catch (e) { console.error('SA assign-agent-to-gha email error:', e.message); }
-      });
-    }
-
-    res.json({ success: true, gha_code: ghaCheck.gha_code, gha_name: ghaCheck.full_name });
+    res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code + ' successfully' });
   } catch (err) {
-    console.error('SA assign-agent-to-gha error:', err.message);
+    console.error('Assign agent exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1660,6 +1637,53 @@ https://trygethome.online`
     res.json({ success: true });
   } catch (err) {
     console.error('SA confirm-deposit error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/verify-agent
+app.post('/api/gha/verify-agent', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { agent_id, notes } = req.body;
+    if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+
+    const { data: agent } = await adminClient.from('profiles')
+      .select('*').eq('id', agent_id).single();
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    if (agent.gha_id !== session.staff_id) return res.status(403).json({ error: 'This agent is not under your GHA' });
+
+    const { error: updateErr } = await adminClient.from('profiles')
+      .update({ gha_verified: true, status: 'pending_sa_review' }).eq('id', agent_id);
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    const { data: saData } = await adminClient.from('service_agents')
+      .select('id, email, full_name').eq('id', agent.sa_id).single();
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'SA',
+      recipient_id: agent.sa_id,
+      type: 'agent_verified',
+      title: 'GHA Verified Agent',
+      message: 'Agent ' + (agent.full_name || agent.email) + ' has been verified by GHA. You can now approve them.',
+      is_read: false,
+    }]).catch(e => console.error('SA notification failed:', e.message));
+
+    try {
+      await sendCustomerEmail(
+        saData?.email,
+        'Agent Verification Complete - Action Required',
+        `Hello ${saData?.full_name || 'SA'},\n\nGHA has verified agent ${agent.full_name || agent.email}. Please log in to your SA dashboard to approve this agent.\n\nGetHome Team`
+      );
+    } catch(emailErr) { console.error('SA email failed:', emailErr.message); }
+
+    res.json({ success: true, message: 'Agent verified successfully. SA has been notified to approve.' });
+  } catch (err) {
+    console.error('Verify agent exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2716,67 +2740,67 @@ app.get('/api/admin/earnings', async (req, res) => {
 });
 
 // POST /api/sa/create-inspection
-app.post('/api/sa/create-inspection', verifyStaffToken, async (req, res) => {
+app.post('/api/sa/create-inspection', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const saId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const { gha_id, property_id, inspection_date, customer_name, customer_email, customer_phone, property_address, notes } = req.body;
-    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+    const { property_id, customer_name, customer_email, customer_phone, property_address, gha_id, inspection_date, notes, inspection_type } = req.body;
 
-    const { data: ghaCheck } = await serviceClient
-      .from('gha_agents').select('id, gha_code, full_name, email').eq('id', gha_id).eq('sa_id', saId).single();
-    if (!ghaCheck) return res.status(403).json({ error: 'This GHA does not belong to you' });
-
-    const { data: inspection, error } = await serviceClient
-      .from('inspections')
-      .insert([{
-        gha_id,
-        property_id: property_id || null,
-        inspection_date: inspection_date || null,
-        customer_name: customer_name || null,
-        customer_email: customer_email || null,
-        customer_phone: customer_phone || null,
-        property_address: property_address || null,
-        notes: notes || null,
-        assigned_by_sa: saId,
-        status: 'pending',
-      }])
-      .select()
-      .single();
-    if (error) throw error;
-
-    if (ghaCheck.email) {
-      setImmediate(async function() {
-        try {
-          await sendCustomerEmail(
-            ghaCheck.email,
-            'GetHome - New Inspection Assigned to You',
-            `Hello ${ghaCheck.full_name || 'GHA'},
-
-A new property inspection has been assigned to you.
-
-INSPECTION DETAILS
-------------------
-Customer Name    : ${customer_name || 'N/A'}
-Customer Email   : ${customer_email || 'N/A'}
-Customer Phone   : ${customer_phone || 'N/A'}
-Property Address : ${property_address || 'N/A'}
-Inspection Date  : ${inspection_date || 'TBD'}
-${notes ? 'Notes            : ' + notes : ''}
-
-Please log in to your GHA dashboard to view and manage this inspection.
-
-The GetHome Team
-https://trygethome.online`
-          );
-        } catch (e) { console.error('SA create-inspection GHA email error:', e.message); }
-      });
+    if (!customer_name || !customer_email || !gha_id) {
+      return res.status(400).json({ error: 'customer_name, customer_email and gha_id are required' });
     }
 
-    res.status(201).json(inspection);
+    const { data: gha } = await adminClient.from('gha_agents')
+      .select('id, gha_code, full_name, sa_id, email').eq('id', gha_id).single();
+    if (!gha) return res.status(404).json({ error: 'GHA not found' });
+    if (gha.sa_id !== session.staff_id) return res.status(403).json({ error: 'This GHA does not belong to your team' });
+
+    const { data: inspection, error: insertErr } = await adminClient.from('inspections').insert([{
+      property_id: property_id ? parseInt(property_id) : null,
+      gha_id: gha_id,
+      assigned_by_sa: session.staff_id,
+      customer_name: customer_name.trim(),
+      customer_email: customer_email.trim().toLowerCase(),
+      customer_phone: (customer_phone || '').trim(),
+      property_address: (property_address || '').trim(),
+      inspection_date: inspection_date || null,
+      inspection_type: inspection_type || 'physical',
+      notes: notes || null,
+      status: 'pending',
+    }]).select().single();
+
+    if (insertErr) {
+      console.error('Inspection insert error:', insertErr.message);
+      return res.status(500).json({ error: insertErr.message });
+    }
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: gha_id,
+      type: 'inspection_request',
+      title: 'New Inspection Assigned',
+      message: 'Inspect property for customer ' + customer_name + ' at ' + (property_address || 'address TBD') + (inspection_date ? ' on ' + new Date(inspection_date).toLocaleDateString() : ''),
+      property_id: property_id ? parseInt(property_id) : null,
+      inspection_id: inspection.id,
+      customer_email: customer_email,
+      customer_phone: customer_phone || '',
+      is_read: false,
+    }]).catch(e => console.error('Notification insert failed:', e.message));
+
+    try {
+      await sendCustomerEmail(
+        gha.email,
+        'New Inspection Assigned - GetHome',
+        `Hello ${gha.full_name},\n\nA new inspection has been assigned to you.\n\nCustomer: ${customer_name}\nEmail: ${customer_email}\nPhone: ${customer_phone || 'Not provided'}\nAddress: ${property_address || 'TBD'}\nDate: ${inspection_date ? new Date(inspection_date).toLocaleString() : 'TBD'}\nType: ${inspection_type || 'Physical'}\n\nPlease log in to your GHA dashboard to view details.\n\nGetHome Team`
+      );
+    } catch(emailErr) { console.error('GHA notification email failed:', emailErr.message); }
+
+    res.json({ success: true, inspection });
   } catch (err) {
-    console.error('SA create-inspection error:', err.message);
+    console.error('Create inspection exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
