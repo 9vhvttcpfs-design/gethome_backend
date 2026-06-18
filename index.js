@@ -3546,7 +3546,7 @@ https://trygethome.online`
 });
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
-  const { email, password, fullName, phone, address, experience, specialty, nin, cac, about } = req.body;
+  const { email, password, fullName, phone, address, city, experience, specialty, nin, cac, about, requested_gha_code } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
   // Block disposable emails
@@ -3590,7 +3590,9 @@ app.post('/api/auth/agent-register', async (req, res) => {
             email: email,
             full_name: fullName || null,
             phone: phone || null,
-            office_address: address || null,
+            office_address: address && city ? address + ', ' + city : (address || null),
+            city: city || null,
+            requested_gha_code: requested_gha_code ? requested_gha_code.toUpperCase().trim() : null,
             experience: experience || null,
             specialty: specialty || null,
             nin_number: nin || null,
@@ -3598,7 +3600,7 @@ app.post('/api/auth/agent-register', async (req, res) => {
             about: about || null,
           }], { onConflict: 'id' });
         if (profileErr) console.error('Agent profile error:', profileErr.message);
-        else console.log('Agent profile created: role=agent, status=pending, email:', email);
+        else console.log('Agent profile created: email:', email, '| city:', city || null, '| requested_gha_code:', requested_gha_code ? requested_gha_code.toUpperCase().trim() : null);
       } catch (profileErr) {
         console.error('Agent profile upsert failed:', profileErr.message);
       }
