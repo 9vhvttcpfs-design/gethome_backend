@@ -1474,18 +1474,18 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
       .eq('id', agent_id);
     if (updateErr) return res.status(500).json({ error: updateErr.message });
 
-    const { data: agent } = await adminClient.from('profiles')
+    const { data: agentProfile } = await adminClient.from('profiles')
       .select('email, full_name').eq('id', agent_id).single();
 
     try {
       await sendCustomerEmail(
-        agent?.email,
+        agentProfile?.email,
         'You have been assigned to a GetHome team',
-        `Hello ${agent?.full_name || 'Agent'},\n\nYou have been assigned to GHA ${gha.gha_code} - ${gha.full_name} under SA ${sa?.sa_code}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
+        `Hello ${agentProfile?.full_name || 'Agent'},\n\nYou have been assigned to GHA ${gha.gha_code} - ${gha.full_name} under SA ${sa?.sa_code}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
       );
     } catch(emailErr) { console.error('Assignment email failed:', emailErr.message); }
 
-    const agentName = agent?.full_name || agent?.email || 'New Agent';
+    const agentName = agentProfile?.full_name || agentProfile?.email || 'New Agent';
     await adminClient.from('notifications').insert([{
       recipient_type: 'GHA',
       recipient_id: gha_id,
