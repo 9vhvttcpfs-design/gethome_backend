@@ -1227,27 +1227,42 @@ app.get('/api/sa/my-agents', async (req, res) => {
         return w.length > 2;
       });
 
-      var fallbackQuery = adminClient.from('profiles').select('*').eq('role', 'agent');
+      // Fetch both pending and approved agents so the full dashboard is populated
+      var fallbackQuery = adminClient
+        .from('profiles')
+        .select('*')
+        .eq('role', 'agent')
+        .in('status', ['pending', 'pending_gha_inspection', 'pending_sa_review', 'approved']);
 
       if (locationWords.length > 0) {
         var orConditions = locationWords.map(function(word) {
-          return 'office_address.ilike.%' + word + '%';
+          return 'office_address.ilike.%' + word + '%,city.ilike.%' + word + '%';
         }).join(',');
-        fallbackQuery = fallbackQuery.or(orConditions + ',office_address.is.null,office_address.eq.');
+        fallbackQuery = fallbackQuery.or(orConditions + ',office_address.is.null,office_address.eq.,city.is.null,city.eq.');
       }
 
       var { data: fallbackAgents } = await fallbackQuery.order('created_at', { ascending: false });
-      return res.json(fallbackAgents || []);
+      // Normalise city and requested_gha_code for UI safety even in fallback path
+      var normFallback = (fallbackAgents || []).map(function(a) {
+        return Object.assign({}, a, {
+          city:               (a.city || '').trim() || null,
+          requested_gha_code: (a.requested_gha_code || '').trim() || null,
+        });
+      });
+      return res.json(normFallback);
     }
 
     const enriched = (agents || []).map(function(a) {
       var ghaId = a.assigned_gha_id || a.gha_id || null;
       var saId  = a.assigned_sa_id  || a.sa_id  || null;
       return Object.assign({}, a, {
-        gha_id: ghaId,
-        sa_id: saId,
-        office_address: a.location || a.office_address || null,
-        already_assigned: !!(ghaId && saId),
+        gha_id:             ghaId,
+        sa_id:              saId,
+        office_address:     a.location || a.office_address || null,
+        // Safe string normalisation so the SA board UI always receives clean values
+        city:               (a.city || '').trim() || null,
+        requested_gha_code: (a.requested_gha_code || '').trim() || null,
+        already_assigned:   !!(ghaId && saId),
         already_assigned_other_sa: !!(ghaId && saId && saId !== session.staff_id),
       });
     });
@@ -1265,68 +1280,77 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    // Fetch SA's location to also surface pending agents in the same city
-    const { data: saRecord } = await adminClient
-      .from('service_agents')
-      .select('location')
-      .eq('id', saId)
-      .single();
-    const saLocation = (saRecord?.location || '').trim();
-    const locationWords = saLocation.split(/[\s,]+/).filter(w => w.length > 2);
-    console.log('[pending-agents] saId:', saId, '| saLocation:', JSON.stringify(saLocation), '| locationWords:', locationWords);
-
     const statusFilter = ['pending', 'pending_gha_inspection', 'pending_sa_review'];
 
-    // Query 1: agents explicitly assigned to this SA
-    const { data: assignedAgents, error: assignedErr } = await adminClient
+    // Use the updated RPC which cleanly extracts city names across profiles and agents tables
+    const { data: rpcAgents, error: rpcErr } = await adminClient
+      .rpc('get_sa_localized_agents', { sa_uuid: saId });
+
+    let agents = [];
+
+    if (rpcErr || !rpcAgents || rpcAgents.length === 0) {
+      console.log('[pending-agents] RPC empty or failed:', rpcErr?.message || 'no results');
+      // Fallback: direct query for agents explicitly assigned to this SA
+      const { data: fallback, error: fbErr } = await adminClient
+        .from('profiles')
+        .select('*')
+        .eq('role', 'agent')
+        .in('status', statusFilter)
+        .eq('sa_id', saId)
+        .order('created_at', { ascending: false });
+      if (fbErr) throw fbErr;
+      agents = fallback || [];
+    } else {
+      // RPC returns all statuses — filter down to pending workflow statuses only
+      agents = rpcAgents.filter(function(a) { return statusFilter.includes(a.status); });
+      console.log('[pending-agents] RPC ok:', rpcAgents.length, 'total ->', agents.length, 'in pending statuses');
+    }
+
+    // Always supplement with agents directly assigned to this SA that the RPC may not surface
+    // (handles edge cases where city fields are blank but sa_id is already stamped)
+    const rpcIds = new Set(agents.map(function(a) { return a.id; }));
+    const { data: assignedAgents } = await adminClient
       .from('profiles')
       .select('*')
       .eq('role', 'agent')
       .eq('sa_id', saId)
       .in('status', statusFilter)
       .order('created_at', { ascending: false });
-    if (assignedErr) throw assignedErr;
-
-    // Query 2: pending agents in the same city (by city column and office_address)
-    // Uses chained .ilike() — Supabase handles % wildcards correctly here unlike in .or() strings
-    let cityAgents = [];
-    if (locationWords.length > 0) {
-      for (const word of locationWords) {
-        const [{ data: byCity }, { data: byAddr }] = await Promise.all([
-          adminClient.from('profiles').select('*').eq('role', 'agent').in('status', statusFilter).ilike('city', `%${word}%`),
-          adminClient.from('profiles').select('*').eq('role', 'agent').in('status', statusFilter).ilike('office_address', `%${word}%`),
-        ]);
-        cityAgents = cityAgents.concat(byCity || []).concat(byAddr || []);
+    for (const a of (assignedAgents || [])) {
+      if (!rpcIds.has(a.id)) {
+        agents.push(a);
+        rpcIds.add(a.id);
       }
     }
 
-    // Merge and deduplicate — assigned agents take precedence for ordering
-    const seen = new Set();
-    const agents = [...(assignedAgents || []), ...cityAgents].filter(a => {
-      if (seen.has(a.id)) return false;
-      seen.add(a.id);
-      return true;
-    }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    agents.sort(function(a, b) { return new Date(b.created_at) - new Date(a.created_at); });
 
-    console.log('[pending-agents] found', agents.length, 'agents (assigned:', (assignedAgents || []).length, '| city-matched:', cityAgents.length, '). Sample:', agents.slice(0, 3).map(a => ({ city: a.city, addr: a.office_address, sa_id: a.sa_id })));
-
-    // Enrich agents that have a gha_id with GHA details
-    const ghaIds = [...new Set((agents || []).map(a => a.gha_id).filter(Boolean))];
+    // Enrich with GHA details (including phone/whatsapp for the SA's "contact GHA" button)
+    const ghaIds = [...new Set(agents.map(function(a) { return a.gha_id; }).filter(Boolean))];
     let ghaMap = {};
     if (ghaIds.length > 0) {
       const { data: ghas } = await serviceClient
         .from('gha_agents')
-        .select('id, gha_code, full_name')
+        .select('id, gha_code, full_name, phone, whatsapp_number')
         .in('id', ghaIds);
       for (const g of (ghas || [])) ghaMap[g.id] = g;
     }
 
-    const enriched = (agents || []).map(a => ({
-      ...a,
-      gha_code: a.gha_id ? (ghaMap[a.gha_id]?.gha_code || null) : null,
-      gha_name: a.gha_id ? (ghaMap[a.gha_id]?.full_name || null) : null,
-    }));
+    const enriched = agents.map(function(a) {
+      const ghaInfo = a.gha_id ? (ghaMap[a.gha_id] || {}) : {};
+      return Object.assign({}, a, {
+        // Safely normalise city and requested_gha_code so the SA board UI always gets clean strings
+        city:               (a.city || '').trim() || null,
+        requested_gha_code: (a.requested_gha_code || '').trim() || null,
+        gha_code:           a.gha_id ? (ghaInfo.gha_code   || null) : null,
+        gha_name:           a.gha_id ? (ghaInfo.full_name   || null) : null,
+        gha_phone:          a.gha_id ? (ghaInfo.phone       || null) : null,
+        gha_whatsapp:       a.gha_id ? (ghaInfo.whatsapp_number || null) : null,
+      });
+    });
 
+    console.log('[pending-agents] returning', enriched.length, 'agents for SA', saId,
+      '| sample city values:', enriched.slice(0, 3).map(function(a) { return a.city; }));
     res.json(enriched);
   } catch (err) {
     console.error('SA pending-agents error:', err.message);
@@ -4554,6 +4578,91 @@ app.post('/api/gha/mark-notifications-read', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ──────────────────────────────────────────────────────────
+// ADMIN FORCE-ASSIGN AGENT TO GHA
+// Bypasses all SA portal locks. Calls admin_force_assign_agent_gha RPC.
+// Registered on both /force-assign-agent and /assign-agent-gha (alias).
+// ──────────────────────────────────────────────────────────
+async function handleAdminForceAssign(req, res) {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Accept canonical RPC-aligned names (target_agent_id / target_gha_id) or legacy aliases
+    const agent_id = req.body.target_agent_id || req.body.agent_id;
+    const gha_id   = req.body.target_gha_id   || req.body.gha_id;
+    if (!agent_id || !gha_id) return res.status(400).json({ error: 'target_agent_id and target_gha_id are required' });
+
+    // Call the privileged RPC that overrides SA ownership and city locks
+    const { error: rpcErr } = await serviceClient
+      .rpc('admin_force_assign_agent_gha', {
+        target_agent_id: agent_id,
+        target_gha_id:   gha_id,
+      });
+
+    if (rpcErr) {
+      console.error('[force-assign] RPC error:', rpcErr.message, '| code:', rpcErr.code);
+      // Graceful fallback: direct service-role update if RPC is not yet deployed (PGRST202 = no such function)
+      if (rpcErr.code === '42883' || rpcErr.code === 'PGRST202') {
+        console.warn('[force-assign] RPC not found — falling back to direct table update');
+        const { data: ghaFb, error: ghaFbErr } = await serviceClient
+          .from('gha_agents')
+          .select('id, gha_code, full_name, sa_id')
+          .eq('id', gha_id)
+          .single();
+        if (ghaFbErr || !ghaFb) return res.status(404).json({ error: 'GHA not found' });
+
+        const { error: updateErr } = await serviceClient
+          .from('profiles')
+          .update({ gha_id: ghaFb.id, sa_id: ghaFb.sa_id || null, gha_code: ghaFb.gha_code })
+          .eq('id', agent_id);
+        if (updateErr) throw updateErr;
+      } else {
+        throw rpcErr;
+      }
+    }
+
+    // Fetch fresh agent + GHA details for email
+    const [{ data: agent }, { data: gha }] = await Promise.all([
+      serviceClient.from('profiles').select('id, full_name, email').eq('id', agent_id).single(),
+      serviceClient.from('gha_agents').select('id, gha_code, full_name, sa_id').eq('id', gha_id).single(),
+    ]);
+
+    // Notify the agent by email (non-blocking)
+    if (agent?.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            agent.email,
+            'You have been assigned to a GetHome team',
+            `Hello ${agent.full_name || 'Agent'},
+
+You have been assigned to GHA ${gha?.gha_code} — ${gha?.full_name} by GetHome Admin.
+
+Your account is now being reviewed. You will be notified once it is fully approved.
+
+The GetHome Team
+https://trygethome.online`
+          );
+        } catch (e) { console.error('[force-assign] email error:', e.message); }
+      });
+    }
+
+    console.log('[force-assign] admin', admin.id, 'assigned agent', agent_id, 'to GHA', gha_id);
+    res.json({
+      success: true,
+      message: `Agent force-assigned to ${gha?.gha_code || gha_id} successfully`,
+    });
+  } catch (err) {
+    console.error('Admin force-assign-agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+app.post('/api/admin/force-assign-agent', handleAdminForceAssign);
+// Alias: frontend originally called /assign-agent-gha; both resolve to the same handler
+app.post('/api/admin/assign-agent-gha', handleAdminForceAssign);
 
 // ──────────────────────────────────────────────────────────
 // START SERVER
