@@ -63,6 +63,7 @@ const serviceClient = process.env.SUPABASE_SERVICE_KEY
     })
   : supabase;
 const adminClient = serviceClient;
+console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
 const KYC_BUCKET  = process.env.SUPABASE_KYC_BUCKET     || 'agent-kyc-documents';
@@ -403,7 +404,8 @@ app.get('/api/admin/agents', async (req, res) => {
           if (foundEmail) {
             agent.email = foundEmail;
             // Also update the profiles table so future calls are fast
-            supabase.from('profiles').update({ email: foundEmail }).eq('id', agent.id).then(() => {}).catch(() => {});
+            const { error: emailUpdateErr } = await supabase.from('profiles').update({ email: foundEmail }).eq('id', agent.id);
+            if (emailUpdateErr) console.error('Email profile update failed for', agent.id, emailUpdateErr.message);
           }
         } catch (e) {
           console.error('Email fallback lookup failed for', agent.id, e.message);
@@ -417,6 +419,23 @@ app.get('/api/admin/agents', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.get('/api/admin/verified-pending-agents', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: profile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
+    if (!profile || profile.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const { data, error } = await adminClient.from('verified_pending_agents').select('*');
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Approve agent (admin only)
 app.post('/api/admin/approve-agent', async (req, res) => {
   try {
@@ -1282,35 +1301,65 @@ app.get('/api/sa/pending-agents', async (req, res) => {
       .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    // Fetch ALL agents under this SA regardless of how they got assigned
-    const { data: agents, error } = await adminClient
+    // Get SA location for matching
+    const { data: saRecord } = await adminClient
+      .from('service_agents').select('location, sa_code').eq('id', session.staff_id).single();
+    const saLocation = (saRecord?.location || '').toLowerCase().trim();
+    const saKeywords = saLocation.split(/[\s,]+/).map(w => w.trim()).filter(w => w.length > 2);
+
+    console.log('SA', saRecord?.sa_code, 'fetching pending agents for location:', saLocation);
+
+    // PART 1: Unclaimed agents (sa_id IS NULL) matching this SA's city - these are NEW pending agents
+    const { data: unclaimedAgents } = await adminClient
       .from('profiles')
       .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, created_at')
-      .eq('sa_id', session.staff_id)
       .eq('role', 'agent')
+      .is('sa_id', null)
       .order('created_at', { ascending: false });
 
-    if (error) {
-      console.error('Pending agents fetch error:', error.message);
-      return res.status(500).json({ error: error.message });
-    }
+    // Filter unclaimed agents by city match (relaxed)
+    const matchedUnclaimed = (unclaimedAgents || []).filter(function(a) {
+      if (saKeywords.length === 0) return true; // no SA location set - show all
+      const agentCity = (a.city || '').toLowerCase();
+      const agentAddr = (a.office_address || '').toLowerCase();
+      const agentText = agentCity + ' ' + agentAddr;
+      const hasNoLocation = !agentCity && !agentAddr;
+      const matches = saKeywords.some(function(kw) { return agentText.includes(kw); });
+      return matches || hasNoLocation;
+    });
 
-    console.log('SA', session.staff_id, 'total agents under them:', (agents || []).length);
+    // PART 2: Agents ALREADY assigned to this SA (after SA claimed them) - these are in later stages
+    const { data: claimedAgents } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, created_at')
+      .eq('role', 'agent')
+      .eq('sa_id', session.staff_id)
+      .order('created_at', { ascending: false });
+
+    console.log('Unclaimed matched:', matchedUnclaimed.length, '| Claimed by this SA:', (claimedAgents || []).length);
 
     const pendingStatuses = ['pending', 'pending_sa_review', 'awaiting_review'];
-    const pending = (agents || []).filter(function(a) {
+
+    // Pending = unclaimed agents in this SA's area, status pending
+    const pending = matchedUnclaimed.filter(function(a) {
       return pendingStatuses.includes(a.status) || !a.status;
     });
-    const ghaInspection = (agents || []).filter(function(a) {
+
+    // GHA inspection = already claimed by this SA and sent to a GHA
+    const ghaInspection = (claimedAgents || []).filter(function(a) {
       return a.status === 'pending_gha_inspection';
     });
-    const approved = (agents || []).filter(function(a) {
+
+    // Approved = claimed by this SA and approved
+    const approved = (claimedAgents || []).filter(function(a) {
       return a.status === 'approved';
     });
 
-    console.log('Pending:', pending.length, '| GHA inspection:', ghaInspection.length, '| Approved:', approved.length);
-
-    res.json({ pending: pending, pending_gha_inspection: ghaInspection, approved: approved, all: agents });
+    res.json({
+      pending: pending,
+      pending_gha_inspection: ghaInspection,
+      approved: approved,
+    });
   } catch (err) {
     console.error('Pending agents exception:', err.message);
     res.status(500).json({ error: err.message });
@@ -1422,10 +1471,15 @@ app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
       .single();
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
 
-    // Update agent status and assign to GHA
+    // Update agent status and assign to GHA; sa_id claims the previously-unclaimed agent
     const { error: updateErr } = await serviceClient
       .from('profiles')
-      .update({ status: 'pending_gha_inspection', gha_id })
+      .update({
+        gha_id: gha_id,
+        sa_id: saId,
+        gha_code: gha.gha_code,
+        status: 'pending_gha_inspection',
+      })
       .eq('id', agent_id);
     if (updateErr) throw updateErr;
 
@@ -1683,14 +1737,15 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     } catch(emailErr) { console.error('Assignment email failed:', emailErr.message); }
 
     const agentName = agentProfile?.full_name || agentProfile?.email || 'New Agent';
-    await adminClient.from('notifications').insert([{
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'GHA',
       recipient_id: gha_id,
       type: 'agent_verification',
       title: 'Confirm Agent Information',
       message: 'SA has assigned agent ' + agentName + ' to your team. Please review their registration details and confirm their information so the SA can approve them.',
       is_read: false,
-    }]).catch(e => console.error('GHA agent notification failed:', e.message));
+    }]);
+    if (notifErr) console.error('GHA agent notification failed:', notifErr.message);
 
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code + ' successfully' });
   } catch (err) {
@@ -1867,14 +1922,15 @@ app.post('/api/gha/verify-agent', async (req, res) => {
     const { data: saData } = await adminClient.from('service_agents')
       .select('id, email, full_name').eq('id', agent.sa_id).single();
 
-    await adminClient.from('notifications').insert([{
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'SA',
       recipient_id: agent.sa_id,
       type: 'agent_verified',
       title: 'GHA Verified Agent',
       message: 'Agent ' + (agent.full_name || agent.email) + ' has been verified by GHA. You can now approve them.',
       is_read: false,
-    }]).catch(e => console.error('SA notification failed:', e.message));
+    }]);
+    if (notifErr) console.error('SA notification failed:', notifErr.message);
 
     try {
       await sendCustomerEmail(
@@ -1897,27 +1953,19 @@ app.get('/api/gha/my-agents', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
     const ghaId = req.staffSession.staff_id;
 
-    const { data: agents, error } = await serviceClient
+    console.log('GHA fetching agents - my staff_id (gha_agents.id):', ghaId);
+    const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('id, full_name, phone, email, nin_number, experience, specialty, verification_level, status, subscription_tier, subscription_end, bank_name, account_number, gha_id, sa_id, created_at')
+      .select('*')
       .eq('gha_id', ghaId)
-      .eq('role', 'agent')
-      .order('created_at', { ascending: false });
-    if (error) throw error;
+      .eq('role', 'agent');
 
-    console.log(`[GHA my-agents] gha_id=${ghaId} — found ${(agents || []).length} agent(s)`);
+    console.log('Query result - found agents:', (agents || []).length, '| error:', error?.message);
+    if (agents && agents.length > 0) {
+      console.log('Sample agent gha_id values:', agents.map(a => a.gha_id));
+    }
 
-    const now = new Date();
-    const enriched = (agents || []).map(function(agent) {
-      return Object.assign({}, agent, {
-        nin_number: agent.nin_number
-          ? agent.nin_number.slice(0, 3) + '****' + agent.nin_number.slice(-3)
-          : null,
-        is_expired: agent.subscription_end ? new Date(agent.subscription_end) < now : false,
-      });
-    });
-
-    res.json(enriched);
+    res.json(agents || []);
   } catch (err) {
     console.error('GHA my-agents error:', err.message);
     res.status(500).json({ error: err.message });
@@ -2178,7 +2226,7 @@ app.post('/api/admin/create-gha', async (req, res) => {
       .from('gha_agents')
       .insert([{ full_name, email, phone, location: location || null, sa_id: sa_id || null, gha_code, password_hash }])
       .select()
-      .single();
+      .single(); 
     if (error) throw error;
 
     const result = Object.assign({}, data);
@@ -2970,7 +3018,7 @@ app.post('/api/sa/create-inspection', async (req, res) => {
       return res.status(500).json({ error: insertErr.message });
     }
 
-    await adminClient.from('notifications').insert([{
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'GHA',
       recipient_id: gha_id,
       type: 'inspection_request',
@@ -2981,7 +3029,8 @@ app.post('/api/sa/create-inspection', async (req, res) => {
       customer_email: customer_email,
       customer_phone: customer_phone || '',
       is_read: false,
-    }]).catch(e => console.error('Notification insert failed:', e.message));
+    }]);
+    if (notifErr) console.error('Notification insert failed:', notifErr.message);
 
     try {
       await sendCustomerEmail(
@@ -3063,7 +3112,7 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
       .eq('id', inspection_id);
     if (error) throw error;
 
-    await adminClient.from('notifications').insert([{
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'GHA',
       recipient_id: inspection.gha_id,
       type: 'inspection_passed',
@@ -3071,7 +3120,8 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
       message: 'Your inspection for customer ' + inspection.customer_name + ' has been reviewed and confirmed by your SA. Great work!',
       inspection_id: inspection_id,
       is_read: false,
-    }]).catch(e => console.error('GHA confirmed notification failed:', e.message));
+    }]);
+    if (notifErr) console.error('GHA confirmed notification failed:', notifErr.message);
 
     res.json({ success: true });
   } catch (err) {
@@ -3103,7 +3153,7 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
     if (error) throw error;
 
     // Notify SA that inspection is done
-    await adminClient.from('notifications').insert([{
+    const { error: notifSaErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'SA',
       recipient_id: inspection.assigned_by_sa,
       type: 'inspection_done',
@@ -3113,10 +3163,11 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
       customer_email: inspection.customer_email,
       customer_phone: inspection.customer_phone || '',
       is_read: false,
-    }]).catch(e => console.error('SA notification failed:', e.message));
+    }]);
+    if (notifSaErr) console.error('SA notification failed:', notifSaErr.message);
 
     // Also notify the GHA themselves as confirmation
-    await adminClient.from('notifications').insert([{
+    const { error: notifGhaErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'GHA',
       recipient_id: req.staffSession.staff_id,
       type: 'inspection_passed',
@@ -3124,7 +3175,8 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
       message: 'Your inspection report for customer ' + inspection.customer_name + ' has been submitted and is awaiting SA confirmation.',
       inspection_id: inspection_id,
       is_read: false,
-    }]).catch(e => console.error('GHA confirmation notification failed:', e.message));
+    }]);
+    if (notifGhaErr) console.error('GHA confirmation notification failed:', notifGhaErr.message);
 
     if (inspection.assigned_by_sa) {
       const [{ data: sa }, { data: ghaInfo }] = await Promise.all([
@@ -3212,96 +3264,51 @@ app.post('/api/admin/assign-gha-to-sa', async (req, res) => {
 // POST /api/admin/assign-agent-to-gha
 app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
   try {
-    const admin = await verifyAdminToken(req);
-    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    if (authError || !userData?.user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: callerProfile } = await adminClient.from('profiles').select('role').eq('id', userData.user.id).single();
+    if (!callerProfile || callerProfile.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
 
     const { agent_id, gha_id } = req.body;
+    console.log('Admin assign request - agent_id:', agent_id, 'gha_id:', gha_id);
     if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
 
-    // Fetch GHA (need gha_code and sa_id for the update)
-    const { data: gha } = await serviceClient
-      .from('gha_agents')
-      .select('id, gha_code, full_name, sa_id')
-      .eq('id', gha_id)
-      .single();
-    if (!gha) return res.status(404).json({ error: 'GHA not found' });
-
-    // Fetch agent
-    const { data: agent } = await serviceClient
-      .from('profiles')
-      .select('id, full_name, email, role')
-      .eq('id', agent_id)
-      .single();
-    if (!agent) return res.status(404).json({ error: 'Agent not found' });
-    if (agent.role !== 'agent') return res.status(400).json({ error: 'Profile is not an agent' });
-
-    // Fetch SA for the notification email
-    let saRecord = null;
-    if (gha.sa_id) {
-      const { data: sa } = await serviceClient
-        .from('service_agents')
-        .select('id, sa_code, full_name')
-        .eq('id', gha.sa_id)
-        .single();
-      saRecord = sa || null;
+    const { data: gha, error: ghaErr } = await adminClient.from('gha_agents').select('id, gha_code, sa_id, full_name').eq('id', gha_id).single();
+    if (ghaErr || !gha) {
+      console.error('GHA lookup failed:', ghaErr?.message);
+      return res.status(404).json({ error: 'GHA not found with id: ' + gha_id });
     }
 
-    // Assign agent to GHA (and cascade sa_id), set status so GHA can action it
-    const { error: updateErr } = await serviceClient
+    const { data: updated, error: updateErr } = await adminClient
       .from('profiles')
-      .update({ gha_id: gha.id, sa_id: gha.sa_id || null, gha_code: gha.gha_code, status: 'pending_gha_inspection' })
-      .eq('id', agent_id);
-    if (updateErr) throw updateErr;
+      .update({
+        gha_id: gha_id,
+        sa_id: gha.sa_id,
+        gha_code: gha.gha_code,
+        status: 'pending_gha_inspection',
+      })
+      .eq('id', agent_id)
+      .select();
 
-    // Notify GHA in-app
-    await serviceClient.from('notifications').insert({
-      recipient_type: 'GHA',
-      recipient_id: gha.id,
-      type: 'inspection_request',
-      title: 'New Agent to Verify',
-      message: `Admin has assigned agent ${agent.full_name || agent_id} to your team. Please review their registration details and confirm.`,
-      is_read: false,
-    }).catch(e => console.error('Admin assign-agent GHA notification error:', e.message));
+    if (updateErr) {
+      console.error('PROFILE UPDATE FAILED:', updateErr.message, updateErr.code, updateErr.details);
+      return res.status(500).json({ error: 'Database update failed: ' + updateErr.message });
+    }
 
-    // Email GHA and agent (non-blocking)
-    setImmediate(async function() {
-      try {
-        // Fetch GHA email if not already available
-        const { data: ghaFull } = await serviceClient.from('gha_agents').select('email, full_name').eq('id', gha.id).single();
-        if (ghaFull?.email) {
-          await sendCustomerEmail(ghaFull.email, 'GetHome - New Agent Assigned to You',
-`Hello ${ghaFull.full_name || 'GHA'},
+    console.log('UPDATE SUCCESS - rows affected:', updated?.length, '| updated row:', JSON.stringify(updated?.[0]));
 
-GetHome Admin has assigned an agent to your team for inspection and verification.
+    if (!updated || updated.length === 0) {
+      console.error('WARNING: Update query ran but affected 0 rows. agent_id may not exist:', agent_id);
+      return res.status(404).json({ error: 'No profile found with id: ' + agent_id });
+    }
 
-Agent Name: ${agent.full_name || 'N/A'}
-Agent Email: ${agent.email || 'N/A'}
-
-Please review the agent's registration details, conduct the necessary inspection, and confirm to your SA once done.
-
-Log in to your GHA dashboard to action this request.
-
-The GetHome Team
-https://trygethome.online`);
-        }
-      } catch (e) { console.error('Admin assign-agent GHA email error:', e.message); }
-      try {
-        if (agent.email) {
-          await sendCustomerEmail(
-            agent.email,
-            'You have been assigned to a GetHome team',
-            `Hello ${agent.full_name || 'Agent'},\n\nYou have been assigned to GHA ${gha.gha_code} - ${gha.full_name}${saRecord ? ' under SA ' + saRecord.sa_code : ''}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
-          );
-        }
-      } catch (e) { console.error('Admin assign-agent email error:', e.message); }
-    });
-
-    res.json({
-      success: true,
-      message: `Agent assigned to ${gha.gha_code} successfully`,
-    });
+    res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code, updated_agent: updated[0] });
   } catch (err) {
-    console.error('Admin assign-agent-to-gha error:', err.message);
+    console.error('Admin assign exception:', err.message, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3525,24 +3532,51 @@ app.get('/api/property-sa/:propertyId', async (req, res) => {
 });
 
 // GET /api/sa/notifications
-app.get('/api/sa/notifications', verifyStaffToken, async (req, res) => {
+app.get('/api/sa/notifications', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const saId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
 
-    const { data: notifications, error } = await serviceClient
+    const { data: session, error: sessionErr } = await adminClient
+      .from('staff_sessions')
+      .select('*')
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+
+    if (sessionErr || !session) {
+      console.error('SA notifications session error:', sessionErr?.message);
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    }
+    if (session.staff_role !== 'SA') {
+      return res.status(403).json({ error: 'SA access required' });
+    }
+
+    const saId = session.staff_id;
+    console.log('Fetching notifications for SA:', saId);
+
+    const { data: notifs, error: notifErr } = await adminClient
       .from('notifications')
       .select('*')
       .eq('recipient_type', 'SA')
       .eq('recipient_id', saId)
-      .order('created_at', { ascending: false });
-    if (error) throw error;
+      .order('created_at', { ascending: false })
+      .limit(50);
 
-    const unread_count = (notifications || []).filter(function(n) { return !n.is_read; }).length;
-    res.json({ notifications: notifications || [], unread_count });
+    if (notifErr) {
+      console.error('SA notifications query error:', notifErr.message, notifErr.code);
+      return res.json({ notifications: [], unread_count: 0 });
+    }
+
+    const safeNotifs = notifs || [];
+    const unreadCount = safeNotifs.filter(function(n) { return n.is_read === false || n.is_read === null; }).length;
+
+    console.log('SA notifications found:', safeNotifs.length, '| unread:', unreadCount);
+
+    res.json({ notifications: safeNotifs, unread_count: unreadCount });
   } catch (err) {
-    console.error('SA notifications error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('SA notifications exception:', err.message);
+    res.json({ notifications: [], unread_count: 0 });
   }
 });
 
@@ -3550,23 +3584,48 @@ app.get('/api/sa/notifications', verifyStaffToken, async (req, res) => {
 app.get('/api/gha/notifications', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
-    const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
-    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+    if (!token) return res.status(401).json({ error: 'No token' });
 
-    const { data: notifs } = await adminClient
+    const { data: session, error: sessionErr } = await adminClient
+      .from('staff_sessions')
+      .select('*')
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+
+    if (sessionErr || !session) {
+      console.error('GHA notifications session error:', sessionErr?.message);
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    }
+    if (session.staff_role !== 'GHA') {
+      return res.status(403).json({ error: 'GHA access required' });
+    }
+
+    const ghaId = session.staff_id;
+    console.log('Fetching notifications for GHA:', ghaId);
+
+    const { data: notifs, error: notifErr } = await adminClient
       .from('notifications')
       .select('*')
       .eq('recipient_type', 'GHA')
-      .eq('recipient_id', session.staff_id)
+      .eq('recipient_id', ghaId)
       .order('created_at', { ascending: false })
       .limit(50);
 
-    const unread = (notifs || []).filter(function(n) { return !n.is_read; }).length;
-    res.json({ notifications: notifs || [], unread_count: unread });
+    if (notifErr) {
+      console.error('GHA notifications query error:', notifErr.message, notifErr.code);
+      return res.json({ notifications: [], unread_count: 0 });
+    }
+
+    const safeNotifs = notifs || [];
+    const unreadCount = safeNotifs.filter(function(n) { return n.is_read === false || n.is_read === null; }).length;
+
+    console.log('GHA notifications found:', safeNotifs.length, '| unread:', unreadCount);
+
+    res.json({ notifications: safeNotifs, unread_count: unreadCount });
   } catch (err) {
-    console.error('GHA notifications error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('GHA notifications exception:', err.message);
+    res.json({ notifications: [], unread_count: 0 });
   }
 });
 
@@ -3801,10 +3860,12 @@ app.post('/api/auth/signup', async (req, res) => {
     }
     // Create customer profile with explicit role, status and email
     if (finalUserId) {
-      supabase.from('profiles')
-        .upsert([{ id: finalUserId, role: 'customer', status: 'approved', email: userEmail }], { onConflict: 'id' })
-        .then(() => console.log('Customer profile created for:', userEmail))
-        .catch(e => console.error('Profile error (non-blocking):', e.message));
+      (async () => {
+        const { error: profileErr } = await supabase.from('profiles')
+          .upsert([{ id: finalUserId, role: 'customer', status: 'approved', email: userEmail }], { onConflict: 'id' });
+        if (profileErr) console.error('Profile error (non-blocking):', profileErr.message);
+        else console.log('Customer profile created for:', userEmail);
+      })();
     }
     // Send welcome email - completely non-blocking, never affects response
     setImmediate(async function() {
@@ -3982,12 +4043,13 @@ app.post('/api/auth/login', async (req, res) => {
         // If profile missing entirely, create one so future logins work
         if (profileError.code === 'PGRST116') { // not found
           console.log('Profile missing for user - creating default customer profile');
-          await adminClient.from('profiles').upsert([{
+          const { error: upsertErr } = await adminClient.from('profiles').upsert([{
             id: data.user.id,
             role: 'customer',
             status: 'approved',
             email: email,
-          }], { onConflict: 'id' }).catch(e => console.error('Profile create failed:', e.message));
+          }], { onConflict: 'id' });
+          if (upsertErr) console.error('Profile create failed:', upsertErr.message);
         }
       } else if (profile) {
         role         = profile.role         || 'customer';
@@ -4600,122 +4662,71 @@ app.post('/api/gha/mark-notifications-read', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────
 // ADMIN FORCE-ASSIGN AGENT TO GHA
-// Bypasses all SA portal locks. Calls admin_force_assign_agent_gha RPC.
-// Registered on both /force-assign-agent and /assign-agent-gha (alias).
-// ──────────────────────────────────────────────────────────
-async function handleAdminForceAssign(req, res) {
+const adminForceAssignHandler = async (req, res) => {
   try {
-    const admin = await verifyAdminToken(req);
-    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
 
-    // Accept canonical RPC-aligned names (target_agent_id / target_gha_id) or legacy aliases
-    const agent_id = req.body.target_agent_id || req.body.agent_id;
-    const gha_id   = req.body.target_gha_id   || req.body.gha_id;
-    if (!agent_id || !gha_id) return res.status(400).json({ error: 'target_agent_id and target_gha_id are required' });
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    if (authError || !userData?.user) return res.status(401).json({ error: 'Unauthorized' });
 
-    // Call the privileged RPC that overrides SA ownership and city locks
-    const { error: rpcErr } = await serviceClient
-      .rpc('admin_force_assign_agent_gha', {
-        target_agent_id: agent_id,
-        target_gha_id:   gha_id,
-      });
-
-    if (rpcErr) {
-      console.error('[force-assign] RPC error:', rpcErr.message, '| code:', rpcErr.code);
-      // Graceful fallback: direct service-role update if RPC is not yet deployed (PGRST202 = no such function)
-      if (rpcErr.code === '42883' || rpcErr.code === 'PGRST202') {
-        console.warn('[force-assign] RPC not found — falling back to direct table update');
-        const { data: ghaFb, error: ghaFbErr } = await serviceClient
-          .from('gha_agents')
-          .select('id, gha_code, full_name, sa_id')
-          .eq('id', gha_id)
-          .single();
-        if (ghaFbErr || !ghaFb) return res.status(404).json({ error: 'GHA not found' });
-
-        const { error: updateErr } = await serviceClient
-          .from('profiles')
-          .update({ gha_id: ghaFb.id, sa_id: ghaFb.sa_id || null, gha_code: ghaFb.gha_code, status: 'pending_gha_inspection' })
-          .eq('id', agent_id);
-        if (updateErr) throw updateErr;
-      } else {
-        throw rpcErr;
-      }
-    } else {
-      // RPC succeeded — still ensure status is set to pending_gha_inspection
-      await serviceClient.from('profiles').update({ status: 'pending_gha_inspection' }).eq('id', agent_id)
-        .then(({ error: sErr }) => { if (sErr) console.error('[force-assign] status update error:', sErr.message); });
+    const { data: callerProfile } = await adminClient
+      .from('profiles').select('role').eq('id', userData.user.id).single();
+    if (!callerProfile || callerProfile.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
     }
 
-    // Fetch fresh agent + GHA details for email/notification
-    const [{ data: agent }, { data: gha }] = await Promise.all([
-      serviceClient.from('profiles').select('id, full_name, email').eq('id', agent_id).single(),
-      serviceClient.from('gha_agents').select('id, gha_code, full_name, sa_id, email').eq('id', gha_id).single(),
-    ]);
+    // Accept canonical names or legacy aliases from the /assign-agent-gha route
+    const target_agent_id = req.body.target_agent_id || req.body.agent_id;
+    const target_gha_id   = req.body.target_gha_id   || req.body.gha_id;
+    if (!target_agent_id || !target_gha_id) {
+      return res.status(400).json({ error: 'target_agent_id and target_gha_id are required' });
+    }
 
-    // In-app notification for GHA
-    await serviceClient.from('notifications').insert({
-      recipient_type: 'GHA',
-      recipient_id: gha_id,
-      type: 'inspection_request',
-      title: 'New Agent to Verify',
-      message: `Admin has assigned agent ${agent?.full_name || agent_id} to your team. Please review their registration details and confirm.`,
-      is_read: false,
-    }).catch(e => console.error('[force-assign] GHA notification error:', e.message));
+    console.log('Force-assign request - agent:', target_agent_id, 'gha:', target_gha_id);
 
-    // Notify GHA and agent by email (non-blocking)
-    setImmediate(async function() {
-      try {
-        if (gha?.email) {
-          await sendCustomerEmail(gha.email, 'GetHome - New Agent Assigned to You',
-`Hello ${gha.full_name || 'GHA'},
-
-GetHome Admin has assigned an agent to your team for inspection and verification.
-
-Agent Name: ${agent?.full_name || 'N/A'}
-Agent Email: ${agent?.email || 'N/A'}
-
-Please review the agent's registration details, conduct the necessary inspection, and confirm to your SA once done.
-
-Log in to your GHA dashboard to action this request.
-
-The GetHome Team
-https://trygethome.online`);
-        }
-      } catch (e) { console.error('[force-assign] GHA email error:', e.message); }
-      try {
-        if (agent?.email) {
-          await sendCustomerEmail(
-            agent.email,
-            'You have been assigned to a GetHome team',
-            `Hello ${agent.full_name || 'Agent'},
-
-You have been assigned to GHA ${gha?.gha_code} — ${gha?.full_name} by GetHome Admin.
-
-Your account is now being reviewed. You will be notified once it is fully approved.
-
-The GetHome Team
-https://trygethome.online`
-          );
-        }
-      } catch (e) { console.error('[force-assign] agent email error:', e.message); }
+    // Use the RPC function for atomic assignment
+    const { error: rpcError } = await adminClient.rpc('admin_force_assign_agent_gha', {
+      target_agent_id: target_agent_id,
+      target_gha_id: target_gha_id,
     });
 
-    console.log('[force-assign] admin', admin.id, 'assigned agent', agent_id, 'to GHA', gha_id);
-    res.json({
+    if (rpcError) {
+      console.error('RPC assignment failed:', rpcError.message);
+      return res.status(500).json({ error: rpcError.message });
+    }
+
+    console.log('Agent successfully assigned via RPC');
+
+    // Safe notification insert - awaited properly, never chained .catch
+    const { error: notifError } = await adminClient
+      .from('notifications')
+      .insert([{
+        recipient_id: target_gha_id,
+        recipient_type: 'GHA',
+        type: 'agent_verification',
+        title: 'New Agent Assigned',
+        message: 'An administrator has assigned a new agent to your team for verification.',
+        is_read: false,
+      }]);
+
+    if (notifError) {
+      console.error('Non-blocking notification error:', notifError.message);
+    }
+
+    res.status(200).json({
       success: true,
-      message: `Agent force-assigned to ${gha?.gha_code || gha_id} successfully`,
+      message: 'Agent successfully linked to GHA.',
     });
   } catch (err) {
-    console.error('Admin force-assign-agent error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Admin force-assign-agent exception:', err.message);
+    res.status(500).json({ error: err.message || 'Internal server exception during GHA mapping.' });
   }
-}
-
-app.post('/api/admin/force-assign-agent', handleAdminForceAssign);
-// Alias: frontend originally called /assign-agent-gha; both resolve to the same handler
-app.post('/api/admin/assign-agent-gha', handleAdminForceAssign);
+};
+app.post('/api/admin/force-assign-agent', adminForceAssignHandler);
+// Alias: frontend originally called /assign-agent-gha
+app.post('/api/admin/assign-agent-gha', adminForceAssignHandler);
 
 // ──────────────────────────────────────────────────────────
 // START SERVER
