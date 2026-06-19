@@ -1280,13 +1280,29 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    const { data: agents, error } = await adminClient
+    const { data: rpcAgents, error } = await adminClient
       .rpc('get_sa_localized_agents', { sa_uuid: saId });
 
-    if (error || !agents) {
+    if (error) {
       console.error('Localized agents fetch error:', error?.message);
-      return res.json([]);
     }
+
+    // Supplemental query: agents directly under this SA (admin-assigned or otherwise)
+    // so agents outside the location filter are never silently dropped.
+    const { data: saDirectAgents } = await adminClient
+      .from('profiles')
+      .select('*')
+      .eq('role', 'agent')
+      .eq('sa_id', saId)
+      .in('status', ['pending', 'pending_gha_inspection', 'pending_sa_review', 'awaiting_review', 'approved']);
+
+    // Merge RPC results with direct-SA results, deduplicating by id
+    const agentMap = {};
+    for (const a of (rpcAgents || [])) agentMap[a.id] = a;
+    for (const a of (saDirectAgents || [])) {
+      if (!agentMap[a.id]) agentMap[a.id] = a;
+    }
+    const agents = Object.values(agentMap);
 
     console.log('Total localized agents found:', agents.length, '| statuses:', agents.map(function(a) { return a.status; }));
 
@@ -3234,25 +3250,55 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
       saRecord = sa || null;
     }
 
-    // Assign agent to GHA (and cascade sa_id)
+    // Assign agent to GHA (and cascade sa_id), set status so GHA can action it
     const { error: updateErr } = await serviceClient
       .from('profiles')
-      .update({ gha_id: gha.id, sa_id: gha.sa_id || null, gha_code: gha.gha_code })
+      .update({ gha_id: gha.id, sa_id: gha.sa_id || null, gha_code: gha.gha_code, status: 'pending_gha_inspection' })
       .eq('id', agent_id);
     if (updateErr) throw updateErr;
 
-    // Notify agent by email
-    if (agent.email) {
-      setImmediate(async function() {
-        try {
+    // Notify GHA in-app
+    await serviceClient.from('notifications').insert({
+      recipient_type: 'GHA',
+      recipient_id: gha.id,
+      type: 'inspection_request',
+      title: 'New Agent to Verify',
+      message: `Admin has assigned agent ${agent.full_name || agent_id} to your team. Please review their registration details and confirm.`,
+      is_read: false,
+    }).catch(e => console.error('Admin assign-agent GHA notification error:', e.message));
+
+    // Email GHA and agent (non-blocking)
+    setImmediate(async function() {
+      try {
+        // Fetch GHA email if not already available
+        const { data: ghaFull } = await serviceClient.from('gha_agents').select('email, full_name').eq('id', gha.id).single();
+        if (ghaFull?.email) {
+          await sendCustomerEmail(ghaFull.email, 'GetHome - New Agent Assigned to You',
+`Hello ${ghaFull.full_name || 'GHA'},
+
+GetHome Admin has assigned an agent to your team for inspection and verification.
+
+Agent Name: ${agent.full_name || 'N/A'}
+Agent Email: ${agent.email || 'N/A'}
+
+Please review the agent's registration details, conduct the necessary inspection, and confirm to your SA once done.
+
+Log in to your GHA dashboard to action this request.
+
+The GetHome Team
+https://trygethome.online`);
+        }
+      } catch (e) { console.error('Admin assign-agent GHA email error:', e.message); }
+      try {
+        if (agent.email) {
           await sendCustomerEmail(
             agent.email,
             'You have been assigned to a GetHome team',
             `Hello ${agent.full_name || 'Agent'},\n\nYou have been assigned to GHA ${gha.gha_code} - ${gha.full_name}${saRecord ? ' under SA ' + saRecord.sa_code : ''}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
           );
-        } catch (e) { console.error('Admin assign-agent email error:', e.message); }
-      });
-    }
+        }
+      } catch (e) { console.error('Admin assign-agent email error:', e.message); }
+    });
 
     res.json({
       success: true,
@@ -4594,24 +4640,56 @@ async function handleAdminForceAssign(req, res) {
 
         const { error: updateErr } = await serviceClient
           .from('profiles')
-          .update({ gha_id: ghaFb.id, sa_id: ghaFb.sa_id || null, gha_code: ghaFb.gha_code })
+          .update({ gha_id: ghaFb.id, sa_id: ghaFb.sa_id || null, gha_code: ghaFb.gha_code, status: 'pending_gha_inspection' })
           .eq('id', agent_id);
         if (updateErr) throw updateErr;
       } else {
         throw rpcErr;
       }
+    } else {
+      // RPC succeeded — still ensure status is set to pending_gha_inspection
+      await serviceClient.from('profiles').update({ status: 'pending_gha_inspection' }).eq('id', agent_id)
+        .then(({ error: sErr }) => { if (sErr) console.error('[force-assign] status update error:', sErr.message); });
     }
 
-    // Fetch fresh agent + GHA details for email
+    // Fetch fresh agent + GHA details for email/notification
     const [{ data: agent }, { data: gha }] = await Promise.all([
       serviceClient.from('profiles').select('id, full_name, email').eq('id', agent_id).single(),
-      serviceClient.from('gha_agents').select('id, gha_code, full_name, sa_id').eq('id', gha_id).single(),
+      serviceClient.from('gha_agents').select('id, gha_code, full_name, sa_id, email').eq('id', gha_id).single(),
     ]);
 
-    // Notify the agent by email (non-blocking)
-    if (agent?.email) {
-      setImmediate(async function() {
-        try {
+    // In-app notification for GHA
+    await serviceClient.from('notifications').insert({
+      recipient_type: 'GHA',
+      recipient_id: gha_id,
+      type: 'inspection_request',
+      title: 'New Agent to Verify',
+      message: `Admin has assigned agent ${agent?.full_name || agent_id} to your team. Please review their registration details and confirm.`,
+      is_read: false,
+    }).catch(e => console.error('[force-assign] GHA notification error:', e.message));
+
+    // Notify GHA and agent by email (non-blocking)
+    setImmediate(async function() {
+      try {
+        if (gha?.email) {
+          await sendCustomerEmail(gha.email, 'GetHome - New Agent Assigned to You',
+`Hello ${gha.full_name || 'GHA'},
+
+GetHome Admin has assigned an agent to your team for inspection and verification.
+
+Agent Name: ${agent?.full_name || 'N/A'}
+Agent Email: ${agent?.email || 'N/A'}
+
+Please review the agent's registration details, conduct the necessary inspection, and confirm to your SA once done.
+
+Log in to your GHA dashboard to action this request.
+
+The GetHome Team
+https://trygethome.online`);
+        }
+      } catch (e) { console.error('[force-assign] GHA email error:', e.message); }
+      try {
+        if (agent?.email) {
           await sendCustomerEmail(
             agent.email,
             'You have been assigned to a GetHome team',
@@ -4624,9 +4702,9 @@ Your account is now being reviewed. You will be notified once it is fully approv
 The GetHome Team
 https://trygethome.online`
           );
-        } catch (e) { console.error('[force-assign] email error:', e.message); }
-      });
-    }
+        }
+      } catch (e) { console.error('[force-assign] agent email error:', e.message); }
+    });
 
     console.log('[force-assign] admin', admin.id, 'assigned agent', agent_id, 'to GHA', gha_id);
     res.json({
