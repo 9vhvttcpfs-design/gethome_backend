@@ -1048,31 +1048,110 @@ app.get('/api/staff/me', async (req, res) => {
 
     if (!session) return res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });
 
-    let table, codeField;
     if (session.staff_role === 'SA') {
-      table = 'service_agents';
-      codeField = 'sa_code';
-    } else {
-      table = 'gha_agents';
-      codeField = 'gha_code';
+      const { data: staff } = await serviceClient
+        .from('service_agents')
+        .select('*')
+        .eq('id', session.staff_id)
+        .single();
+      if (!staff) return res.status(404).json({ error: 'Staff record not found' });
+
+      return res.json({
+        id: staff.id,
+        code: staff.sa_code,
+        full_name: staff.full_name,
+        email: staff.email,
+        phone: staff.phone,
+        location: staff.location,
+        role: 'SA',
+        whatsapp_number: staff.whatsapp_number || null,
+      });
     }
 
-    const { data: staff } = await serviceClient.from(table).select('*').eq('id', session.staff_id).single();
-    if (!staff) return res.status(404).json({ error: 'Staff record not found' });
+    // GHA — fetch with SA details joined
+    const { data: ghaRecord } = await adminClient
+      .from('gha_agents')
+      .select('*, service_agents!gha_agents_sa_id_fkey(sa_code, full_name, email, phone, whatsapp_number)')
+      .eq('id', session.staff_id)
+      .single();
 
-    res.json({
-      id: staff.id,
-      code: staff[codeField],
-      full_name: staff.full_name,
-      email: staff.email,
-      phone: staff.phone,
-      location: staff.location,
-      role: session.staff_role,
-      sa_id: staff.sa_id || null,
-      whatsapp_number: staff.whatsapp_number || null,
+    if (!ghaRecord) return res.status(404).json({ error: 'GHA record not found' });
+
+    const { count: agentCount } = await adminClient
+      .from('profiles')
+      .select('id', { count: 'exact', head: true })
+      .eq('gha_id', session.staff_id);
+
+    const saDetails = ghaRecord.service_agents || {};
+
+    return res.json({
+      id: ghaRecord.id,
+      code: ghaRecord.gha_code,
+      gha_code: ghaRecord.gha_code,
+      full_name: ghaRecord.full_name,
+      email: ghaRecord.email,
+      phone: ghaRecord.phone,
+      location: ghaRecord.location,
+      status: ghaRecord.status,
+      role: 'GHA',
+      commission_rate: ghaRecord.commission_rate || 5,
+      sa_id: ghaRecord.sa_id,
+      sa_code: saDetails.sa_code || null,
+      sa_name: saDetails.full_name || null,
+      sa_email: saDetails.email || null,
+      sa_phone: saDetails.phone || null,
+      sa_whatsapp: saDetails.whatsapp_number || null,
+      agent_count: agentCount || 0,
     });
   } catch (err) {
     console.error('Staff me error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha/profile
+app.get('/api/gha/profile', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient
+      .from('staff_sessions')
+      .select('*')
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { data: ghaRecord } = await adminClient
+      .from('gha_agents')
+      .select('*, service_agents!gha_agents_sa_id_fkey(sa_code, full_name, email, phone, whatsapp_number)')
+      .eq('id', session.staff_id)
+      .single();
+
+    if (!ghaRecord) return res.status(404).json({ error: 'GHA profile not found' });
+
+    const { count: agentCount } = await adminClient
+      .from('profiles')
+      .select('id', { count: 'exact', head: true })
+      .eq('gha_id', session.staff_id);
+
+    const sa = ghaRecord.service_agents || {};
+    res.json({
+      gha_code: ghaRecord.gha_code,
+      full_name: ghaRecord.full_name,
+      email: ghaRecord.email,
+      phone: ghaRecord.phone,
+      location: ghaRecord.location,
+      status: ghaRecord.status,
+      commission_rate: ghaRecord.commission_rate || 5,
+      sa_id: ghaRecord.sa_id,
+      sa_code: sa.sa_code || 'Not assigned',
+      sa_name: sa.full_name || 'Not assigned',
+      sa_email: sa.email || null,
+      sa_whatsapp: sa.whatsapp_number || null,
+      agent_count: agentCount || 0,
+    });
+  } catch (err) {
+    console.error('GHA profile error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1405,41 +1484,79 @@ app.get('/api/sa/search-agent', async (req, res) => {
       return res.status(403).json({ error: 'SA access required' });
     }
 
+    // Get SA location for city matching
+    const { data: saRecord } = await adminClient
+      .from('service_agents')
+      .select('location, sa_code')
+      .eq('id', session.staff_id)
+      .single();
+
+    const saLocation = (saRecord?.location || '').toLowerCase().trim();
+
+    // Extract city keywords from SA location
+    // e.g. 'Wuse Abuja' -> ['wuse', 'abuja']
+    const saKeywords = saLocation
+      .split(/[\s,]+/)
+      .map(w => w.trim())
+      .filter(w => w.length > 2);
+
+    console.log('SA', saRecord?.sa_code, 'location:', saLocation, 'keywords:', saKeywords);
+
     const searchEmail = (req.query.email || '').trim().toLowerCase();
     if (!searchEmail) return res.status(400).json({ error: 'Email is required' });
 
-    console.log('SA searching agent by email:', searchEmail);
-
-    // Search by email with role=agent only - NO status filter
-    const { data: foundAgent, error } = await adminClient
+    // Search by email with role=agent - NO status filter
+    const { data: foundAgent, error: searchError } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, experience, specialty, nin_number, cac_number, about, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, created_at')
       .ilike('email', searchEmail)
       .eq('role', 'agent')
       .single();
 
-    if (error || !foundAgent) {
-      console.log('Agent not found:', searchEmail, '| DB error:', error?.message);
+    if (searchError || !foundAgent) {
+      console.log('Agent not found:', searchEmail);
       return res.status(404).json({
         error: 'No registered agent found with that email. Make sure the agent has signed up on GetHome as an agent first.'
       });
     }
 
-    console.log('Agent found:', foundAgent.email, '| status:', foundAgent.status, '| gha_id:', foundAgent.gha_id);
+    // Location check - only enforce if SA has a location set
+    if (saKeywords.length > 0) {
+      const agentCity = (foundAgent.city || '').toLowerCase().trim();
+      const agentAddress = (foundAgent.office_address || '').toLowerCase().trim();
+      const agentLocationText = agentCity + ' ' + agentAddress;
 
-    // Check if already assigned to a different GHA under a different SA
+      // Check if any SA keyword appears in agent location OR agent location appears in SA location
+      const locationMatch = saKeywords.some(function(keyword) {
+        return agentLocationText.includes(keyword) || saLocation.includes(agentCity);
+      });
+
+      // Also allow if agent has no city set yet
+      const agentHasNoLocation = !agentCity && !agentAddress;
+
+      if (!locationMatch && !agentHasNoLocation) {
+        return res.status(400).json({
+          error: 'This agent is located in ' + (foundAgent.city || 'a different area') + ' and is outside your service area (' + saRecord?.location + '). Only agents in your area can be assigned to your GHAs.',
+          location_mismatch: true,
+          agent_city: foundAgent.city || 'Unknown',
+          sa_location: saRecord?.location,
+        });
+      }
+    }
+
+    // Check if already assigned to a GHA under a DIFFERENT SA
     if (foundAgent.gha_id && foundAgent.sa_id && foundAgent.sa_id !== session.staff_id) {
       return res.status(400).json({
-        error: 'This agent is already assigned to a GHA under a different SA. Contact admin to reassign them.'
+        error: 'This agent is already assigned to a GHA under a different SA. Only admin can reassign them.',
+        locked: true,
       });
     }
 
-    // If assigned to a GHA under THIS SA that is fine - return agent with a note
-    var alreadyAssigned = !!(foundAgent.gha_id && foundAgent.sa_id === session.staff_id);
+    console.log('Agent found and eligible:', foundAgent.email, 'status:', foundAgent.status);
 
     res.json({
       agent: Object.assign({}, foundAgent, {
-        already_assigned: alreadyAssigned,
+        already_assigned: !!(foundAgent.gha_id && foundAgent.sa_id === session.staff_id),
         assigned_gha_code: foundAgent.gha_code || null,
       })
     });
@@ -3581,7 +3698,7 @@ app.post('/api/auth/agent-register', async (req, res) => {
     const agentUserId = data?.user?.id || null;
     if (agentUserId) {
       try {
-        const { error: profileErr } = await supabase
+        const { error: profileErr } = await adminClient
           .from('profiles')
           .upsert([{
             id: agentUserId,
