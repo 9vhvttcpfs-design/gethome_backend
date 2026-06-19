@@ -1176,45 +1176,88 @@ app.get('/api/gha/profile', async (req, res) => {
 });
 
 // GET /api/sa/my-ghas
-app.get('/api/sa/my-ghas', verifyStaffToken, async (req, res) => {
+app.get('/api/sa/my-ghas', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const saId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
 
-    const { data: ghas, error } = await serviceClient
-      .from('gha_agents')
+    const { data: session, error: sessionErr } = await adminClient
+      .from('staff_sessions')
       .select('*')
-      .eq('sa_id', saId);
-    if (error) throw error;
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
 
-    const now = new Date().toISOString();
-    const enriched = await Promise.all((ghas || []).map(async function(gha) {
-      const { count: agentCount } = await serviceClient
-        .from('profiles')
-        .select('id', { count: 'exact', head: true })
-        .eq('gha_id', gha.id);
+    if (sessionErr || !session) {
+      console.error('SA my-ghas session error:', sessionErr?.message);
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    }
+    if (session.staff_role !== 'SA') {
+      return res.status(403).json({ error: 'SA access required' });
+    }
 
-      const { data: activeSubs } = await serviceClient
-        .from('profiles')
-        .select('subscription_amount')
-        .eq('gha_id', gha.id)
-        .gt('subscription_end', now);
-      const monthlyCommission = (activeSubs || []).reduce(function(sum, p) {
-        return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
-      }, 0);
+    const saId = session.staff_id;
+    console.log('Fetching GHAs for SA:', saId);
 
-      return Object.assign({}, gha, {
-        password_hash: undefined,
-        gh_staff_token: undefined,
-        agent_count: agentCount || 0,
-        monthly_commission: monthlyCommission,
-      });
+    const { data: ghas, error: ghaErr } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, email, phone, location, status, commission_rate, created_at')
+      .eq('sa_id', saId)
+      .order('created_at', { ascending: false });
+
+    if (ghaErr) {
+      console.error('GHA query error:', ghaErr.message, ghaErr.code);
+      return res.json([]);
+    }
+
+    const safeGhas = ghas || [];
+    console.log('Found', safeGhas.length, 'GHAs for SA', saId);
+
+    const enriched = await Promise.all(safeGhas.map(async function(gha) {
+      try {
+        const { count, error: countErr } = await adminClient
+          .from('profiles')
+          .select('id', { count: 'exact', head: true })
+          .eq('gha_id', gha.id)
+          .eq('role', 'agent');
+
+        if (countErr) {
+          console.error('Agent count error for GHA', gha.gha_code, ':', countErr.message);
+          return Object.assign({}, gha, { agent_count: 0, monthly_commission: 0 });
+        }
+
+        const agentCount = count || 0;
+
+        let monthlyCommission = 0;
+        try {
+          const { data: subAgents } = await adminClient
+            .from('profiles')
+            .select('subscription_amount')
+            .eq('gha_id', gha.id)
+            .eq('role', 'agent')
+            .gt('subscription_end', new Date().toISOString());
+
+          monthlyCommission = (subAgents || []).reduce(function(sum, a) {
+            return sum + (parseFloat(a.subscription_amount) || 0) * 0.05;
+          }, 0);
+        } catch (commErr) {
+          console.error('Commission calc error for GHA', gha.gha_code, ':', commErr.message);
+        }
+
+        return Object.assign({}, gha, {
+          agent_count: agentCount,
+          monthly_commission: Math.round(monthlyCommission),
+        });
+      } catch (innerErr) {
+        console.error('Enrichment failed for GHA', gha?.gha_code, ':', innerErr.message);
+        return Object.assign({}, gha, { agent_count: 0, monthly_commission: 0 });
+      }
     }));
 
     res.json(enriched);
   } catch (err) {
-    console.error('SA my-ghas error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('CRITICAL: SA my-ghas exception:', err.message, err.stack);
+    res.status(200).json([]);
   }
 });
 
