@@ -1273,23 +1273,27 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
       .single();
     const saLocation = (saRecord?.location || '').trim();
     const locationWords = saLocation.split(/[\s,]+/).filter(w => w.length > 2);
+    console.log('[pending-agents] saId:', saId, '| saLocation:', JSON.stringify(saLocation), '| locationWords:', locationWords);
 
     // Build query: agents assigned to this SA OR in the same city (unassigned/pending)
     let query = serviceClient
       .from('profiles')
       .select('*')
       .eq('role', 'agent')
-      .in('status', ['pending', 'pending_gha_inspection']);
+      .in('status', ['pending', 'pending_gha_inspection', 'pending_sa_review']);
 
     if (locationWords.length > 0) {
       const cityConditions = locationWords.map(w => `city.ilike.%${w}%,office_address.ilike.%${w}%`).join(',');
-      query = query.or(`sa_id.eq.${saId},${cityConditions}`);
+      const orFilter = `sa_id.eq.${saId},${cityConditions}`;
+      console.log('[pending-agents] OR filter:', orFilter);
+      query = query.or(orFilter);
     } else {
       query = query.eq('sa_id', saId);
     }
 
     const { data: agents, error } = await query.order('created_at', { ascending: false });
     if (error) throw error;
+    console.log('[pending-agents] found', agents?.length ?? 0, 'agents. Sample city/address:', (agents || []).slice(0, 3).map(a => ({ city: a.city, addr: a.office_address, sa_id: a.sa_id })));
 
     // Enrich agents that have a gha_id with GHA details
     const ghaIds = [...new Set((agents || []).map(a => a.gha_id).filter(Boolean))];
@@ -1323,6 +1327,8 @@ app.post('/api/sa/approve-agent', async (req, res) => {
       .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
+    const saId = session.staff_id;
+
     const { agent_id } = req.body;
     if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
 
@@ -1330,12 +1336,21 @@ app.post('/api/sa/approve-agent', async (req, res) => {
       .select('*').eq('id', agent_id).single();
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
 
+    // Block if agent is assigned to a different SA
+    if (agent.sa_id && agent.sa_id !== saId) {
+      return res.status(403).json({ error: 'This agent is assigned to a different SA and cannot be approved by you.' });
+    }
+
     if (agent.gha_id && agent.gha_verified === false) {
       return res.status(400).json({ error: 'GHA has not yet confirmed this agent. Please wait for GHA verification before approving.' });
     }
 
+    // Stamp sa_id so the agent is linked to the approving SA
+    const updatePayload = { status: 'approved' };
+    if (!agent.sa_id) updatePayload.sa_id = saId;
+
     const { error: updateErr } = await adminClient.from('profiles')
-      .update({ status: 'approved' }).eq('id', agent_id);
+      .update(updatePayload).eq('id', agent_id);
     if (updateErr) return res.status(500).json({ error: updateErr.message });
 
     try {
@@ -3521,6 +3536,24 @@ app.post('/api/mark-notification-read', verifyStaffToken, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('mark-notification-read error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/profile
+app.get('/api/sa/profile', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+    const { data, error } = await serviceClient
+      .from('service_agents')
+      .select('id, full_name, email, phone, location, whatsapp_number, sa_code, created_at')
+      .eq('id', saId)
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('sa/profile error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
