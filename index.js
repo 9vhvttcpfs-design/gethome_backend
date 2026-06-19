@@ -1275,80 +1275,44 @@ app.get('/api/sa/my-agents', async (req, res) => {
 });
 
 // GET /api/sa/pending-agents
-app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
+app.get('/api/sa/pending-agents', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
-    const saId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const { data: rpcAgents, error } = await adminClient
-      .rpc('get_sa_localized_agents', { sa_uuid: saId });
+    // Fetch ALL agents under this SA regardless of how they got assigned
+    const { data: agents, error } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, created_at')
+      .eq('sa_id', session.staff_id)
+      .eq('role', 'agent')
+      .order('created_at', { ascending: false });
 
     if (error) {
-      console.error('Localized agents fetch error:', error?.message);
+      console.error('Pending agents fetch error:', error.message);
+      return res.status(500).json({ error: error.message });
     }
 
-    // Supplemental query: agents directly under this SA (admin-assigned or otherwise)
-    // so agents outside the location filter are never silently dropped.
-    const { data: saDirectAgents } = await adminClient
-      .from('profiles')
-      .select('*')
-      .eq('role', 'agent')
-      .eq('sa_id', saId)
-      .in('status', ['pending', 'pending_gha_inspection', 'pending_sa_review', 'awaiting_review', 'approved']);
+    console.log('SA', session.staff_id, 'total agents under them:', (agents || []).length);
 
-    // Merge RPC results with direct-SA results, deduplicating by id
-    const agentMap = {};
-    for (const a of (rpcAgents || [])) agentMap[a.id] = a;
-    for (const a of (saDirectAgents || [])) {
-      if (!agentMap[a.id]) agentMap[a.id] = a;
-    }
-    const agents = Object.values(agentMap);
-
-    console.log('Total localized agents found:', agents.length, '| statuses:', agents.map(function(a) { return a.status; }));
-
-    // Enrich all agents with GHA contact details before splitting into groups
-    const ghaIds = [...new Set(agents.map(function(a) { return a.gha_id; }).filter(Boolean))];
-    let ghaMap = {};
-    if (ghaIds.length > 0) {
-      const { data: ghas } = await serviceClient
-        .from('gha_agents')
-        .select('id, gha_code, full_name, phone, whatsapp_number')
-        .in('id', ghaIds);
-      for (const g of (ghas || [])) ghaMap[g.id] = g;
-    }
-
-    const enriched = agents.map(function(a) {
-      const ghaInfo = a.gha_id ? (ghaMap[a.gha_id] || {}) : {};
-      return Object.assign({}, a, {
-        city:               (a.city || '').trim() || null,
-        requested_gha_code: (a.requested_gha_code || '').trim() || null,
-        gha_code:           a.gha_id ? (ghaInfo.gha_code          || null) : null,
-        gha_name:           a.gha_id ? (ghaInfo.full_name          || null) : null,
-        gha_phone:          a.gha_id ? (ghaInfo.phone              || null) : null,
-        gha_whatsapp:       a.gha_id ? (ghaInfo.whatsapp_number    || null) : null,
-      });
-    });
-
-    // Accept ALL pending-style statuses, not just one exact string
-    const pendingStatuses = ['pending', 'pending_sa_review', 'awaiting_review', null, ''];
-
-    const pendingAgents = enriched.filter(function(a) {
+    const pendingStatuses = ['pending', 'pending_sa_review', 'awaiting_review'];
+    const pending = (agents || []).filter(function(a) {
       return pendingStatuses.includes(a.status) || !a.status;
     });
-
-    const ghaInspectionAgents = enriched.filter(function(a) {
+    const ghaInspection = (agents || []).filter(function(a) {
       return a.status === 'pending_gha_inspection';
     });
-
-    console.log('Pending agents:', pendingAgents.length, '| GHA inspection agents:', ghaInspectionAgents.length);
-
-    res.json({
-      pending:                 pendingAgents,
-      pending_gha_inspection:  ghaInspectionAgents,
-      all:                     enriched,
+    const approved = (agents || []).filter(function(a) {
+      return a.status === 'approved';
     });
+
+    console.log('Pending:', pending.length, '| GHA inspection:', ghaInspection.length, '| Approved:', approved.length);
+
+    res.json({ pending: pending, pending_gha_inspection: ghaInspection, approved: approved, all: agents });
   } catch (err) {
-    console.error('SA pending-agents error:', err.message);
+    console.error('Pending agents exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1398,6 +1362,36 @@ app.post('/api/sa/approve-agent', async (req, res) => {
     res.json({ success: true, message: 'Agent approved successfully' });
   } catch (err) {
     console.error('Approve agent exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/reject-agent
+app.post('/api/sa/reject-agent', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const { agent_id, reason } = req.body;
+    if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+
+    const { error: updateErr } = await adminClient.from('profiles')
+      .update({ status: 'rejected' }).eq('id', agent_id).eq('sa_id', session.staff_id);
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    const { data: agent } = await adminClient.from('profiles').select('email, full_name').eq('id', agent_id).single();
+    try {
+      await sendCustomerEmail(
+        agent?.email,
+        'GetHome Agent Application Update',
+        'Hello ' + (agent?.full_name || 'Agent') + ',\n\nYour agent application was not approved at this time' + (reason ? '. Reason: ' + reason : '.') + '\n\nContact us on WhatsApp for more information.\n\nGetHome Team'
+      );
+    } catch(e) { console.error('Reject email failed:', e.message); }
+
+    res.json({ success: true });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -1910,6 +1904,8 @@ app.get('/api/gha/my-agents', verifyStaffToken, async (req, res) => {
       .eq('role', 'agent')
       .order('created_at', { ascending: false });
     if (error) throw error;
+
+    console.log(`[GHA my-agents] gha_id=${ghaId} — found ${(agents || []).length} agent(s)`);
 
     const now = new Date();
     const enriched = (agents || []).map(function(agent) {
