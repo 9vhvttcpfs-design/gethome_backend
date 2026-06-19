@@ -1280,52 +1280,17 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    const statusFilter = ['pending', 'pending_gha_inspection', 'pending_sa_review'];
-
-    // Use the updated RPC which cleanly extracts city names across profiles and agents tables
-    const { data: rpcAgents, error: rpcErr } = await adminClient
+    const { data: agents, error } = await adminClient
       .rpc('get_sa_localized_agents', { sa_uuid: saId });
 
-    let agents = [];
-
-    if (rpcErr || !rpcAgents || rpcAgents.length === 0) {
-      console.log('[pending-agents] RPC empty or failed:', rpcErr?.message || 'no results');
-      // Fallback: direct query for agents explicitly assigned to this SA
-      const { data: fallback, error: fbErr } = await adminClient
-        .from('profiles')
-        .select('*')
-        .eq('role', 'agent')
-        .in('status', statusFilter)
-        .eq('sa_id', saId)
-        .order('created_at', { ascending: false });
-      if (fbErr) throw fbErr;
-      agents = fallback || [];
-    } else {
-      // RPC returns all statuses — filter down to pending workflow statuses only
-      agents = rpcAgents.filter(function(a) { return statusFilter.includes(a.status); });
-      console.log('[pending-agents] RPC ok:', rpcAgents.length, 'total ->', agents.length, 'in pending statuses');
+    if (error || !agents) {
+      console.error('Localized agents fetch error:', error?.message);
+      return res.json([]);
     }
 
-    // Always supplement with agents directly assigned to this SA that the RPC may not surface
-    // (handles edge cases where city fields are blank but sa_id is already stamped)
-    const rpcIds = new Set(agents.map(function(a) { return a.id; }));
-    const { data: assignedAgents } = await adminClient
-      .from('profiles')
-      .select('*')
-      .eq('role', 'agent')
-      .eq('sa_id', saId)
-      .in('status', statusFilter)
-      .order('created_at', { ascending: false });
-    for (const a of (assignedAgents || [])) {
-      if (!rpcIds.has(a.id)) {
-        agents.push(a);
-        rpcIds.add(a.id);
-      }
-    }
+    console.log('Total localized agents found:', agents.length, '| statuses:', agents.map(function(a) { return a.status; }));
 
-    agents.sort(function(a, b) { return new Date(b.created_at) - new Date(a.created_at); });
-
-    // Enrich with GHA details (including phone/whatsapp for the SA's "contact GHA" button)
+    // Enrich all agents with GHA contact details before splitting into groups
     const ghaIds = [...new Set(agents.map(function(a) { return a.gha_id; }).filter(Boolean))];
     let ghaMap = {};
     if (ghaIds.length > 0) {
@@ -1339,19 +1304,33 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
     const enriched = agents.map(function(a) {
       const ghaInfo = a.gha_id ? (ghaMap[a.gha_id] || {}) : {};
       return Object.assign({}, a, {
-        // Safely normalise city and requested_gha_code so the SA board UI always gets clean strings
         city:               (a.city || '').trim() || null,
         requested_gha_code: (a.requested_gha_code || '').trim() || null,
-        gha_code:           a.gha_id ? (ghaInfo.gha_code   || null) : null,
-        gha_name:           a.gha_id ? (ghaInfo.full_name   || null) : null,
-        gha_phone:          a.gha_id ? (ghaInfo.phone       || null) : null,
-        gha_whatsapp:       a.gha_id ? (ghaInfo.whatsapp_number || null) : null,
+        gha_code:           a.gha_id ? (ghaInfo.gha_code          || null) : null,
+        gha_name:           a.gha_id ? (ghaInfo.full_name          || null) : null,
+        gha_phone:          a.gha_id ? (ghaInfo.phone              || null) : null,
+        gha_whatsapp:       a.gha_id ? (ghaInfo.whatsapp_number    || null) : null,
       });
     });
 
-    console.log('[pending-agents] returning', enriched.length, 'agents for SA', saId,
-      '| sample city values:', enriched.slice(0, 3).map(function(a) { return a.city; }));
-    res.json(enriched);
+    // Accept ALL pending-style statuses, not just one exact string
+    const pendingStatuses = ['pending', 'pending_sa_review', 'awaiting_review', null, ''];
+
+    const pendingAgents = enriched.filter(function(a) {
+      return pendingStatuses.includes(a.status) || !a.status;
+    });
+
+    const ghaInspectionAgents = enriched.filter(function(a) {
+      return a.status === 'pending_gha_inspection';
+    });
+
+    console.log('Pending agents:', pendingAgents.length, '| GHA inspection agents:', ghaInspectionAgents.length);
+
+    res.json({
+      pending:                 pendingAgents,
+      pending_gha_inspection:  ghaInspectionAgents,
+      all:                     enriched,
+    });
   } catch (err) {
     console.error('SA pending-agents error:', err.message);
     res.status(500).json({ error: err.message });
