@@ -1990,6 +1990,70 @@ app.post('/api/gha/verify-agent', async (req, res) => {
   }
 });
 
+// GET /api/gha/overview
+app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    const ghaId = req.staffSession.staff_id;
+
+    // Fetch agent IDs first — needed for property queries
+    const { data: agentRows, error: agentErr } = await adminClient
+      .from('profiles')
+      .select('id')
+      .eq('gha_id', ghaId)
+      .eq('role', 'agent');
+
+    if (agentErr) {
+      console.error('GHA overview agent fetch error:', agentErr.message);
+      return res.json({ totalAgents: 0, activeSubscriptions: 0, propertiesSold: 0, activeListings: 0 });
+    }
+
+    const agentIds = (agentRows || []).map(function(a) { return a.id; });
+    const totalAgents = agentIds.length;
+    const now = new Date().toISOString();
+
+    // Run remaining counts in parallel
+    const [subResult, soldResult, activeResult] = await Promise.all([
+      adminClient
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', ghaId)
+        .eq('role', 'agent')
+        .gt('subscription_end', now),
+
+      agentIds.length > 0
+        ? adminClient
+            .from('properties')
+            .select('id', { count: 'exact', head: true })
+            .in('created_by', agentIds)
+            .eq('is_sold', true)
+        : Promise.resolve({ count: 0, error: null }),
+
+      agentIds.length > 0
+        ? adminClient
+            .from('properties')
+            .select('id', { count: 'exact', head: true })
+            .in('created_by', agentIds)
+            .eq('is_sold', false)
+        : Promise.resolve({ count: 0, error: null }),
+    ]);
+
+    if (subResult.error) console.error('GHA overview sub count error:', subResult.error.message);
+    if (soldResult.error) console.error('GHA overview sold count error:', soldResult.error.message);
+    if (activeResult.error) console.error('GHA overview active count error:', activeResult.error.message);
+
+    res.json({
+      totalAgents,
+      activeSubscriptions: subResult.count || 0,
+      propertiesSold: soldResult.count || 0,
+      activeListings: activeResult.count || 0,
+    });
+  } catch (err) {
+    console.error('GHA overview error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/gha/my-agents
 app.get('/api/gha/my-agents', verifyStaffToken, async (req, res) => {
   try {
