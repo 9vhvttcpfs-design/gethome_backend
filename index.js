@@ -1275,25 +1275,40 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
     const locationWords = saLocation.split(/[\s,]+/).filter(w => w.length > 2);
     console.log('[pending-agents] saId:', saId, '| saLocation:', JSON.stringify(saLocation), '| locationWords:', locationWords);
 
-    // Build query: agents assigned to this SA OR in the same city (unassigned/pending)
-    let query = serviceClient
+    const statusFilter = ['pending', 'pending_gha_inspection', 'pending_sa_review'];
+
+    // Query 1: agents explicitly assigned to this SA
+    const { data: assignedAgents, error: assignedErr } = await adminClient
       .from('profiles')
       .select('*')
       .eq('role', 'agent')
-      .in('status', ['pending', 'pending_gha_inspection', 'pending_sa_review']);
+      .eq('sa_id', saId)
+      .in('status', statusFilter)
+      .order('created_at', { ascending: false });
+    if (assignedErr) throw assignedErr;
 
+    // Query 2: pending agents in the same city (by city column and office_address)
+    // Uses chained .ilike() — Supabase handles % wildcards correctly here unlike in .or() strings
+    let cityAgents = [];
     if (locationWords.length > 0) {
-      const cityConditions = locationWords.map(w => `city.ilike.%${w}%,office_address.ilike.%${w}%`).join(',');
-      const orFilter = `sa_id.eq.${saId},${cityConditions}`;
-      console.log('[pending-agents] OR filter:', orFilter);
-      query = query.or(orFilter);
-    } else {
-      query = query.eq('sa_id', saId);
+      for (const word of locationWords) {
+        const [{ data: byCity }, { data: byAddr }] = await Promise.all([
+          adminClient.from('profiles').select('*').eq('role', 'agent').in('status', statusFilter).ilike('city', `%${word}%`),
+          adminClient.from('profiles').select('*').eq('role', 'agent').in('status', statusFilter).ilike('office_address', `%${word}%`),
+        ]);
+        cityAgents = cityAgents.concat(byCity || []).concat(byAddr || []);
+      }
     }
 
-    const { data: agents, error } = await query.order('created_at', { ascending: false });
-    if (error) throw error;
-    console.log('[pending-agents] found', agents?.length ?? 0, 'agents. Sample city/address:', (agents || []).slice(0, 3).map(a => ({ city: a.city, addr: a.office_address, sa_id: a.sa_id })));
+    // Merge and deduplicate — assigned agents take precedence for ordering
+    const seen = new Set();
+    const agents = [...(assignedAgents || []), ...cityAgents].filter(a => {
+      if (seen.has(a.id)) return false;
+      seen.add(a.id);
+      return true;
+    }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    console.log('[pending-agents] found', agents.length, 'agents (assigned:', (assignedAgents || []).length, '| city-matched:', cityAgents.length, '). Sample:', agents.slice(0, 3).map(a => ({ city: a.city, addr: a.office_address, sa_id: a.sa_id })));
 
     // Enrich agents that have a gha_id with GHA details
     const ghaIds = [...new Set((agents || []).map(a => a.gha_id).filter(Boolean))];
@@ -3175,6 +3190,73 @@ app.post('/api/admin/assign-gha-to-sa', async (req, res) => {
     res.json({ success: true, message: 'GHA assigned to SA successfully' });
   } catch (err) {
     console.error('Admin assign-gha-to-sa error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/assign-agent-to-gha
+app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { agent_id, gha_id } = req.body;
+    if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
+
+    // Fetch GHA (need gha_code and sa_id for the update)
+    const { data: gha } = await serviceClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, sa_id')
+      .eq('id', gha_id)
+      .single();
+    if (!gha) return res.status(404).json({ error: 'GHA not found' });
+
+    // Fetch agent
+    const { data: agent } = await serviceClient
+      .from('profiles')
+      .select('id, full_name, email, role')
+      .eq('id', agent_id)
+      .single();
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    if (agent.role !== 'agent') return res.status(400).json({ error: 'Profile is not an agent' });
+
+    // Fetch SA for the notification email
+    let saRecord = null;
+    if (gha.sa_id) {
+      const { data: sa } = await serviceClient
+        .from('service_agents')
+        .select('id, sa_code, full_name')
+        .eq('id', gha.sa_id)
+        .single();
+      saRecord = sa || null;
+    }
+
+    // Assign agent to GHA (and cascade sa_id)
+    const { error: updateErr } = await serviceClient
+      .from('profiles')
+      .update({ gha_id: gha.id, sa_id: gha.sa_id || null, gha_code: gha.gha_code })
+      .eq('id', agent_id);
+    if (updateErr) throw updateErr;
+
+    // Notify agent by email
+    if (agent.email) {
+      setImmediate(async function() {
+        try {
+          await sendCustomerEmail(
+            agent.email,
+            'You have been assigned to a GetHome team',
+            `Hello ${agent.full_name || 'Agent'},\n\nYou have been assigned to GHA ${gha.gha_code} - ${gha.full_name}${saRecord ? ' under SA ' + saRecord.sa_code : ''}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
+          );
+        } catch (e) { console.error('Admin assign-agent email error:', e.message); }
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Agent assigned to ${gha.gha_code} successfully`,
+    });
+  } catch (err) {
+    console.error('Admin assign-agent-to-gha error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
