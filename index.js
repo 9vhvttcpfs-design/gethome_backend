@@ -1265,13 +1265,30 @@ app.get('/api/sa/pending-agents', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    const { data: agents, error } = await serviceClient
+    // Fetch SA's location to also surface pending agents in the same city
+    const { data: saRecord } = await adminClient
+      .from('service_agents')
+      .select('location')
+      .eq('id', saId)
+      .single();
+    const saLocation = (saRecord?.location || '').trim();
+    const locationWords = saLocation.split(/[\s,]+/).filter(w => w.length > 2);
+
+    // Build query: agents assigned to this SA OR in the same city (unassigned/pending)
+    let query = serviceClient
       .from('profiles')
       .select('*')
-      .eq('sa_id', saId)
       .eq('role', 'agent')
-      .in('status', ['pending', 'pending_gha_inspection'])
-      .order('created_at', { ascending: false });
+      .in('status', ['pending', 'pending_gha_inspection']);
+
+    if (locationWords.length > 0) {
+      const cityConditions = locationWords.map(w => `city.ilike.%${w}%,office_address.ilike.%${w}%`).join(',');
+      query = query.or(`sa_id.eq.${saId},${cityConditions}`);
+    } else {
+      query = query.eq('sa_id', saId);
+    }
+
+    const { data: agents, error } = await query.order('created_at', { ascending: false });
     if (error) throw error;
 
     // Enrich agents that have a gha_id with GHA details
