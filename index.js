@@ -4065,7 +4065,7 @@ app.post('/api/auth/agent-register', async (req, res) => {
     return res.status(400).json({ error: 'Disposable email addresses are not allowed. Please use a real email.' });
   }
   try {
-    const { data, error } = await supabase.auth.signUp({
+    const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
       email,
       password,
       options: {
@@ -4076,44 +4076,62 @@ app.post('/api/auth/agent-register', async (req, res) => {
         },
       },
     });
-    // Handle Supabase email errors - user may still be created
-    if (error) {
-      const isEmailError = error.message.toLowerCase().includes('sending') ||
-                           error.message.toLowerCase().includes('email') ||
-                           error.message.toLowerCase().includes('confirmation');
+
+    if (signUpError) {
+      // Supabase sometimes returns an email-sending error but still creates the auth user.
+      // Treat those as non-blocking; any other error is a real signup failure.
+      const isEmailError = signUpError.message.toLowerCase().includes('sending') ||
+                           signUpError.message.toLowerCase().includes('email') ||
+                           signUpError.message.toLowerCase().includes('confirmation');
       if (!isEmailError) {
-        return res.status(400).json({ error: error.message });
+        console.error('Auth signup failed:', signUpError.message);
+        return res.status(400).json({ error: signUpError.message });
       }
-      console.error('Supabase email error for agent (non-blocking):', error.message);
+      console.error('Supabase email error for agent (non-blocking):', signUpError.message);
     }
-    // Set role=agent, status=pending, and store email in profiles table
-    const agentUserId = data?.user?.id || null;
-    if (agentUserId) {
-      try {
-        const { error: profileErr } = await adminClient
-          .from('profiles')
-          .upsert([{
-            id: agentUserId,
-            role: 'agent',
-            status: 'pending',
-            email: email,
-            full_name: fullName || null,
-            phone: phone || null,
-            office_address: address && city ? address + ', ' + city : (address || null),
-            city: city || null,
-            requested_gha_code: requested_gha_code ? requested_gha_code.toUpperCase().trim() : null,
-            experience: experience || null,
-            specialty: specialty || null,
-            nin_number: nin || null,
-            cac_number: cac || null,
-            about: about || null,
-          }], { onConflict: 'id' });
-        if (profileErr) console.error('Agent profile error:', profileErr.message);
-        else console.log('Agent profile created: email:', email, '| city:', city || null, '| requested_gha_code:', requested_gha_code ? requested_gha_code.toUpperCase().trim() : null);
-      } catch (profileErr) {
-        console.error('Agent profile upsert failed:', profileErr.message);
-      }
+
+    if (!signUpData || !signUpData.user || !signUpData.user.id) {
+      console.error('Signup succeeded but no user object returned');
+      return res.status(500).json({ error: 'Account created but user ID missing. Please contact support.' });
     }
+
+    const newUserId = signUpData.user.id;
+    console.log('Auth user created successfully with id:', newUserId);
+
+    // Insert into profiles using the EXACT id returned from signUp.
+    // adminClient (service role) bypasses RLS so this works before the user is authenticated.
+    const { data: agentInsert, error: agentInsertError } = await adminClient
+      .from('profiles')
+      .upsert([{
+        id: newUserId,
+        role: 'agent',
+        status: 'pending',
+        email: email,
+        full_name: fullName || null,
+        phone: phone || null,
+        office_address: address && city ? address + ', ' + city : (address || null),
+        city: city || null,
+        requested_gha_code: requested_gha_code ? requested_gha_code.toUpperCase().trim() : null,
+        experience: experience || null,
+        specialty: specialty || null,
+        nin_number: nin || null,
+        cac_number: cac || null,
+        about: about || null,
+      }], { onConflict: 'id' })
+      .select();
+
+    if (agentInsertError) {
+      console.error('Agent profile insert failed:', agentInsertError.message, agentInsertError.code, agentInsertError.details);
+      return res.status(500).json({ error: 'Account created but agent profile failed: ' + agentInsertError.message });
+    }
+
+    if (!agentInsert || agentInsert.length === 0) {
+      console.error('Profile upsert returned no rows for userId:', newUserId);
+      return res.status(500).json({ error: 'Account created but profile write unconfirmed. Please contact support.' });
+    }
+
+    console.log('Agent profile created successfully:', JSON.stringify(agentInsert[0]));
+
     // Send welcome email to agent with WhatsApp link for account approval
     const agentWhatsAppMsg = encodeURIComponent(
       `Hello GetHome, I just registered as an agent with this email: ${email}. Please activate my agent account.`
@@ -4156,13 +4174,14 @@ https://trygethome.online`
         console.error('Admin notification error:', emailErr.message);
       }
     });
-    const userId    = data?.user?.id    || null;
-    const userEmail  = data?.user?.email  || email;
-    const hasSession = !!data?.session;
+
     return res.status(201).json({
-      user: userId ? { id: userId, email: userEmail, role: 'agent' } : null,
-      token: data?.session?.access_token || null,
-      confirmationRequired: !hasSession,
+      success: true,
+      message: 'Registration successful',
+      user: { id: newUserId, email: email, role: 'agent' },
+      token: signUpData?.session?.access_token || null,
+      confirmationRequired: !signUpData?.session,
+      agent: agentInsert[0],
     });
   } catch (err) {
     console.error('Agent register error:', err.message);
