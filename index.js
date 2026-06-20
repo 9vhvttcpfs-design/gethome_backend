@@ -1739,6 +1739,15 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     if (!gha) return res.status(404).json({ error: 'GHA not found' });
     if (gha.sa_id !== session.staff_id) return res.status(403).json({ error: 'This GHA does not belong to your team' });
 
+    if (typeof agent_id !== 'string' || agent_id.length < 10) {
+      console.error('INVALID agent_id received:', agent_id, typeof agent_id);
+      return res.status(400).json({ error: 'Invalid agent_id format received: ' + JSON.stringify(agent_id) });
+    }
+    if (typeof gha_id !== 'string' || gha_id.length < 10) {
+      console.error('INVALID gha_id received:', gha_id, typeof gha_id);
+      return res.status(400).json({ error: 'Invalid gha_id format received: ' + JSON.stringify(gha_id) });
+    }
+
     const { data: agent } = await adminClient.from('profiles')
       .select('id, gha_id, sa_id, gha_code').eq('id', agent_id).single();
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
@@ -1763,14 +1772,34 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     const { data: sa } = await adminClient.from('service_agents')
       .select('id, sa_code, full_name').eq('id', session.staff_id).single();
 
-    const { error: updateErr } = await adminClient.from('profiles')
-      .update({ gha_id: gha_id, sa_id: session.staff_id, gha_code: gha.gha_code })
-      .eq('id', agent_id);
-    if (updateErr) return res.status(500).json({ error: updateErr.message });
+    console.log('BEFORE UPDATE - agent_id:', agent_id, '| gha_id:', gha_id, '| typeof agent_id:', typeof agent_id, '| typeof gha_id:', typeof gha_id);
 
-    const { data: agentProfile } = await adminClient.from('profiles')
-      .select('email, full_name').eq('id', agent_id).single();
+    const { data: updated, error: updateErr } = await adminClient
+      .from('profiles')
+      .update({
+        gha_id: gha_id,
+        sa_id: gha.sa_id,
+        gha_code: gha.gha_code,
+        status: 'pending_gha_inspection',
+      })
+      .eq('id', agent_id)
+      .select();
 
+    console.log('UPDATE RESULT - error:', JSON.stringify(updateErr), '| rows affected:', updated ? updated.length : 'null', '| data:', JSON.stringify(updated));
+
+    if (updateErr) {
+      console.error('DATABASE UPDATE FAILED:', updateErr.message, updateErr.code, updateErr.details, updateErr.hint);
+      return res.status(500).json({ error: 'Database error: ' + updateErr.message });
+    }
+
+    if (!updated || updated.length === 0) {
+      console.error('CRITICAL: Update query succeeded but affected ZERO rows. agent_id may not exist or may be wrong type:', agent_id);
+      return res.status(404).json({ error: 'No profile was updated. The agent_id may be invalid: ' + agent_id });
+    }
+
+    console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
+
+    const agentProfile = updated[0];
     try {
       await sendCustomerEmail(
         agentProfile?.email,
@@ -1790,7 +1819,7 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     }]);
     if (notifErr) console.error('GHA agent notification failed:', notifErr.message);
 
-    res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code + ' successfully' });
+    res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code + ' successfully', updated_agent: updated[0] });
   } catch (err) {
     console.error('Assign agent exception:', err.message);
     res.status(500).json({ error: err.message });
@@ -3395,6 +3424,17 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
       return res.status(404).json({ error: 'GHA not found with id: ' + gha_id });
     }
 
+    if (typeof agent_id !== 'string' || agent_id.length < 10) {
+      console.error('INVALID agent_id received:', agent_id, typeof agent_id);
+      return res.status(400).json({ error: 'Invalid agent_id format received: ' + JSON.stringify(agent_id) });
+    }
+    if (typeof gha_id !== 'string' || gha_id.length < 10) {
+      console.error('INVALID gha_id received:', gha_id, typeof gha_id);
+      return res.status(400).json({ error: 'Invalid gha_id format received: ' + JSON.stringify(gha_id) });
+    }
+
+    console.log('BEFORE UPDATE - agent_id:', agent_id, '| gha_id:', gha_id, '| typeof agent_id:', typeof agent_id, '| typeof gha_id:', typeof gha_id);
+
     const { data: updated, error: updateErr } = await adminClient
       .from('profiles')
       .update({
@@ -3406,17 +3446,19 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
       .eq('id', agent_id)
       .select();
 
-    if (updateErr) {
-      console.error('PROFILE UPDATE FAILED:', updateErr.message, updateErr.code, updateErr.details);
-      return res.status(500).json({ error: 'Database update failed: ' + updateErr.message });
-    }
+    console.log('UPDATE RESULT - error:', JSON.stringify(updateErr), '| rows affected:', updated ? updated.length : 'null', '| data:', JSON.stringify(updated));
 
-    console.log('UPDATE SUCCESS - rows affected:', updated?.length, '| updated row:', JSON.stringify(updated?.[0]));
+    if (updateErr) {
+      console.error('DATABASE UPDATE FAILED:', updateErr.message, updateErr.code, updateErr.details, updateErr.hint);
+      return res.status(500).json({ error: 'Database error: ' + updateErr.message });
+    }
 
     if (!updated || updated.length === 0) {
-      console.error('WARNING: Update query ran but affected 0 rows. agent_id may not exist:', agent_id);
-      return res.status(404).json({ error: 'No profile found with id: ' + agent_id });
+      console.error('CRITICAL: Update query succeeded but affected ZERO rows. agent_id may not exist or may be wrong type:', agent_id);
+      return res.status(404).json({ error: 'No profile was updated. The agent_id may be invalid: ' + agent_id });
     }
+
+    console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
 
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code, updated_agent: updated[0] });
   } catch (err) {
@@ -4790,32 +4832,62 @@ const adminForceAssignHandler = async (req, res) => {
     }
 
     // Accept canonical names or legacy aliases from the /assign-agent-gha route
-    const target_agent_id = req.body.target_agent_id || req.body.agent_id;
-    const target_gha_id   = req.body.target_gha_id   || req.body.gha_id;
-    if (!target_agent_id || !target_gha_id) {
+    const agent_id = req.body.target_agent_id || req.body.agent_id;
+    const gha_id   = req.body.target_gha_id   || req.body.gha_id;
+    if (!agent_id || !gha_id) {
       return res.status(400).json({ error: 'target_agent_id and target_gha_id are required' });
     }
 
-    console.log('Force-assign request - agent:', target_agent_id, 'gha:', target_gha_id);
-
-    // Use the RPC function for atomic assignment
-    const { error: rpcError } = await adminClient.rpc('admin_force_assign_agent_gha', {
-      target_agent_id: target_agent_id,
-      target_gha_id: target_gha_id,
-    });
-
-    if (rpcError) {
-      console.error('RPC assignment failed:', rpcError.message);
-      return res.status(500).json({ error: rpcError.message });
+    const { data: gha, error: ghaErr } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, sa_id, full_name')
+      .eq('id', gha_id)
+      .single();
+    if (ghaErr || !gha) {
+      console.error('Force-assign GHA lookup failed:', ghaErr?.message);
+      return res.status(404).json({ error: 'GHA not found with id: ' + gha_id });
     }
 
-    console.log('Agent successfully assigned via RPC');
+    if (typeof agent_id !== 'string' || agent_id.length < 10) {
+      console.error('INVALID agent_id received:', agent_id, typeof agent_id);
+      return res.status(400).json({ error: 'Invalid agent_id format received: ' + JSON.stringify(agent_id) });
+    }
+    if (typeof gha_id !== 'string' || gha_id.length < 10) {
+      console.error('INVALID gha_id received:', gha_id, typeof gha_id);
+      return res.status(400).json({ error: 'Invalid gha_id format received: ' + JSON.stringify(gha_id) });
+    }
 
-    // Safe notification insert - awaited properly, never chained .catch
+    console.log('BEFORE UPDATE - agent_id:', agent_id, '| gha_id:', gha_id, '| typeof agent_id:', typeof agent_id, '| typeof gha_id:', typeof gha_id);
+
+    const { data: updated, error: updateErr } = await adminClient
+      .from('profiles')
+      .update({
+        gha_id: gha_id,
+        sa_id: gha.sa_id,
+        gha_code: gha.gha_code,
+        status: 'pending_gha_inspection',
+      })
+      .eq('id', agent_id)
+      .select();
+
+    console.log('UPDATE RESULT - error:', JSON.stringify(updateErr), '| rows affected:', updated ? updated.length : 'null', '| data:', JSON.stringify(updated));
+
+    if (updateErr) {
+      console.error('DATABASE UPDATE FAILED:', updateErr.message, updateErr.code, updateErr.details, updateErr.hint);
+      return res.status(500).json({ error: 'Database error: ' + updateErr.message });
+    }
+
+    if (!updated || updated.length === 0) {
+      console.error('CRITICAL: Update query succeeded but affected ZERO rows. agent_id may not exist or may be wrong type:', agent_id);
+      return res.status(404).json({ error: 'No profile was updated. The agent_id may be invalid: ' + agent_id });
+    }
+
+    console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
+
     const { error: notifError } = await adminClient
       .from('notifications')
       .insert([{
-        recipient_id: target_gha_id,
+        recipient_id: gha_id,
         recipient_type: 'GHA',
         type: 'agent_verification',
         title: 'New Agent Assigned',
@@ -4830,6 +4902,7 @@ const adminForceAssignHandler = async (req, res) => {
     res.status(200).json({
       success: true,
       message: 'Agent successfully linked to GHA.',
+      updated_agent: updated[0],
     });
   } catch (err) {
     console.error('Admin force-assign-agent exception:', err.message);
