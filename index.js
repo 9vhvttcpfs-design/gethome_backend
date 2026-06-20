@@ -1994,13 +1994,15 @@ app.post('/api/gha/verify-agent', async (req, res) => {
 app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
   try {
     if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
-    const ghaId = req.staffSession.staff_id;
+    // staff_code holds the 'GHA0001' string; profiles.gha_code is how agents are linked
+    const ghaCode = req.staffSession.staff_code;
+    console.log('GHA overview - gha_code:', ghaCode);
 
     // Fetch agent IDs first — needed for property queries
     const { data: agentRows, error: agentErr } = await adminClient
       .from('profiles')
       .select('id')
-      .eq('gha_id', ghaId)
+      .eq('gha_code', ghaCode)
       .eq('role', 'agent');
 
     if (agentErr) {
@@ -2010,6 +2012,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
 
     const agentIds = (agentRows || []).map(function(a) { return a.id; });
     const totalAgents = agentIds.length;
+    console.log('GHA overview - found', totalAgents, 'agents for', ghaCode);
     const now = new Date().toISOString();
 
     // Run remaining counts in parallel
@@ -2017,7 +2020,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
       adminClient
         .from('profiles')
         .select('id', { count: 'exact', head: true })
-        .eq('gha_id', ghaId)
+        .eq('gha_code', ghaCode)
         .eq('role', 'agent')
         .gt('subscription_end', now),
 
@@ -2058,14 +2061,16 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
 app.get('/api/gha/my-agents', verifyStaffToken, async (req, res) => {
   try {
     if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
-    const ghaId = req.staffSession.staff_id;
+    // staff_code holds 'GHA0001'; profiles.gha_code is how agents are linked to this GHA
+    const ghaCode = req.staffSession.staff_code;
 
-    console.log('GHA fetching agents - my staff_id (gha_agents.id):', ghaId);
+    console.log('GHA fetching agents - gha_code:', ghaCode);
     const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('*')
-      .eq('gha_id', ghaId)
-      .eq('role', 'agent');
+      .select('id, full_name, email, phone, status, verification_level, gha_code, gha_id, sa_id, office_address, city, experience, specialty, nin_number, cac_number, about, gha_verified, subscription_tier, subscription_end, created_at')
+      .eq('gha_code', ghaCode)
+      .eq('role', 'agent')
+      .order('created_at', { ascending: false });
 
     console.log('Query result - found agents:', (agents || []).length, '| error:', error?.message);
     if (agents && agents.length > 0) {
