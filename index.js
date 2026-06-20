@@ -1526,15 +1526,20 @@ app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
       .eq('id', agent_id);
     if (updateErr) throw updateErr;
 
-    // Insert notification for GHA
-    await serviceClient.from('notifications').insert({
-      recipient_type: 'GHA',
-      recipient_id: gha_id,
-      type: 'inspection_request',
-      title: 'New Agent to Verify',
-      message: `Please verify agent ${agent.full_name || agent_id} registration details and confirm to SA.`,
-      is_read: false,
-    });
+    // Notification is best-effort only - must never block the primary action
+    try {
+      const { error: notifErr } = await serviceClient.from('notifications').insert({
+        recipient_type: 'GHA',
+        recipient_id: gha_id,
+        type: 'inspection_request',
+        title: 'New Agent to Verify',
+        message: `Please verify agent ${agent.full_name || agent_id} registration details and confirm to SA.`,
+        is_read: false,
+      });
+      if (notifErr) console.error('Non-blocking notification error (action still succeeded):', notifErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     // Email GHA
     if (gha.email) {
@@ -1809,15 +1814,19 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     } catch(emailErr) { console.error('Assignment email failed:', emailErr.message); }
 
     const agentName = agentProfile?.full_name || agentProfile?.email || 'New Agent';
-    const { error: notifErr } = await adminClient.from('notifications').insert([{
-      recipient_type: 'GHA',
-      recipient_id: gha_id,
-      type: 'agent_verification',
-      title: 'Confirm Agent Information',
-      message: 'SA has assigned agent ' + agentName + ' to your team. Please review their registration details and confirm their information so the SA can approve them.',
-      is_read: false,
-    }]);
-    if (notifErr) console.error('GHA agent notification failed:', notifErr.message);
+    try {
+      const { error: notifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: gha_id,
+        type: 'agent_verification',
+        title: 'Confirm Agent Information',
+        message: 'SA has assigned agent ' + agentName + ' to your team. Please review their registration details and confirm their information so the SA can approve them.',
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Non-blocking notification error (action still succeeded):', notifErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code + ' successfully', updated_agent: updated[0] });
   } catch (err) {
@@ -1994,15 +2003,19 @@ app.post('/api/gha/verify-agent', async (req, res) => {
     const { data: saData } = await adminClient.from('service_agents')
       .select('id, email, full_name').eq('id', agent.sa_id).single();
 
-    const { error: notifErr } = await adminClient.from('notifications').insert([{
-      recipient_type: 'SA',
-      recipient_id: agent.sa_id,
-      type: 'agent_verified',
-      title: 'GHA Verified Agent',
-      message: 'Agent ' + (agent.full_name || agent.email) + ' has been verified by GHA. You can now approve them.',
-      is_read: false,
-    }]);
-    if (notifErr) console.error('SA notification failed:', notifErr.message);
+    try {
+      const { error: notifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'SA',
+        recipient_id: agent.sa_id,
+        type: 'agent_verified',
+        title: 'GHA Verified Agent',
+        message: 'Agent ' + (agent.full_name || agent.email) + ' has been verified by GHA. You can now approve them.',
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Non-blocking notification error (action still succeeded):', notifErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     try {
       await sendCustomerEmail(
@@ -3159,19 +3172,23 @@ app.post('/api/sa/create-inspection', async (req, res) => {
       return res.status(500).json({ error: insertErr.message });
     }
 
-    const { error: notifErr } = await adminClient.from('notifications').insert([{
-      recipient_type: 'GHA',
-      recipient_id: gha_id,
-      type: 'inspection_request',
-      title: 'New Inspection Assigned',
-      message: 'Inspect property for customer ' + customer_name + ' at ' + (property_address || 'address TBD') + (inspection_date ? ' on ' + new Date(inspection_date).toLocaleDateString() : ''),
-      property_id: property_id ? parseInt(property_id) : null,
-      inspection_id: inspection.id,
-      customer_email: customer_email,
-      customer_phone: customer_phone || '',
-      is_read: false,
-    }]);
-    if (notifErr) console.error('Notification insert failed:', notifErr.message);
+    try {
+      const { error: notifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: gha_id,
+        type: 'inspection_request',
+        title: 'New Inspection Assigned',
+        message: 'Inspect property for customer ' + customer_name + ' at ' + (property_address || 'address TBD') + (inspection_date ? ' on ' + new Date(inspection_date).toLocaleDateString() : ''),
+        property_id: property_id ? parseInt(property_id) : null,
+        inspection_id: inspection.id,
+        customer_email: customer_email,
+        customer_phone: customer_phone || '',
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Non-blocking notification error (action still succeeded):', notifErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     try {
       await sendCustomerEmail(
@@ -3253,16 +3270,20 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
       .eq('id', inspection_id);
     if (error) throw error;
 
-    const { error: notifErr } = await adminClient.from('notifications').insert([{
-      recipient_type: 'GHA',
-      recipient_id: inspection.gha_id,
-      type: 'inspection_passed',
-      title: 'Inspection Confirmed by SA',
-      message: 'Your inspection for customer ' + inspection.customer_name + ' has been reviewed and confirmed by your SA. Great work!',
-      inspection_id: inspection_id,
-      is_read: false,
-    }]);
-    if (notifErr) console.error('GHA confirmed notification failed:', notifErr.message);
+    try {
+      const { error: notifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: inspection.gha_id,
+        type: 'inspection_passed',
+        title: 'Inspection Confirmed by SA',
+        message: 'Your inspection for customer ' + inspection.customer_name + ' has been reviewed and confirmed by your SA. Great work!',
+        inspection_id: inspection_id,
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Non-blocking notification error (action still succeeded):', notifErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -3294,30 +3315,38 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
     if (error) throw error;
 
     // Notify SA that inspection is done
-    const { error: notifSaErr } = await adminClient.from('notifications').insert([{
-      recipient_type: 'SA',
-      recipient_id: inspection.assigned_by_sa,
-      type: 'inspection_done',
-      title: 'Inspection Completed',
-      message: 'GHA has completed inspection for customer ' + inspection.customer_name + ' at ' + (inspection.property_address || 'property address') + '. Notes: ' + notes.substring(0, 100),
-      inspection_id: inspection_id,
-      customer_email: inspection.customer_email,
-      customer_phone: inspection.customer_phone || '',
-      is_read: false,
-    }]);
-    if (notifSaErr) console.error('SA notification failed:', notifSaErr.message);
+    try {
+      const { error: notifSaErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'SA',
+        recipient_id: inspection.assigned_by_sa,
+        type: 'inspection_done',
+        title: 'Inspection Completed',
+        message: 'GHA has completed inspection for customer ' + inspection.customer_name + ' at ' + (inspection.property_address || 'property address') + '. Notes: ' + notes.substring(0, 100),
+        inspection_id: inspection_id,
+        customer_email: inspection.customer_email,
+        customer_phone: inspection.customer_phone || '',
+        is_read: false,
+      }]);
+      if (notifSaErr) console.error('Non-blocking notification error (action still succeeded):', notifSaErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     // Also notify the GHA themselves as confirmation
-    const { error: notifGhaErr } = await adminClient.from('notifications').insert([{
-      recipient_type: 'GHA',
-      recipient_id: req.staffSession.staff_id,
-      type: 'inspection_passed',
-      title: 'Inspection Submitted Successfully',
-      message: 'Your inspection report for customer ' + inspection.customer_name + ' has been submitted and is awaiting SA confirmation.',
-      inspection_id: inspection_id,
-      is_read: false,
-    }]);
-    if (notifGhaErr) console.error('GHA confirmation notification failed:', notifGhaErr.message);
+    try {
+      const { error: notifGhaErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: req.staffSession.staff_id,
+        type: 'inspection_passed',
+        title: 'Inspection Submitted Successfully',
+        message: 'Your inspection report for customer ' + inspection.customer_name + ' has been submitted and is awaiting SA confirmation.',
+        inspection_id: inspection_id,
+        is_read: false,
+      }]);
+      if (notifGhaErr) console.error('Non-blocking notification error (action still succeeded):', notifGhaErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     if (inspection.assigned_by_sa) {
       const [{ data: sa }, { data: ghaInfo }] = await Promise.all([
@@ -3613,14 +3642,19 @@ app.post('/api/admin/reassign-inspection', async (req, res) => {
     if (updateErr) throw updateErr;
     if (!inspection) return res.status(404).json({ error: 'Inspection not found' });
 
-    await serviceClient.from('notifications').insert([{
-      recipient_type: 'GHA',
-      recipient_id: new_gha_id,
-      type: 'inspection_request',
-      title: 'Inspection Reassigned to You',
-      message: `An inspection for customer "${inspection.customer_name || 'N/A'}" at ${inspection.property_address || 'N/A'} has been reassigned to you. Inspection date: ${inspection.inspection_date || 'TBD'}.`,
-      is_read: false,
-    }]);
+    try {
+      const { error: notifErr } = await serviceClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: new_gha_id,
+        type: 'inspection_request',
+        title: 'Inspection Reassigned to You',
+        message: `An inspection for customer "${inspection.customer_name || 'N/A'}" at ${inspection.property_address || 'N/A'} has been reassigned to you. Inspection date: ${inspection.inspection_date || 'TBD'}.`,
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Non-blocking notification error (action still succeeded):', notifErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     if (ghaCheck.email) {
       setImmediate(async function() {
@@ -3817,14 +3851,19 @@ app.post('/api/sa/assign-inspection', verifyStaffToken, async (req, res) => {
       await serviceClient.from('notifications').update({ is_read: true }).eq('id', notification_id);
     }
 
-    await serviceClient.from('notifications').insert([{
-      recipient_type: 'GHA',
-      recipient_id: gha_id,
-      type: 'inspection_request',
-      title: 'New Inspection Assigned',
-      message: `You have been assigned a new inspection for customer "${customer_name || 'N/A'}". Inspection date: ${inspection_date || 'TBD'}.`,
-      is_read: false,
-    }]);
+    try {
+      const { error: notifErr } = await serviceClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: gha_id,
+        type: 'inspection_request',
+        title: 'New Inspection Assigned',
+        message: `You have been assigned a new inspection for customer "${customer_name || 'N/A'}". Inspection date: ${inspection_date || 'TBD'}.`,
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Non-blocking notification error (action still succeeded):', notifErr.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
+    }
 
     if (ghaCheck.email) {
       setImmediate(async function() {
@@ -4131,6 +4170,34 @@ app.post('/api/auth/agent-register', async (req, res) => {
     }
 
     console.log('Agent profile created successfully:', JSON.stringify(agentInsert[0]));
+
+    // Notification is best-effort only - must never block the registration response
+    try {
+      let ghaRecordId = null;
+      if (requested_gha_code) {
+        const { data: ghaRecord } = await adminClient
+          .from('gha_agents')
+          .select('id')
+          .eq('gha_code', requested_gha_code.toUpperCase().trim())
+          .single();
+        ghaRecordId = ghaRecord?.id || null;
+      }
+      const { error: notifError } = await adminClient
+        .from('notifications')
+        .insert([{
+          recipient_type: 'GHA',
+          recipient_id: ghaRecordId,
+          type: 'agent_verification',
+          title: 'New Agent Registration',
+          message: 'A new agent has registered and requested GHA: ' + (requested_gha_code || 'none specified'),
+          is_read: false,
+        }]);
+      if (notifError) {
+        console.error('Non-blocking notification error (registration still succeeded):', notifError.message);
+      }
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (registration still succeeded):', notifCatchErr.message);
+    }
 
     // Send welcome email to agent with WhatsApp link for account approval
     const agentWhatsAppMsg = encodeURIComponent(
@@ -4903,19 +4970,20 @@ const adminForceAssignHandler = async (req, res) => {
 
     console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
 
-    const { error: notifError } = await adminClient
-      .from('notifications')
-      .insert([{
-        recipient_id: gha_id,
-        recipient_type: 'GHA',
-        type: 'agent_verification',
-        title: 'New Agent Assigned',
-        message: 'An administrator has assigned a new agent to your team for verification.',
-        is_read: false,
-      }]);
-
-    if (notifError) {
-      console.error('Non-blocking notification error:', notifError.message);
+    try {
+      const { error: notifError } = await adminClient
+        .from('notifications')
+        .insert([{
+          recipient_id: gha_id,
+          recipient_type: 'GHA',
+          type: 'agent_verification',
+          title: 'New Agent Assigned',
+          message: 'An administrator has assigned a new agent to your team for verification.',
+          is_read: false,
+        }]);
+      if (notifError) console.error('Non-blocking notification error (action still succeeded):', notifError.message);
+    } catch (notifCatchErr) {
+      console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
     }
 
     res.status(200).json({
