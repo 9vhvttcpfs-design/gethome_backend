@@ -379,7 +379,7 @@ app.get('/api/admin/agents', async (req, res) => {
     // Fetch ALL agents - use adminClient to bypass RLS
     const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, kyc_documents, bank_name, account_number, account_name')
+      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, kyc_documents, bank_name, account_number, account_name, subscription_tier, subscription_start, subscription_end, subscription_status')
       .eq('role', 'agent')
       .order('created_at', { ascending: false });
     if (error) {
@@ -1346,7 +1346,7 @@ app.get('/api/sa/pending-agents', async (req, res) => {
     // PART 1: Unclaimed agents (sa_id IS NULL) matching this SA's city - these are NEW pending agents
     const { data: unclaimedAgents } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, created_at')
       .eq('role', 'agent')
       .is('sa_id', null)
       .order('created_at', { ascending: false });
@@ -1365,7 +1365,7 @@ app.get('/api/sa/pending-agents', async (req, res) => {
     // PART 2: Agents ALREADY assigned to this SA (after SA claimed them) - these are in later stages
     const { data: claimedAgents } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, created_at')
       .eq('role', 'agent')
       .eq('sa_id', session.staff_id)
       .order('created_at', { ascending: false });
@@ -2020,6 +2020,44 @@ app.post('/api/gha/verify-agent', async (req, res) => {
     res.json({ success: true, message: 'Agent verified successfully. SA has been notified to approve.' });
   } catch (err) {
     console.error('Verify agent exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/confirm-agent
+app.post('/api/gha/confirm-agent', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { agent_id, notes } = req.body;
+    if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+
+    const { data: agent } = await adminClient.from('profiles').select('*').eq('id', agent_id).single();
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    if (agent.gha_id !== session.staff_id) return res.status(403).json({ error: 'This agent is not under your GHA' });
+
+    const { error: updateErr } = await adminClient.from('profiles')
+      .update({ gha_verified: true, status: 'pending_sa_review' }).eq('id', agent_id);
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    const { data: saData } = await adminClient.from('service_agents')
+      .select('id, email, full_name').eq('id', agent.sa_id).single();
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'SA',
+      recipient_id: agent.sa_id,
+      type: 'agent_verified',
+      title: 'GHA Confirmed Agent Details',
+      message: 'Agent ' + (agent.full_name || agent.email) + ' has been confirmed by their GHA. Ready for your approval.',
+      is_read: false,
+    }]).catch(e => console.error('SA notification failed (non-blocking):', e.message));
+
+    res.json({ success: true, message: 'Agent confirmed successfully' });
+  } catch (err) {
+    console.error('Confirm agent exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -4882,36 +4920,60 @@ The GetHome Team`
 // Records the upgrade and sends admin confirmation.
 // ──────────────────────────────────────────────────────────
 app.post('/api/agent/upgrade', async (req, res) => {
-  const { reference, tier, agent_email } = req.body;
+  const { reference, tier, agent_email, user_id } = req.body;
   if (!reference || !tier || !agent_email) return res.status(400).json({ error: "reference, tier, and agent_email required." });
   const tierConfig = { free: { label: 'Free', limit: 3 }, premium: { label: 'Premium', limit: 15 }, agency: { label: 'Agency', limit: 100 } };
   const t = tierConfig[tier] || tierConfig.premium;
-  // Optional Supabase log:
-  // await supabase.from('agent_upgrades').insert([{
-  //   paystack_ref: reference, tier, agent_email,
-  //   listing_limit: t.limit, created_at: new Date().toISOString(),
-  // }]);
+
+  const subscriptionEndDate = new Date();
+  subscriptionEndDate.setFullYear(subscriptionEndDate.getFullYear() + 1);
+  const subscriptionEndIso = subscriptionEndDate.toISOString();
+
+  // Resolve agent ID — prefer explicit user_id, fall back to email lookup
+  let userId = user_id || null;
+  if (!userId) {
+    const { data: profile } = await adminClient.from('profiles').select('id').eq('email', agent_email).single();
+    userId = profile?.id || null;
+  }
+
+  if (userId) {
+    const { error: profileSubErr } = await adminClient.from('profiles').update({
+      subscription_tier: tier,
+      subscription_start: new Date().toISOString(),
+      subscription_end: subscriptionEndIso,
+      subscription_status: 'active',
+    }).eq('id', userId);
+    if (profileSubErr) console.error('Profile subscription sync failed:', profileSubErr.message);
+
+    const { error: agentSubErr } = await adminClient.from('agents').update({
+      subscription_tier: tier,
+      subscription_end: subscriptionEndIso,
+    }).eq('id', userId).catch(e => ({ error: e }));
+    if (agentSubErr) console.error('Agent table subscription sync failed (non-blocking):', agentSubErr.message);
+  } else {
+    console.error('Agent upgrade: could not resolve user ID for email', agent_email, '— DB not updated');
+  }
+
   const body = `
  AGENT TIER UPGRADE — ${t.label.toUpperCase()}
 =============================================
 An agent has upgraded their listing plan.
 Paystack Reference : ${reference}
 Agent Email        : ${agent_email}
+Agent User ID      : ${userId || 'UNRESOLVED — check manually'}
 New Tier           : ${t.label}
 Listing Limit      : ${t.limit} active listings
-ACTION REQUIRED---------------
-  1. Update this agent's tier in your admin records.
-  2. If Agency plan: set up their dedicated Agency Profile page.
-  3. Send a welcome email confirming their new plan.
+Subscription End   : ${subscriptionEndIso}
+DB Updated         : ${userId ? 'YES' : 'NO — manual action required'}
 =============================================
   `.trim();
   try {
     await sendAdminEmail(` Agent Upgraded to ${t.label} — ${agent_email}`, body);
     console.log(` Agent upgrade notification sent. Ref: ${reference}`);
-    res.status(200).json({ success: true, tier, listingLimit: t.limit });
+    res.status(200).json({ success: true, tier, listingLimit: t.limit, subscription_end: subscriptionEndIso });
   } catch (err) {
     console.error("Agent upgrade email error:", err.message);
-    res.status(200).json({ success: false, warning: "Payment captured but email failed." });
+    res.status(200).json({ success: false, warning: "Payment captured but email failed.", subscription_end: subscriptionEndIso });
   }
 });
 // ──────────────────────────────────────────────────────────
