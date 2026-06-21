@@ -4255,6 +4255,78 @@ https://trygethome.online`
     return res.status(500).json({ error: 'Agent registration failed. Please try again.' });
   }
 });
+
+// POST /api/auth/create-agent-row
+// Called by the frontend immediately after Supabase Auth signup completes.
+// Uses the service role key (adminClient) to bypass RLS and retries on foreign key
+// violations to absorb the auth.users replication delay.
+app.post('/api/auth/create-agent-row', async (req, res) => {
+  try {
+    const {
+      id, email, full_name, name, phone, phone_number, office_address, address,
+      nin, nin_number, ghana_card_number, experience, specialty,
+      cac, cac_number, orc_number, about_self, about,
+      country, city, requested_gha_code, role, status,
+    } = req.body;
+
+    if (!id || !email) {
+      return res.status(400).json({ error: 'id and email are required' });
+    }
+
+    console.log('Creating agent row for id:', id, '| country:', country);
+
+    // Retry with exponential backoff to handle auth.users replication delay.
+    // Only retries on foreign key violation (23503); all other errors fail immediately.
+    let lastError = null;
+    const maxAttempts = 5;
+    const delays = [300, 600, 1200, 2000, 3000]; // total ~7s worst case
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) {
+        await new Promise(resolve => setTimeout(resolve, delays[attempt - 1]));
+        console.log('Retry attempt', attempt + 1, 'for agent id:', id);
+      }
+
+      const { data, error } = await adminClient.from('profiles').upsert([{
+        id,
+        email,
+        full_name: full_name || name || null,
+        phone: phone || phone_number || null,
+        office_address: office_address || address || null,
+        nin_number: nin_number || nin || null,
+        ghana_card_number: ghana_card_number || null,
+        experience: experience || null,
+        specialty: specialty || null,
+        cac_number: cac_number || cac || null,
+        orc_number: orc_number || null,
+        about: about || about_self || null,
+        country: country || 'NG',
+        city: city || null,
+        requested_gha_code: requested_gha_code || null,
+        role: role || 'agent',
+        status: status || 'pending',
+      }], { onConflict: 'id' }).select();
+
+      if (!error) {
+        console.log('Agent row created successfully on attempt', attempt + 1, ':', JSON.stringify(data?.[0]));
+        return res.status(201).json({ success: true, agent: data?.[0] });
+      }
+
+      lastError = error;
+      console.error('Attempt', attempt + 1, 'failed:', error.message, error.code);
+
+      // Only retry on foreign key violation — any other error is permanent
+      if (error.code !== '23503') break;
+    }
+
+    console.error('All retry attempts exhausted for agent id:', id, '| last error:', lastError?.message);
+    return res.status(500).json({ error: 'Failed to create agent profile after multiple attempts: ' + (lastError?.message || 'unknown error') });
+  } catch (err) {
+    console.error('create-agent-row exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
