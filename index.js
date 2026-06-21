@@ -1213,48 +1213,39 @@ app.get('/api/sa/my-ghas', async (req, res) => {
     const safeGhas = ghas || [];
     console.log('Found', safeGhas.length, 'GHAs for SA', saId);
 
-    const enriched = await Promise.all(safeGhas.map(async function(gha) {
-      try {
-        const { count, error: countErr } = await adminClient
-          .from('profiles')
+    const enrichedGhas = await Promise.all(safeGhas.map(async function(gha) {
+      const { data: agentsUnderGha } = await adminClient
+        .from('profiles')
+        .select('id, subscription_tier, subscription_end')
+        .eq('gha_id', gha.id)
+        .eq('role', 'agent');
+
+      const agentIds = (agentsUnderGha || []).map(a => a.id);
+      let totalListings = 0;
+      if (agentIds.length > 0) {
+        const { count } = await adminClient
+          .from('properties')
           .select('id', { count: 'exact', head: true })
-          .eq('gha_id', gha.id)
-          .eq('role', 'agent');
-
-        if (countErr) {
-          console.error('Agent count error for GHA', gha.gha_code, ':', countErr.message);
-          return Object.assign({}, gha, { agent_count: 0, monthly_commission: 0 });
-        }
-
-        const agentCount = count || 0;
-
-        let monthlyCommission = 0;
-        try {
-          const { data: subAgents } = await adminClient
-            .from('profiles')
-            .select('subscription_amount')
-            .eq('gha_id', gha.id)
-            .eq('role', 'agent')
-            .gt('subscription_end', new Date().toISOString());
-
-          monthlyCommission = (subAgents || []).reduce(function(sum, a) {
-            return sum + (parseFloat(a.subscription_amount) || 0) * 0.05;
-          }, 0);
-        } catch (commErr) {
-          console.error('Commission calc error for GHA', gha.gha_code, ':', commErr.message);
-        }
-
-        return Object.assign({}, gha, {
-          agent_count: agentCount,
-          monthly_commission: Math.round(monthlyCommission),
-        });
-      } catch (innerErr) {
-        console.error('Enrichment failed for GHA', gha?.gha_code, ':', innerErr.message);
-        return Object.assign({}, gha, { agent_count: 0, monthly_commission: 0 });
+          .in('created_by', agentIds);
+        totalListings = count || 0;
       }
+
+      const activeSubscriptions = (agentsUnderGha || []).filter(function(a) {
+        return a.subscription_tier && a.subscription_tier !== 'free' && a.subscription_end && new Date(a.subscription_end) > new Date();
+      }).length;
+      const expiredSubscriptions = (agentsUnderGha || []).filter(function(a) {
+        return a.subscription_end && new Date(a.subscription_end) < new Date();
+      }).length;
+
+      return Object.assign({}, gha, {
+        agent_count: agentIds.length,
+        total_listings: totalListings,
+        active_subscriptions: activeSubscriptions,
+        expired_subscriptions: expiredSubscriptions,
+      });
     }));
 
-    res.json(enriched);
+    res.json(enrichedGhas);
   } catch (err) {
     console.error('CRITICAL: SA my-ghas exception:', err.message, err.stack);
     res.status(200).json([]);
@@ -2120,7 +2111,22 @@ app.get('/api/gha/my-agents', verifyStaffToken, async (req, res) => {
       console.log('Sample agent gha_id values:', agents.map(a => a.gha_id));
     }
 
-    res.json(agents || []);
+    const enrichedAgents = await Promise.all((agents || []).map(async function(agent) {
+      const { count: listingCount } = await adminClient
+        .from('properties')
+        .select('id', { count: 'exact', head: true })
+        .eq('created_by', agent.id);
+
+      const isExpired = agent.subscription_end && new Date(agent.subscription_end) < new Date();
+
+      return Object.assign({}, agent, {
+        listing_count: listingCount || 0,
+        subscription_tier: agent.subscription_tier || 'free',
+        subscription_end: agent.subscription_end || null,
+        is_subscription_expired: !!isExpired,
+      });
+    }));
+    res.json(enrichedAgents);
   } catch (err) {
     console.error('GHA my-agents error:', err.message);
     res.status(500).json({ error: err.message });
@@ -2406,7 +2412,6 @@ app.get('/api/admin/all-sas', async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
 
-    const now = new Date().toISOString();
     const enriched = await Promise.all((sas || []).map(async function(sa) {
       const { data: ghas } = await serviceClient
         .from('gha_agents')
@@ -2417,20 +2422,36 @@ app.get('/api/admin/all-sas', async (req, res) => {
 
       let agentCount = 0;
       let monthlyEarnings = 0;
+      let totalListings = 0;
+      let activeSubscriptions = 0;
+      let expiredSubscriptions = 0;
+
       if (ghaIds.length > 0) {
-        const { count } = await serviceClient
+        const { data: agentsUnderSa } = await serviceClient
           .from('profiles')
-          .select('id', { count: 'exact', head: true })
+          .select('id, subscription_tier, subscription_end, subscription_amount')
           .in('gha_id', ghaIds)
           .eq('role', 'agent');
-        agentCount = count || 0;
 
-        const { data: activeSubs } = await serviceClient
-          .from('profiles')
-          .select('subscription_amount')
-          .in('gha_id', ghaIds)
-          .gt('subscription_end', now);
-        monthlyEarnings = (activeSubs || []).reduce(function(sum, p) {
+        const agentIds = (agentsUnderSa || []).map(function(a) { return a.id; });
+        agentCount = agentIds.length;
+
+        if (agentIds.length > 0) {
+          const { count } = await serviceClient
+            .from('properties')
+            .select('id', { count: 'exact', head: true })
+            .in('created_by', agentIds);
+          totalListings = count || 0;
+        }
+
+        activeSubscriptions = (agentsUnderSa || []).filter(function(a) {
+          return a.subscription_tier && a.subscription_tier !== 'free' && a.subscription_end && new Date(a.subscription_end) > new Date();
+        }).length;
+        expiredSubscriptions = (agentsUnderSa || []).filter(function(a) {
+          return a.subscription_end && new Date(a.subscription_end) < new Date();
+        }).length;
+
+        monthlyEarnings = (agentsUnderSa || []).reduce(function(sum, p) {
           return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
         }, 0);
       }
@@ -2439,6 +2460,9 @@ app.get('/api/admin/all-sas', async (req, res) => {
         gha_count: ghaCount,
         agent_count: agentCount,
         monthly_earnings: monthlyEarnings,
+        total_listings: totalListings,
+        active_subscriptions: activeSubscriptions,
+        expired_subscriptions: expiredSubscriptions,
       });
       delete result.password_hash;
       delete result.gh_staff_token;
@@ -2474,25 +2498,39 @@ app.get('/api/admin/all-ghas', async (req, res) => {
       (sas || []).forEach(function(s) { saMap[s.id] = s; });
     }
 
-    const now = new Date().toISOString();
     const enriched = await Promise.all((ghas || []).map(async function(gha) {
-      const { count: agentCount } = await serviceClient
+      const { data: agentsUnderGha } = await serviceClient
         .from('profiles')
-        .select('id', { count: 'exact', head: true })
+        .select('id, subscription_tier, subscription_end, subscription_amount')
         .eq('gha_id', gha.id)
         .eq('role', 'agent');
 
-      const { data: activeSubs } = await serviceClient
-        .from('profiles')
-        .select('subscription_amount')
-        .eq('gha_id', gha.id)
-        .gt('subscription_end', now);
-      const monthlyEarnings = (activeSubs || []).reduce(function(sum, p) {
+      const agentIds = (agentsUnderGha || []).map(function(a) { return a.id; });
+
+      let totalListings = 0;
+      if (agentIds.length > 0) {
+        const { count } = await serviceClient
+          .from('properties')
+          .select('id', { count: 'exact', head: true })
+          .in('created_by', agentIds);
+        totalListings = count || 0;
+      }
+
+      const activeSubscriptions = (agentsUnderGha || []).filter(function(a) {
+        return a.subscription_tier && a.subscription_tier !== 'free' && a.subscription_end && new Date(a.subscription_end) > new Date();
+      }).length;
+      const expiredSubscriptions = (agentsUnderGha || []).filter(function(a) {
+        return a.subscription_end && new Date(a.subscription_end) < new Date();
+      }).length;
+      const monthlyEarnings = (agentsUnderGha || []).reduce(function(sum, p) {
         return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
       }, 0);
 
       const result = Object.assign({}, gha, {
-        agent_count: agentCount || 0,
+        agent_count: agentIds.length,
+        total_listings: totalListings,
+        active_subscriptions: activeSubscriptions,
+        expired_subscriptions: expiredSubscriptions,
         monthly_earnings: monthlyEarnings,
         sa: gha.sa_id ? (saMap[gha.sa_id] || null) : null,
       });
