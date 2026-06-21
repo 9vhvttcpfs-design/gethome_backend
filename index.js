@@ -4302,96 +4302,34 @@ https://trygethome.online`
 // violations to absorb the auth.users replication delay.
 app.post('/api/auth/create-agent-row', async (req, res) => {
   try {
-    const {
-      id, email, full_name, name, phone, phone_number, office_address, address,
-      nin, nin_number, ghana_card_number, experience, specialty,
-      cac, cac_number, orc_number, about_self, about,
-      country, city, requested_gha_code, role, status,
-    } = req.body;
+    const { id, email, full_name, name, phone, phone_number, office_address, address, city, experience, specialty, nin, nin_number, cac, cac_number, about, about_self, country, requested_gha_code } = req.body;
+    if (!id || !email) return res.status(400).json({ error: 'id and email are required' });
 
-    if (!id || !email) {
-      return res.status(400).json({ error: 'id and email are required' });
+    console.log('Calling create_agent_with_retry RPC for id:', id);
+
+    const { data, error } = await adminClient.rpc('create_agent_with_retry', {
+      p_id: id,
+      p_email: email,
+      p_full_name: full_name || name || null,
+      p_phone: phone || phone_number || null,
+      p_office_address: office_address || address || null,
+      p_city: city || null,
+      p_experience: experience || null,
+      p_specialty: specialty || null,
+      p_nin: nin || nin_number || null,
+      p_cac: cac || cac_number || null,
+      p_about: about || about_self || null,
+      p_country: country || 'NG',
+      p_requested_gha_code: requested_gha_code || null,
+    });
+
+    if (error) {
+      console.error('create_agent_with_retry RPC failed:', error.message);
+      return res.status(500).json({ error: error.message });
     }
 
-    console.log('Creating agent row for id:', id, '| country:', country);
-
-    // Retry with exponential backoff to handle auth.users replication delay.
-    // Only retries on foreign key violation (23503); all other errors fail immediately.
-    let lastError = null;
-    const maxAttempts = 5;
-    const delays = [300, 600, 1200, 2000, 3000]; // total ~7s worst case
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (attempt > 0) {
-        await new Promise(resolve => setTimeout(resolve, delays[attempt - 1]));
-        console.log('Retry attempt', attempt + 1, 'for agent id:', id);
-      }
-
-      const { data, error } = await adminClient.from('agents').upsert([{
-        id,
-        email,
-        full_name: full_name || name || null,
-        name: name || full_name || null,
-        phone: phone || phone_number || null,
-        phone_number: phone_number || phone || null,
-        office_address: office_address || address || null,
-        address: address || office_address || null,
-        nin: nin || nin_number || null,
-        nin_number: nin_number || nin || null,
-        ghana_card_number: ghana_card_number || null,
-        experience: experience || null,
-        specialty: specialty || null,
-        cac: cac || cac_number || null,
-        cac_number: cac_number || cac || null,
-        orc_number: orc_number || null,
-        about_self: about_self || about || null,
-        about: about || about_self || null,
-        country: country || 'NG',
-        city: city || null,
-        requested_gha_code: requested_gha_code || null,
-        role: role || 'agent',
-        status: status || 'pending',
-      }], { onConflict: 'id' }).select();
-
-      if (!error) {
-        console.log('Agent row created successfully on attempt', attempt + 1, ':', JSON.stringify(data?.[0]));
-
-        // Mirror the same data into profiles so all SA/GHA logic can find it
-        const { error: profileSyncErr } = await adminClient.from('profiles').upsert([{
-          id,
-          email,
-          role: 'agent',
-          status: status || 'pending',
-          full_name: full_name || name || null,
-          phone: phone || phone_number || null,
-          office_address: office_address || address || null,
-          city: city || null,
-          experience: experience || null,
-          specialty: specialty || null,
-          nin_number: nin_number || nin || null,
-          cac_number: cac_number || cac || null,
-          about: about || about_self || null,
-          requested_gha_code: requested_gha_code || null,
-        }], { onConflict: 'id' });
-
-        if (profileSyncErr) {
-          console.error('Profile sync failed (non-blocking, agent row already saved):', profileSyncErr.message);
-        } else {
-          console.log('Profile synced successfully for agent:', id);
-        }
-
-        return res.status(201).json({ success: true, agent: data?.[0] });
-      }
-
-      lastError = error;
-      console.error('Attempt', attempt + 1, 'failed:', error.message, error.code);
-
-      // Only retry on foreign key violation — any other error is permanent
-      if (error.code !== '23503') break;
-    }
-
-    console.error('All retry attempts exhausted for agent id:', id, '| last error:', lastError?.message);
-    return res.status(500).json({ error: 'Failed to create agent profile after multiple attempts: ' + (lastError?.message || 'unknown error') });
+    console.log('Agent created successfully via RPC:', JSON.stringify(data));
+    res.status(201).json({ success: true, agent: data });
   } catch (err) {
     console.error('create-agent-row exception:', err.message);
     res.status(500).json({ error: err.message });
