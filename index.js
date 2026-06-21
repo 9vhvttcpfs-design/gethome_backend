@@ -4287,18 +4287,24 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
         console.log('Retry attempt', attempt + 1, 'for agent id:', id);
       }
 
-      const { data, error } = await adminClient.from('profiles').upsert([{
+      const { data, error } = await adminClient.from('agents').upsert([{
         id,
         email,
         full_name: full_name || name || null,
+        name: name || full_name || null,
         phone: phone || phone_number || null,
+        phone_number: phone_number || phone || null,
         office_address: office_address || address || null,
+        address: address || office_address || null,
+        nin: nin || nin_number || null,
         nin_number: nin_number || nin || null,
         ghana_card_number: ghana_card_number || null,
         experience: experience || null,
         specialty: specialty || null,
+        cac: cac || cac_number || null,
         cac_number: cac_number || cac || null,
         orc_number: orc_number || null,
+        about_self: about_self || about || null,
         about: about || about_self || null,
         country: country || 'NG',
         city: city || null,
