@@ -4317,6 +4317,31 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
 
       if (!error) {
         console.log('Agent row created successfully on attempt', attempt + 1, ':', JSON.stringify(data?.[0]));
+
+        // Mirror the same data into profiles so all SA/GHA logic can find it
+        const { error: profileSyncErr } = await adminClient.from('profiles').upsert([{
+          id,
+          email,
+          role: 'agent',
+          status: status || 'pending',
+          full_name: full_name || name || null,
+          phone: phone || phone_number || null,
+          office_address: office_address || address || null,
+          city: city || null,
+          experience: experience || null,
+          specialty: specialty || null,
+          nin_number: nin_number || nin || null,
+          cac_number: cac_number || cac || null,
+          about: about || about_self || null,
+          requested_gha_code: requested_gha_code || null,
+        }], { onConflict: 'id' });
+
+        if (profileSyncErr) {
+          console.error('Profile sync failed (non-blocking, agent row already saved):', profileSyncErr.message);
+        } else {
+          console.log('Profile synced successfully for agent:', id);
+        }
+
         return res.status(201).json({ success: true, agent: data?.[0] });
       }
 
