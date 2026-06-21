@@ -1782,6 +1782,7 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     const { data: updated, error: updateErr } = await adminClient
       .from('profiles')
       .update({
+        role: 'agent',
         gha_id: gha_id,
         sa_id: gha.sa_id,
         gha_code: gha.gha_code,
@@ -3467,6 +3468,7 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
     const { data: updated, error: updateErr } = await adminClient
       .from('profiles')
       .update({
+        role: 'agent',
         gha_id: gha_id,
         sa_id: gha.sa_id,
         gha_code: gha.gha_code,
@@ -5026,6 +5028,7 @@ const adminForceAssignHandler = async (req, res) => {
     const { data: updated, error: updateErr } = await adminClient
       .from('profiles')
       .update({
+        role: 'agent',
         gha_id: gha_id,
         sa_id: gha.sa_id,
         gha_code: gha.gha_code,
