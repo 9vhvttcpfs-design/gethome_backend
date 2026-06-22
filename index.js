@@ -1200,8 +1200,8 @@ app.get('/api/sa/my-ghas', async (req, res) => {
     console.log('Fetching GHAs for SA:', saId);
 
     const { data: ghas, error: ghaErr } = await adminClient
-      .from('gha_agents')
-      .select('id, gha_code, full_name, email, phone, location, status, commission_rate, created_at')
+      .from('gha_agents_enriched')
+      .select('id, gha_code, full_name, email, phone, location, status, commission_rate, created_at, agent_count, listing_count, active_subscriptions, expired_subscriptions')
       .eq('sa_id', saId)
       .order('created_at', { ascending: false });
 
@@ -1213,39 +1213,7 @@ app.get('/api/sa/my-ghas', async (req, res) => {
     const safeGhas = ghas || [];
     console.log('Found', safeGhas.length, 'GHAs for SA', saId);
 
-    const enrichedGhas = await Promise.all(safeGhas.map(async function(gha) {
-      const { data: agentsUnderGha } = await adminClient
-        .from('profiles')
-        .select('id, subscription_tier, subscription_end')
-        .eq('gha_id', gha.id)
-        .eq('role', 'agent');
-
-      const agentIds = (agentsUnderGha || []).map(a => a.id);
-      let totalListings = 0;
-      if (agentIds.length > 0) {
-        const { count } = await adminClient
-          .from('properties')
-          .select('id', { count: 'exact', head: true })
-          .in('created_by', agentIds);
-        totalListings = count || 0;
-      }
-
-      const activeSubscriptions = (agentsUnderGha || []).filter(function(a) {
-        return a.subscription_tier && a.subscription_tier !== 'free' && a.subscription_end && new Date(a.subscription_end) > new Date();
-      }).length;
-      const expiredSubscriptions = (agentsUnderGha || []).filter(function(a) {
-        return a.subscription_end && new Date(a.subscription_end) < new Date();
-      }).length;
-
-      return Object.assign({}, gha, {
-        agent_count: agentIds.length,
-        total_listings: totalListings,
-        active_subscriptions: activeSubscriptions,
-        expired_subscriptions: expiredSubscriptions,
-      });
-    }));
-
-    res.json(enrichedGhas);
+    res.json(safeGhas);
   } catch (err) {
     console.error('CRITICAL: SA my-ghas exception:', err.message, err.stack);
     res.status(200).json([]);
