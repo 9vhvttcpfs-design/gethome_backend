@@ -972,7 +972,9 @@ async function verifyStaffToken(req, res, next) {
     .select('*')
     .eq('token', token)
     .gt('expires_at', new Date().toISOString())
-    .single();
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
   if (!session) return res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });
   req.staffSession = session;
   next();
@@ -1063,7 +1065,9 @@ app.get('/api/staff/me', async (req, res) => {
       .select('*')
       .eq('token', token)
       .gt('expires_at', new Date().toISOString())
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (!session) return res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });
 
@@ -1137,7 +1141,9 @@ app.get('/api/gha/profile', async (req, res) => {
       .select('*')
       .eq('token', token)
       .gt('expires_at', new Date().toISOString())
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
     if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
 
     const { data: ghaRecord } = await adminClient
@@ -1186,7 +1192,9 @@ app.get('/api/sa/my-ghas', async (req, res) => {
       .select('*')
       .eq('token', token)
       .gt('expires_at', new Date().toISOString())
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (sessionErr || !session) {
       console.error('SA my-ghas session error:', sessionErr?.message);
@@ -1230,7 +1238,9 @@ app.get('/api/sa/my-agents', async (req, res) => {
       .select('*')
       .eq('token', token)
       .gt('expires_at', new Date().toISOString())
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
     const { data: saRecord } = await adminClient.from('service_agents')
@@ -1300,7 +1310,7 @@ app.get('/api/sa/pending-agents', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
     // Get SA location for matching
@@ -1373,7 +1383,7 @@ app.post('/api/sa/approve-agent', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
     const saId = session.staff_id;
@@ -1422,7 +1432,7 @@ app.post('/api/sa/reject-agent', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
     const { agent_id, reason } = req.body;
@@ -1600,7 +1610,9 @@ app.get('/api/sa/search-agent', async (req, res) => {
       .select('*')
       .eq('token', token)
       .gt('expires_at', new Date().toISOString())
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
     if (!session || session.staff_role !== 'SA') {
       return res.status(403).json({ error: 'SA access required' });
     }
@@ -1692,7 +1704,7 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
     const { agent_id, gha_id } = req.body;
@@ -1945,7 +1957,7 @@ app.post('/api/gha/verify-agent', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
 
     const { agent_id, notes } = req.body;
@@ -1997,7 +2009,7 @@ app.post('/api/gha/confirm-agent', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
 
     const { agent_id, notes } = req.body;
@@ -3184,7 +3196,7 @@ app.post('/api/sa/create-inspection', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
     const { property_id, customer_name, customer_email, customer_phone, property_address, gha_id, inspection_date, notes, inspection_type } = req.body;
@@ -3776,7 +3788,9 @@ app.get('/api/sa/notifications', async (req, res) => {
       .select('*')
       .eq('token', token)
       .gt('expires_at', new Date().toISOString())
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (sessionErr || !session) {
       console.error('SA notifications session error:', sessionErr?.message);
@@ -3825,7 +3839,9 @@ app.get('/api/gha/notifications', async (req, res) => {
       .select('*')
       .eq('token', token)
       .gt('expires_at', new Date().toISOString())
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (sessionErr || !session) {
       console.error('GHA notifications session error:', sessionErr?.message);
@@ -4996,7 +5012,7 @@ app.post('/api/gha/mark-notifications-read', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).single();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
 
     const { notification_id } = req.body;
@@ -5111,6 +5127,119 @@ const adminForceAssignHandler = async (req, res) => {
 app.post('/api/admin/force-assign-agent', adminForceAssignHandler);
 // Alias: frontend originally called /assign-agent-gha
 app.post('/api/admin/assign-agent-gha', adminForceAssignHandler);
+
+// ──────────────────────────────────────────────────────────
+// MONNIFY PAYMENT
+// ──────────────────────────────────────────────────────────
+async function getMonnifyToken() {
+  const credentials = Buffer.from(process.env.MONNIFY_API_KEY + ':' + process.env.MONNIFY_SECRET_KEY).toString('base64');
+  const res = await fetch(process.env.MONNIFY_BASE_URL + '/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Authorization': 'Basic ' + credentials, 'Content-Type': 'application/json' },
+  });
+  const data = await res.json();
+  if (!data.requestSuccessful) throw new Error('Monnify auth failed: ' + JSON.stringify(data));
+  return data.responseBody.accessToken;
+}
+
+app.post('/api/monnify/initialize-transaction', async (req, res) => {
+  try {
+    const { amount, customer_email, customer_name, purpose, property_id } = req.body;
+    if (!amount || !customer_email) return res.status(400).json({ error: 'amount and customer_email are required' });
+
+    const token = await getMonnifyToken();
+    const reference = 'GH-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
+
+    const initRes = await fetch(process.env.MONNIFY_BASE_URL + '/api/v1/merchant/transactions/init-transaction', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amount: parseFloat(amount),
+        customerName: customer_name || customer_email,
+        customerEmail: customer_email,
+        paymentReference: reference,
+        paymentDescription: purpose || 'GetHome Payment',
+        currencyCode: 'NGN',
+        contractCode: process.env.MONNIFY_CONTRACT_CODE,
+        redirectUrl: 'https://trygethome.online/?payment=complete',
+        paymentMethods: ['ACCOUNT_TRANSFER', 'CARD'],
+      }),
+    });
+    const initData = await initRes.json();
+    if (!initData.requestSuccessful) {
+      console.error('Monnify init failed:', JSON.stringify(initData));
+      return res.status(500).json({ error: 'Failed to initialize payment' });
+    }
+
+    if (property_id) {
+      await adminClient.from('properties').update({
+        deposit_reference: reference,
+        deposit_amount: amount,
+        deposit_status: 'pending',
+      }).eq('id', property_id);
+    }
+
+    console.log('Monnify transaction initialized:', reference);
+    res.json({
+      checkout_url: initData.responseBody.checkoutUrl,
+      reference: reference,
+    });
+  } catch (err) {
+    console.error('Monnify initialize exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/monnify/webhook', async (req, res) => {
+  try {
+    const crypto = require('crypto');
+    const signature = req.headers['monnify-signature'];
+    const computedHash = crypto.createHmac('sha512', process.env.MONNIFY_SECRET_KEY)
+      .update(JSON.stringify(req.body)).digest('hex');
+
+    if (signature !== computedHash) {
+      console.error('Monnify webhook signature mismatch - possible spoofed request');
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const eventData = req.body.eventData;
+    const reference = eventData?.paymentReference;
+    const status = eventData?.paymentStatus;
+
+    console.log('Monnify webhook received - reference:', reference, '| status:', status);
+
+    if (status === 'PAID') {
+      await adminClient.from('properties').update({
+        deposit_status: 'confirmed',
+        deposit_confirmed: true,
+      }).eq('deposit_reference', reference);
+
+      const { data: property } = await adminClient.from('properties')
+        .select('title, created_by').eq('deposit_reference', reference).single();
+
+      if (property) {
+        const { data: agentProfile } = await adminClient.from('profiles')
+          .select('sa_id').eq('id', property.created_by).single();
+
+        if (agentProfile?.sa_id) {
+          await adminClient.from('notifications').insert([{
+            recipient_type: 'SA',
+            recipient_id: agentProfile.sa_id,
+            type: 'proxy_payment',
+            title: 'Payment Confirmed via Monnify',
+            message: 'Payment confirmed for property: ' + property.title + '. Reference: ' + reference,
+            is_read: false,
+          }]).catch(e => console.error('Notification failed:', e.message));
+        }
+      }
+    }
+
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error('Monnify webhook exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ──────────────────────────────────────────────────────────
 // START SERVER
