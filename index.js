@@ -2029,14 +2029,18 @@ app.post('/api/gha/confirm-agent', async (req, res) => {
     const { data: saData } = await adminClient.from('service_agents')
       .select('id, email, full_name').eq('id', agent.sa_id).single();
 
-    await adminClient.from('notifications').insert([{
+    const { error: saNotifyErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'SA',
       recipient_id: agent.sa_id,
       type: 'agent_verified',
       title: 'GHA Confirmed Agent Details',
       message: 'Agent ' + (agent.full_name || agent.email) + ' has been confirmed by their GHA. Ready for your approval.',
       is_read: false,
-    }]).catch(e => console.error('SA notification failed (non-blocking):', e.message));
+    }]);
+    if (saNotifyErr) {
+      console.error('SA notification failed (non-blocking):', saNotifyErr.message);
+      // non-blocking - do not throw, just log and continue, since this is typically a notification insert that should never crash the main action
+    }
 
     res.json({ success: true, message: 'Agent confirmed successfully' });
   } catch (err) {
@@ -4935,8 +4939,11 @@ app.post('/api/agent/upgrade', async (req, res) => {
     const { error: agentSubErr } = await adminClient.from('agents').update({
       subscription_tier: tier,
       subscription_end: subscriptionEndIso,
-    }).eq('id', userId).catch(e => ({ error: e }));
-    if (agentSubErr) console.error('Agent table subscription sync failed (non-blocking):', agentSubErr.message);
+    }).eq('id', userId);
+    if (agentSubErr) {
+      console.error('Agent table subscription sync failed (non-blocking):', agentSubErr.message);
+      // non-blocking - do not throw, just log and continue, since this is typically a notification insert that should never crash the main action
+    }
   } else {
     console.error('Agent upgrade: could not resolve user ID for email', agent_email, '— DB not updated');
   }
@@ -5225,14 +5232,18 @@ app.post('/api/monnify/webhook', async (req, res) => {
           .select('sa_id').eq('id', property.created_by).single();
 
         if (agentProfile?.sa_id) {
-          await adminClient.from('notifications').insert([{
+          const { error: notifyErr } = await adminClient.from('notifications').insert([{
             recipient_type: 'SA',
             recipient_id: agentProfile.sa_id,
             type: 'proxy_payment',
             title: 'Payment Confirmed via Monnify',
             message: 'Payment confirmed for property: ' + property.title + '. Reference: ' + reference,
             is_read: false,
-          }]).catch(e => console.error('Notification failed:', e.message));
+          }]);
+          if (notifyErr) {
+            console.error('Notification failed:', notifyErr.message);
+            // non-blocking - do not throw, just log and continue, since this is typically a notification insert that should never crash the main action
+          }
         }
       }
     }
