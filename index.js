@@ -2014,6 +2014,9 @@ app.post('/api/gha/confirm-agent', async (req, res) => {
 
     const { agent_id, notes } = req.body;
     if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agent_id)) {
+      return res.status(400).json({ error: 'agent_id must be a valid UUID, got: ' + agent_id });
+    }
 
     const { data: agent } = await adminClient.from('profiles').select('*').eq('id', agent_id).single();
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
