@@ -3793,7 +3793,7 @@ app.get('/api/sa/notifications', async (req, res) => {
       .maybeSingle();
 
     if (sessionErr || !session) {
-      console.error('SA notifications session error:', sessionErr?.message);
+      console.error('SA notifications session error - FULL OBJECT:', JSON.stringify(sessionErr), '| session value:', JSON.stringify(session));
       return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
     if (session.staff_role !== 'SA') {
