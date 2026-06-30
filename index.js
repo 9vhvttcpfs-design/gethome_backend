@@ -1463,14 +1463,34 @@ app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    const { agent_id, gha_id } = req.body;
-    if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
+    const { agent_id, gha_code, gha_id: rawGhaId } = req.body;
+    if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+
+    let resolvedGhaId = rawGhaId;
+
+    if (!resolvedGhaId && gha_code) {
+      const { data: ghaRecord, error: ghaLookupErr } = await adminClient
+        .from('gha_agents')
+        .select('id')
+        .eq('gha_code', gha_code)
+        .single();
+
+      if (ghaLookupErr || !ghaRecord) {
+        console.error('GHA code lookup failed:', gha_code, '|', ghaLookupErr?.message);
+        return res.status(404).json({ error: 'No GHA found with code: ' + gha_code });
+      }
+      resolvedGhaId = ghaRecord.id;
+    }
+
+    if (!resolvedGhaId) {
+      return res.status(400).json({ error: 'Either gha_id or gha_code is required' });
+    }
 
     // Verify GHA belongs to this SA
     const { data: gha } = await serviceClient
       .from('gha_agents')
       .select('id, email, full_name, gha_code')
-      .eq('id', gha_id)
+      .eq('id', resolvedGhaId)
       .eq('sa_id', saId)
       .single();
     if (!gha) return res.status(403).json({ error: 'This GHA does not belong to your team' });
@@ -1487,7 +1507,7 @@ app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
     const { error: updateErr } = await serviceClient
       .from('profiles')
       .update({
-        gha_id: gha_id,
+        gha_id: resolvedGhaId,
         sa_id: saId,
         gha_code: gha.gha_code,
         status: 'pending_gha_inspection',
@@ -1499,7 +1519,7 @@ app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
     try {
       const { error: notifErr } = await serviceClient.from('notifications').insert({
         recipient_type: 'GHA',
-        recipient_id: gha_id,
+        recipient_id: resolvedGhaId,
         type: 'inspection_request',
         title: 'New Agent to Verify',
         message: `Please verify agent ${agent.full_name || agent_id} registration details and confirm to SA.`,
@@ -5139,90 +5159,73 @@ app.post('/api/admin/force-assign-agent', adminForceAssignHandler);
 app.post('/api/admin/assign-agent-gha', adminForceAssignHandler);
 
 // ──────────────────────────────────────────────────────────
-// MONNIFY PAYMENT
+// FLUTTERWAVE PAYMENT
 // ──────────────────────────────────────────────────────────
-async function getMonnifyToken() {
-  const credentials = Buffer.from(process.env.MONNIFY_API_KEY + ':' + process.env.MONNIFY_SECRET_KEY).toString('base64');
-  const res = await fetch(process.env.MONNIFY_BASE_URL + '/api/v1/auth/login', {
-    method: 'POST',
-    headers: { 'Authorization': 'Basic ' + credentials, 'Content-Type': 'application/json' },
-  });
-  const data = await res.json();
-  if (!data.requestSuccessful) throw new Error('Monnify auth failed: ' + JSON.stringify(data));
-  return data.responseBody.accessToken;
-}
-
-app.post('/api/monnify/initialize-transaction', async (req, res) => {
+app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
   try {
     const { amount, customer_email, customer_name, purpose, property_id } = req.body;
     if (!amount || !customer_email) return res.status(400).json({ error: 'amount and customer_email are required' });
 
-    const token = await getMonnifyToken();
     const reference = 'GH-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
 
-    const initRes = await fetch(process.env.MONNIFY_BASE_URL + '/api/v1/merchant/transactions/init-transaction', {
+    const initRes = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      headers: {
+        'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY,
+        'Content-Type': 'application/json',
+      },
       body: JSON.stringify({
+        tx_ref: reference,
         amount: parseFloat(amount),
-        customerName: customer_name || customer_email,
-        customerEmail: customer_email,
-        paymentReference: reference,
-        paymentDescription: purpose || 'GetHome Payment',
-        currencyCode: 'NGN',
-        contractCode: process.env.MONNIFY_CONTRACT_CODE,
-        redirectUrl: 'https://trygethome.online/?payment=complete',
-        paymentMethods: ['ACCOUNT_TRANSFER', 'CARD'],
+        currency: 'NGN',
+        redirect_url: 'https://trygethome.online/?payment=complete',
+        customer: { email: customer_email, name: customer_name || customer_email },
+        customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
       }),
     });
     const initData = await initRes.json();
-    if (!initData.requestSuccessful) {
-      console.error('Monnify init failed:', JSON.stringify(initData));
+    if (initData.status !== 'success') {
+      console.error('Flutterwave init failed:', JSON.stringify(initData));
       return res.status(500).json({ error: 'Failed to initialize payment' });
     }
 
     if (property_id) {
-      await adminClient.from('properties').update({
+      const { error: updateErr } = await adminClient.from('properties').update({
         deposit_reference: reference,
         deposit_amount: amount,
         deposit_status: 'pending',
       }).eq('id', property_id);
+      if (updateErr) console.error('Property deposit update failed (non-blocking):', updateErr.message);
     }
 
-    console.log('Monnify transaction initialized:', reference);
-    res.json({
-      checkout_url: initData.responseBody.checkoutUrl,
-      reference: reference,
-    });
+    console.log('Flutterwave transaction initialized:', reference);
+    res.json({ checkout_url: initData.data.link, reference: reference });
   } catch (err) {
-    console.error('Monnify initialize exception:', err.message);
+    console.error('Flutterwave initialize exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/monnify/webhook', async (req, res) => {
+app.post('/api/flutterwave/webhook', async (req, res) => {
   try {
-    const crypto = require('crypto');
-    const signature = req.headers['monnify-signature'];
-    const computedHash = crypto.createHmac('sha512', process.env.MONNIFY_SECRET_KEY)
-      .update(JSON.stringify(req.body)).digest('hex');
-
-    if (signature !== computedHash) {
-      console.error('Monnify webhook signature mismatch - possible spoofed request');
+    const signature = req.headers['verif-hash'];
+    if (!signature || signature !== process.env.FLW_WEBHOOK_HASH) {
+      console.error('Flutterwave webhook signature mismatch - possible spoofed request');
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    const eventData = req.body.eventData;
-    const reference = eventData?.paymentReference;
-    const status = eventData?.paymentStatus;
+    const event = req.body;
+    const reference = event?.data?.tx_ref;
+    const status = event?.data?.status;
 
-    console.log('Monnify webhook received - reference:', reference, '| status:', status);
+    console.log('Flutterwave webhook received - reference:', reference, '| status:', status);
 
-    if (status === 'PAID') {
-      await adminClient.from('properties').update({
+    if (status === 'successful') {
+      const { error: updateErr } = await adminClient.from('properties').update({
         deposit_status: 'confirmed',
         deposit_confirmed: true,
       }).eq('deposit_reference', reference);
+      if (updateErr) console.error('Deposit confirm update failed (non-blocking):', updateErr.message);
 
       const { data: property } = await adminClient.from('properties')
         .select('title, created_by').eq('deposit_reference', reference).single();
@@ -5232,25 +5235,22 @@ app.post('/api/monnify/webhook', async (req, res) => {
           .select('sa_id').eq('id', property.created_by).single();
 
         if (agentProfile?.sa_id) {
-          const { error: notifyErr } = await adminClient.from('notifications').insert([{
+          const { error: notifErr } = await adminClient.from('notifications').insert([{
             recipient_type: 'SA',
             recipient_id: agentProfile.sa_id,
             type: 'proxy_payment',
-            title: 'Payment Confirmed via Monnify',
+            title: 'Payment Confirmed via Flutterwave',
             message: 'Payment confirmed for property: ' + property.title + '. Reference: ' + reference,
             is_read: false,
           }]);
-          if (notifyErr) {
-            console.error('Notification failed:', notifyErr.message);
-            // non-blocking - do not throw, just log and continue, since this is typically a notification insert that should never crash the main action
-          }
+          if (notifErr) console.error('Notification insert failed (non-blocking):', notifErr.message);
         }
       }
     }
 
     res.status(200).json({ received: true });
   } catch (err) {
-    console.error('Monnify webhook exception:', err.message);
+    console.error('Flutterwave webhook exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
