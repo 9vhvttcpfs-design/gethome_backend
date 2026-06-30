@@ -1727,38 +1727,52 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
       .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const { agent_id, gha_id } = req.body;
-    if (!agent_id || !gha_id) return res.status(400).json({ error: 'agent_id and gha_id are required' });
-
-    const { data: gha } = await adminClient.from('gha_agents')
-      .select('id, gha_code, full_name, sa_id').eq('id', gha_id).single();
-    if (!gha) return res.status(404).json({ error: 'GHA not found' });
-    if (gha.sa_id !== session.staff_id) return res.status(403).json({ error: 'This GHA does not belong to your team' });
-
-    if (typeof agent_id !== 'string' || agent_id.length < 10) {
-      console.error('INVALID agent_id received:', agent_id, typeof agent_id);
-      return res.status(400).json({ error: 'Invalid agent_id format received: ' + JSON.stringify(agent_id) });
-    }
-    if (typeof gha_id !== 'string' || gha_id.length < 10) {
-      console.error('INVALID gha_id received:', gha_id, typeof gha_id);
-      return res.status(400).json({ error: 'Invalid gha_id format received: ' + JSON.stringify(gha_id) });
+    const { email, gha_code } = req.body;
+    if (!email || !gha_code) {
+      return res.status(400).json({ error: 'email and gha_code are required' });
     }
 
-    const { data: agent } = await adminClient.from('profiles')
-      .select('id, gha_id, sa_id, gha_code').eq('id', agent_id).single();
-    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    // Find the agent's UUID using their email - agents live in profiles
+    const { data: agentProfile, error: agentErr } = await adminClient
+      .from('profiles')
+      .select('id, full_name, email, sa_id, gha_id, gha_code')
+      .ilike('email', email.trim())
+      .eq('role', 'agent')
+      .single();
+
+    if (agentErr || !agentProfile) {
+      console.error('Agent lookup failed for email:', email, '|', agentErr?.message);
+      return res.status(404).json({ error: 'No registered agent found with that email' });
+    }
+
+    // Find the GHA's UUID using their gha_code - GHAs live in gha_agents, NOT profiles
+    const { data: ghaRecord, error: ghaErr } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, sa_id, full_name')
+      .eq('gha_code', gha_code.trim().toUpperCase())
+      .single();
+
+    if (ghaErr || !ghaRecord) {
+      console.error('GHA lookup failed for code:', gha_code, '|', ghaErr?.message);
+      return res.status(404).json({ error: 'No GHA found with code: ' + gha_code });
+    }
+
+    // Verify this GHA actually belongs to the requesting SA
+    if (ghaRecord.sa_id !== session.staff_id) {
+      return res.status(403).json({ error: 'This GHA does not belong to your team' });
+    }
 
     // Check if agent is already assigned to a GHA under a DIFFERENT SA
-    if (agent.gha_id && agent.sa_id && agent.sa_id !== session.staff_id) {
+    if (agentProfile.gha_id && agentProfile.sa_id && agentProfile.sa_id !== session.staff_id) {
       return res.status(400).json({
         error: 'This agent is already assigned to a GHA under a different SA. Only admin can change this assignment.',
         locked: true,
-        current_gha_code: agent.gha_code || 'another GHA',
+        current_gha_code: agentProfile.gha_code || 'another GHA',
       });
     }
 
     // Check if agent is already under THIS SA's GHA - allow reassignment within same SA
-    if (agent.gha_id && agent.sa_id === session.staff_id && agent.gha_id === gha_id) {
+    if (agentProfile.gha_id && agentProfile.sa_id === session.staff_id && agentProfile.gha_id === ghaRecord.id) {
       return res.status(400).json({
         error: 'This agent is already assigned to this GHA.',
         already_here: true,
@@ -1768,18 +1782,19 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     const { data: sa } = await adminClient.from('service_agents')
       .select('id, sa_code, full_name').eq('id', session.staff_id).single();
 
-    console.log('BEFORE UPDATE - agent_id:', agent_id, '| gha_id:', gha_id, '| typeof agent_id:', typeof agent_id, '| typeof gha_id:', typeof gha_id);
+    console.log('BEFORE UPDATE - agent_id:', agentProfile.id, '| gha_id:', ghaRecord.id, '| email:', email, '| gha_code:', ghaRecord.gha_code);
 
+    // Now perform the assignment using the resolved real UUIDs
     const { data: updated, error: updateErr } = await adminClient
       .from('profiles')
       .update({
         role: 'agent',
-        gha_id: gha_id,
-        sa_id: gha.sa_id,
-        gha_code: gha.gha_code,
+        gha_id: ghaRecord.id,
+        sa_id: ghaRecord.sa_id,
+        gha_code: ghaRecord.gha_code,
         status: 'pending_gha_inspection',
       })
-      .eq('id', agent_id)
+      .eq('id', agentProfile.id)
       .select();
 
     console.log('UPDATE RESULT - error:', JSON.stringify(updateErr), '| rows affected:', updated ? updated.length : 'null', '| data:', JSON.stringify(updated));
@@ -1790,26 +1805,26 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     }
 
     if (!updated || updated.length === 0) {
-      console.error('CRITICAL: Update query succeeded but affected ZERO rows. agent_id may not exist or may be wrong type:', agent_id);
-      return res.status(404).json({ error: 'No profile was updated. The agent_id may be invalid: ' + agent_id });
+      console.error('CRITICAL: Update query succeeded but affected ZERO rows. agent id:', agentProfile.id);
+      return res.status(404).json({ error: 'No profile was updated. The agent may not exist: ' + email });
     }
 
-    console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
+    console.log('Agent', email, 'assigned to GHA', ghaRecord.gha_code, 'successfully');
 
-    const agentProfile = updated[0];
+    const updatedProfile = updated[0];
     try {
       await sendCustomerEmail(
-        agentProfile?.email,
+        updatedProfile?.email,
         'You have been assigned to a GetHome team',
-        `Hello ${agentProfile?.full_name || 'Agent'},\n\nYou have been assigned to GHA ${gha.gha_code} - ${gha.full_name} under SA ${sa?.sa_code}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
+        `Hello ${updatedProfile?.full_name || 'Agent'},\n\nYou have been assigned to GHA ${ghaRecord.gha_code} - ${ghaRecord.full_name} under SA ${sa?.sa_code}.\n\nYour account is now being reviewed. You will be notified once approved.\n\nGetHome Team`
       );
     } catch(emailErr) { console.error('Assignment email failed:', emailErr.message); }
 
-    const agentName = agentProfile?.full_name || agentProfile?.email || 'New Agent';
+    const agentName = updatedProfile?.full_name || updatedProfile?.email || 'New Agent';
     try {
       const { error: notifErr } = await adminClient.from('notifications').insert([{
         recipient_type: 'GHA',
-        recipient_id: gha_id,
+        recipient_id: ghaRecord.id,
         type: 'agent_verification',
         title: 'Confirm Agent Information',
         message: 'SA has assigned agent ' + agentName + ' to your team. Please review their registration details and confirm their information so the SA can approve them.',
@@ -1820,7 +1835,7 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
       console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
     }
 
-    res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code + ' successfully', updated_agent: updated[0] });
+    res.json({ success: true, message: 'Agent assigned to ' + ghaRecord.gha_code, updated_agent: updatedProfile });
   } catch (err) {
     console.error('Assign agent exception:', err.message);
     res.status(500).json({ error: err.message });
