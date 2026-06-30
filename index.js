@@ -5270,6 +5270,73 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
   }
 });
 
+app.get('/api/gha-inspection-stats', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    let isAuthorized = false;
+    let saId = null;
+
+    const { data: staffSession } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+
+    if (staffSession && staffSession.staff_role === 'SA') {
+      isAuthorized = true;
+      saId = staffSession.staff_id;
+    } else {
+      const { data: userData } = await adminClient.auth.getUser(token);
+      if (userData?.user) {
+        const { data: profile } = await adminClient.from('profiles').select('role').eq('id', userData.user.id).single();
+        if (profile?.role === 'admin') isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized) return res.status(403).json({ error: 'Admin or SA access required' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const monthStart = month + '-01';
+    const nextMonth = new Date(monthStart);
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    const monthEnd = nextMonth.toISOString().slice(0, 10);
+
+    let ghaQuery = adminClient.from('gha_agents').select('id, gha_code, full_name, sa_id');
+    if (saId) ghaQuery = ghaQuery.eq('sa_id', saId);
+    const { data: ghas } = await ghaQuery;
+
+    const stats = await Promise.all((ghas || []).map(async function(gha) {
+      const { count: completedCount } = await adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .in('status', ['done', 'confirmed'])
+        .gte('gha_done_at', monthStart)
+        .lt('gha_done_at', monthEnd);
+
+      const { count: pendingCount } = await adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .eq('status', 'pending');
+
+      return {
+        gha_id: gha.id,
+        gha_code: gha.gha_code,
+        gha_name: gha.full_name,
+        completed_this_month: completedCount || 0,
+        pending_now: pendingCount || 0,
+      };
+    }));
+
+    stats.sort(function(a, b) { return b.completed_this_month - a.completed_this_month; });
+    res.json({ month, stats });
+  } catch (err) {
+    console.error('GHA inspection stats exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
