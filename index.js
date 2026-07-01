@@ -1727,33 +1727,35 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
       .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const { email, gha_code } = req.body;
-    if (!email || !gha_code) {
-      return res.status(400).json({ error: 'email and gha_code are required' });
+    const { email, gha_code, agent_id, gha_id } = req.body;
+    if ((!email && !agent_id) || (!gha_code && !gha_id)) {
+      return res.status(400).json({ error: 'Provide either (agent_id + gha_id) or (email + gha_code)' });
     }
 
-    // Find the agent's UUID using their email - agents live in profiles
-    const { data: agentProfile, error: agentErr } = await adminClient
+    // Find the agent's UUID - agents live in profiles. Accept a direct agent_id or fall back to email lookup.
+    const agentQuery = adminClient
       .from('profiles')
       .select('id, full_name, email, sa_id, gha_id, gha_code')
-      .ilike('email', email.trim())
-      .eq('role', 'agent')
-      .single();
+      .eq('role', 'agent');
+    const { data: agentProfile, error: agentErr } = agent_id
+      ? await agentQuery.eq('id', agent_id).single()
+      : await agentQuery.ilike('email', email.trim()).single();
 
     if (agentErr || !agentProfile) {
-      console.error('Agent lookup failed for email:', email, '|', agentErr?.message);
-      return res.status(404).json({ error: 'No registered agent found with that email' });
+      console.error('Agent lookup failed for', agent_id ? 'id: ' + agent_id : 'email: ' + email, '|', agentErr?.message);
+      return res.status(404).json({ error: agent_id ? 'No registered agent found with that id' : 'No registered agent found with that email' });
     }
 
-    // Find the GHA's UUID using their gha_code - GHAs live in gha_agents, NOT profiles
-    const { data: ghaRecord, error: ghaErr } = await adminClient
+    // Find the GHA's UUID - GHAs live in gha_agents, NOT profiles. Accept a direct gha_id or fall back to gha_code lookup.
+    const ghaQuery = adminClient
       .from('gha_agents')
-      .select('id, gha_code, sa_id, full_name')
-      .eq('gha_code', gha_code.trim().toUpperCase())
-      .single();
+      .select('id, gha_code, sa_id, full_name');
+    const { data: ghaRecord, error: ghaErr } = gha_id
+      ? await ghaQuery.eq('id', gha_id).single()
+      : await ghaQuery.eq('gha_code', gha_code.trim().toUpperCase()).single();
 
     if (ghaErr || !ghaRecord) {
-      console.error('GHA lookup failed for code:', gha_code, '|', ghaErr?.message);
+      console.error('GHA lookup failed for', gha_id ? 'id: ' + gha_id : 'code: ' + gha_code, '|', ghaErr?.message);
       return res.status(404).json({ error: 'No GHA found with code: ' + gha_code });
     }
 
@@ -1782,7 +1784,7 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     const { data: sa } = await adminClient.from('service_agents')
       .select('id, sa_code, full_name').eq('id', session.staff_id).single();
 
-    console.log('BEFORE UPDATE - agent_id:', agentProfile.id, '| gha_id:', ghaRecord.id, '| email:', email, '| gha_code:', ghaRecord.gha_code);
+    console.log('BEFORE UPDATE - agent_id:', agentProfile.id, '| gha_id:', ghaRecord.id, '| email:', agentProfile.email, '| gha_code:', ghaRecord.gha_code);
 
     // Now perform the assignment using the resolved real UUIDs
     const { data: updated, error: updateErr } = await adminClient
@@ -1806,10 +1808,10 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
 
     if (!updated || updated.length === 0) {
       console.error('CRITICAL: Update query succeeded but affected ZERO rows. agent id:', agentProfile.id);
-      return res.status(404).json({ error: 'No profile was updated. The agent may not exist: ' + email });
+      return res.status(404).json({ error: 'No profile was updated. The agent may not exist: ' + agentProfile.email });
     }
 
-    console.log('Agent', email, 'assigned to GHA', ghaRecord.gha_code, 'successfully');
+    console.log('Agent', agentProfile.email, 'assigned to GHA', ghaRecord.gha_code, 'successfully');
 
     const updatedProfile = updated[0];
     try {
