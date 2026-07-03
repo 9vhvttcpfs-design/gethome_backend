@@ -3106,7 +3106,7 @@ app.post('/api/admin/mark-sa-paid', async (req, res) => {
         try {
           await sendCustomerEmail(
             sa.email,
-          
+
           'GetHome - Your Commission Has Been Paid',
             `Hello ${sa.full_name || 'Service Agent'},
 
@@ -3120,7 +3120,20 @@ https://trygethome.online`
       });
     }
 
-    res.json({ success: true });
+    // Notify SA immediately so their board updates within next poll
+    const { data: saEarning } = await adminClient.from('sa_earnings')
+      .select('commission_amount').eq('sa_id', sa_id).eq('month_year', month_year).single();
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'SA',
+      recipient_id: sa_id,
+      type: 'commission_paid',
+      title: 'Commission Payment Received',
+      message: 'Your commission of NGN ' + (parseFloat(saEarning?.commission_amount || 0)).toLocaleString() + ' for ' + month_year + ' has been paid by admin.',
+      is_read: false,
+    }]).catch(e => console.error('SA payment notification failed:', e.message));
+
+    res.json({ success: true, message: 'SA commission marked as paid' });
   } catch (err) {
     console.error('Admin mark-sa-paid error:', err.message);
     res.status(500).json({ error: err.message });
@@ -3166,7 +3179,20 @@ https://trygethome.online`
       });
     }
 
-    res.json({ success: true });
+    // Notify GHA immediately so their board updates within next poll
+    const { data: ghaEarning } = await adminClient.from('gha_earnings')
+      .select('commission_amount').eq('gha_id', gha_id).eq('month_year', month_year).single();
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: gha_id,
+      type: 'commission_paid',
+      title: 'Commission Payment Received',
+      message: 'Your commission of NGN ' + (parseFloat(ghaEarning?.commission_amount || 0)).toLocaleString() + ' for ' + month_year + ' has been paid by admin.',
+      is_read: false,
+    }]).catch(e => console.error('GHA payment notification failed:', e.message));
+
+    res.json({ success: true, message: 'GHA commission marked as paid' });
   } catch (err) {
     console.error('Admin mark-gha-paid error:', err.message);
     res.status(500).json({ error: err.message });
@@ -5320,6 +5346,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           // Create GHA earnings row (5% commission)
           if (agentProfile?.gha_id) {
             const ghaCommission = Math.round(amount * 0.05);
+            console.log('Commission calc:', amount, '* 5% =', ghaCommission);
             const { error: ghaEarnErr } = await adminClient.from('gha_earnings').insert([{
               gha_id: agentProfile.gha_id,
               agent_id: agentId,
@@ -5347,6 +5374,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           // Create SA earnings row (5% commission)
           if (agentProfile?.sa_id) {
             const saCommission = Math.round(amount * 0.05);
+            console.log('Commission calc:', amount, '* 5% =', saCommission);
             const { error: saEarnErr } = await adminClient.from('sa_earnings').insert([{
               sa_id: agentProfile.sa_id,
               gha_id: agentProfile.gha_id || null,
@@ -5444,6 +5472,198 @@ app.get('/api/gha-inspection-stats', async (req, res) => {
     res.json({ month, stats });
   } catch (err) {
     console.error('GHA inspection stats exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/monthly-history - Admin views any past month
+app.get('/api/admin/monthly-history', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    const { data: ghaSum } = await adminClient
+      .from('monthly_gha_summaries')
+      .select('*')
+      .eq('month_year', month)
+      .order('total_subscription_revenue', { ascending: false });
+
+    const { data: agentSnaps } = await adminClient
+      .from('monthly_agent_snapshots')
+      .select('*')
+      .eq('month_year', month)
+      .order('subscription_amount', { ascending: false });
+
+    const { data: availableMonths } = await adminClient
+      .from('monthly_gha_summaries')
+      .select('month_year')
+      .order('month_year', { ascending: false });
+
+    const months = [...new Set((availableMonths || []).map(r => r.month_year))];
+
+    res.json({
+      month,
+      gha_summaries: ghaSum || [],
+      agent_snapshots: agentSnaps || [],
+      available_months: months,
+    });
+  } catch (err) {
+    console.error('Monthly history error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/monthly-history - SA views their own past months
+app.get('/api/sa/monthly-history', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    const { data: ghaSum } = await adminClient
+      .from('monthly_gha_summaries')
+      .select('*')
+      .eq('sa_id', session.staff_id)
+      .eq('month_year', month)
+      .order('total_subscription_revenue', { ascending: false });
+
+    const { data: agentSnaps } = await adminClient
+      .from('monthly_agent_snapshots')
+      .select('*')
+      .eq('sa_id', session.staff_id)
+      .eq('month_year', month);
+
+    const { data: availableMonths } = await adminClient
+      .from('monthly_gha_summaries')
+      .select('month_year')
+      .eq('sa_id', session.staff_id)
+      .order('month_year', { ascending: false });
+
+    const months = [...new Set((availableMonths || []).map(r => r.month_year))];
+
+    res.json({
+      month,
+      gha_summaries: ghaSum || [],
+      agent_snapshots: agentSnaps || [],
+      available_months: months,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha/monthly-history - GHA views their own past months
+app.get('/api/gha/monthly-history', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    const { data: agentSnaps } = await adminClient
+      .from('monthly_agent_snapshots')
+      .select('*')
+      .eq('gha_id', session.staff_id)
+      .eq('month_year', month)
+      .order('subscription_amount', { ascending: false });
+
+    const { data: availableMonths } = await adminClient
+      .from('monthly_agent_snapshots')
+      .select('month_year')
+      .eq('gha_id', session.staff_id)
+      .order('month_year', { ascending: false });
+
+    const months = [...new Set((availableMonths || []).map(r => r.month_year))];
+
+    const totalRevenue = (agentSnaps || []).reduce((sum, a) => sum + (parseFloat(a.subscription_amount) || 0), 0);
+    const totalCommission = (agentSnaps || []).reduce((sum, a) => sum + (parseFloat(a.gha_commission) || 0), 0);
+
+    res.json({
+      month,
+      agent_snapshots: agentSnaps || [],
+      available_months: months,
+      total_revenue: totalRevenue,
+      total_commission: totalCommission,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/take-snapshot - Admin manually triggers a snapshot
+app.post('/api/admin/take-snapshot', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const month = req.body.month || null;
+    const { data, error } = await adminClient.rpc('take_monthly_snapshot', {
+      target_month: month
+    });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/all-payments - Admin overview separating agent subscriptions from customer payments
+app.get('/api/admin/all-payments', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    // Agent subscription payments from earnings tables
+    const { data: ghaEarnings } = await adminClient
+      .from('gha_earnings')
+      .select('*, gha_agents(gha_code, full_name)')
+      .eq('month_year', month)
+      .order('created_at', { ascending: false });
+
+    const { data: saEarnings } = await adminClient
+      .from('sa_earnings')
+      .select('*, service_agents(sa_code, full_name)')
+      .eq('month_year', month)
+      .order('created_at', { ascending: false });
+
+    // Customer deposit payments
+    const { data: deposits } = await adminClient
+      .from('properties')
+      .select('id, title, location, deposit_amount, deposit_status, deposit_confirmed, deposit_reference, created_at')
+      .not('deposit_amount', 'is', null)
+      .order('created_at', { ascending: false });
+
+    // Calculate totals
+    const totalAgentRevenue = (ghaEarnings || []).reduce((sum, e) => sum + (parseFloat(e.subscription_amount) || 0), 0);
+    const totalCustomerRevenue = (deposits || []).filter(d => d.deposit_confirmed).reduce((sum, d) => sum + (parseFloat(d.deposit_amount) || 0), 0);
+    const totalGhaCommission = (ghaEarnings || []).reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    const totalSaCommission = (saEarnings || []).reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+
+    res.json({
+      month,
+      agent_subscriptions: ghaEarnings || [],
+      sa_earnings: saEarnings || [],
+      customer_deposits: deposits || [],
+      totals: {
+        agent_subscription_revenue: totalAgentRevenue,
+        customer_deposit_revenue: totalCustomerRevenue,
+        total_gha_commission: totalGhaCommission,
+        total_sa_commission: totalSaCommission,
+        grand_total_revenue: totalAgentRevenue + totalCustomerRevenue,
+      }
+    });
+  } catch (err) {
+    console.error('All payments error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
