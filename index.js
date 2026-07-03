@@ -5202,6 +5202,7 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
     if (payment_method === 'card') {
       flwPayload.payment_options = 'card';
     }
+    flwPayload.meta = req.body.meta || {};
 
     const initRes = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
@@ -5272,6 +5273,103 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             is_read: false,
           }]);
           if (notifErr) console.error('Notification insert failed (non-blocking):', notifErr.message);
+        }
+      }
+    }
+
+    // Handle agent subscription payments
+    if (status === 'successful' && event?.data?.meta?.payment_type === 'subscription') {
+      const agentId = event?.data?.meta?.agent_id;
+      const tier = event?.data?.meta?.tier;
+      const amount = parseFloat(event?.data?.amount || 0);
+
+      if (agentId && tier) {
+        const tierDurations = { premium: 30, agency: 30 };
+        const daysToAdd = tierDurations[tier] || 30;
+        const subscriptionEnd = new Date(Date.now() + daysToAdd * 24 * 60 * 60 * 1000).toISOString();
+
+        // Update agent subscription in profiles
+        const { error: subErr } = await adminClient.from('profiles').update({
+          subscription_tier: tier,
+          subscription_start: new Date().toISOString(),
+          subscription_end: subscriptionEnd,
+          subscription_amount: amount,
+          subscription_status: 'active',
+        }).eq('id', agentId);
+
+        if (subErr) {
+          console.error('Subscription update failed (non-blocking):', subErr.message);
+        } else {
+          console.log('Agent subscription updated:', agentId, tier, subscriptionEnd);
+
+          // Also sync to agents table
+          await adminClient.from('agents').update({
+            subscription_tier: tier,
+            subscription_end: subscriptionEnd,
+          }).eq('id', agentId).catch(e => console.error('Agents table sync failed:', e.message));
+
+          // Get agent's GHA and SA for earnings calculation
+          const { data: agentProfile } = await adminClient
+            .from('profiles')
+            .select('gha_id, sa_id, gha_code, full_name, email')
+            .eq('id', agentId)
+            .single();
+
+          const monthYear = new Date().toISOString().slice(0, 7);
+
+          // Create GHA earnings row (5% commission)
+          if (agentProfile?.gha_id) {
+            const ghaCommission = Math.round(amount * 0.05);
+            const { error: ghaEarnErr } = await adminClient.from('gha_earnings').insert([{
+              gha_id: agentProfile.gha_id,
+              agent_id: agentId,
+              agent_email: agentProfile.email,
+              subscription_amount: amount,
+              commission_rate: 5,
+              commission_amount: ghaCommission,
+              month_year: monthYear,
+              is_paid: false,
+            }]);
+            if (ghaEarnErr) console.error('GHA earnings insert failed (non-blocking):', ghaEarnErr.message);
+            else console.log('GHA earnings created:', agentProfile.gha_id, 'commission:', ghaCommission);
+
+            // Notify GHA
+            await adminClient.from('notifications').insert([{
+              recipient_type: 'GHA',
+              recipient_id: agentProfile.gha_id,
+              type: 'subscription_payment',
+              title: 'Agent Subscription Payment',
+              message: 'Agent ' + (agentProfile.full_name || agentProfile.email) + ' subscribed to ' + tier + ' plan. Your commission: NGN ' + ghaCommission.toLocaleString(),
+              is_read: false,
+            }]).catch(e => console.error('GHA notification failed:', e.message));
+          }
+
+          // Create SA earnings row (5% commission)
+          if (agentProfile?.sa_id) {
+            const saCommission = Math.round(amount * 0.05);
+            const { error: saEarnErr } = await adminClient.from('sa_earnings').insert([{
+              sa_id: agentProfile.sa_id,
+              gha_id: agentProfile.gha_id || null,
+              agent_id: agentId,
+              subscription_amount: amount,
+              commission_rate: 5,
+              commission_amount: saCommission,
+              month_year: monthYear,
+              is_paid: false,
+            }]);
+            if (saEarnErr) console.error('SA earnings insert failed (non-blocking):', saEarnErr.message);
+            else console.log('SA earnings created:', agentProfile.sa_id, 'commission:', saCommission);
+
+            // Notify SA
+            await adminClient.from('notifications').insert([{
+              recipient_type: 'SA',
+              recipient_id: agentProfile.sa_id,
+              type: 'subscription_payment',
+              title: 'Agent Subscription Payment',
+              message: 'Agent ' + (agentProfile.full_name || agentProfile.email) + ' subscribed to ' + tier + ' plan. Your commission: NGN ' + saCommission.toLocaleString(),
+              is_read: false,
+            }]).catch(e => console.error('SA notification failed:', e.message));
+          }
         }
       }
     }
