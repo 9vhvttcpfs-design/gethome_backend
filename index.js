@@ -5186,10 +5186,22 @@ app.post('/api/admin/assign-agent-gha', adminForceAssignHandler);
 // ──────────────────────────────────────────────────────────
 app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
   try {
-    const { amount, customer_email, customer_name, purpose, property_id } = req.body;
+    const { amount, customer_email, customer_name, purpose, property_id, payment_method } = req.body;
     if (!amount || !customer_email) return res.status(400).json({ error: 'amount and customer_email are required' });
 
     const reference = 'GH-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
+
+    const flwPayload = {
+      tx_ref: reference,
+      amount: parseFloat(amount),
+      currency: 'NGN',
+      redirect_url: 'https://trygethome.online/?payment=complete',
+      customer: { email: customer_email, name: customer_name || customer_email },
+      customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
+    };
+    if (payment_method === 'card') {
+      flwPayload.payment_options = 'card';
+    }
 
     const initRes = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
@@ -5197,14 +5209,7 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
         'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        tx_ref: reference,
-        amount: parseFloat(amount),
-        currency: 'NGN',
-        redirect_url: 'https://trygethome.online/?payment=complete',
-        customer: { email: customer_email, name: customer_name || customer_email },
-        customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
-      }),
+      body: JSON.stringify(flwPayload),
     });
     const initData = await initRes.json();
     if (initData.status !== 'success') {
