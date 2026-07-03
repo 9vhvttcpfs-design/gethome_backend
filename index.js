@@ -1024,6 +1024,12 @@ app.post('/api/staff/login', async (req, res) => {
     const token = require('crypto').randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
+    // Delete all previous sessions for this staff member before creating a new one
+    await serviceClient.from('staff_sessions')
+      .delete()
+      .eq('staff_id', staff.id);
+    console.log('Cleared old sessions for:', staffId);
+
     await serviceClient.from('staff_sessions').insert([{
       staff_id: staff.id,
       staff_role: role,
