@@ -3124,14 +3124,15 @@ https://trygethome.online`
     const { data: saEarning } = await adminClient.from('sa_earnings')
       .select('commission_amount').eq('sa_id', sa_id).eq('month_year', month_year).single();
 
-    await adminClient.from('notifications').insert([{
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'SA',
       recipient_id: sa_id,
       type: 'commission_paid',
       title: 'Commission Payment Received',
       message: 'Your commission of NGN ' + (parseFloat(saEarning?.commission_amount || 0)).toLocaleString() + ' for ' + month_year + ' has been paid by admin.',
       is_read: false,
-    }]).catch(e => console.error('SA payment notification failed:', e.message));
+    }]);
+    if (notifErr) console.error('SA payment notification failed (non-blocking):', notifErr.message);
 
     res.json({ success: true, message: 'SA commission marked as paid' });
   } catch (err) {
@@ -3183,14 +3184,15 @@ https://trygethome.online`
     const { data: ghaEarning } = await adminClient.from('gha_earnings')
       .select('commission_amount').eq('gha_id', gha_id).eq('month_year', month_year).single();
 
-    await adminClient.from('notifications').insert([{
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'GHA',
       recipient_id: gha_id,
       type: 'commission_paid',
       title: 'Commission Payment Received',
       message: 'Your commission of NGN ' + (parseFloat(ghaEarning?.commission_amount || 0)).toLocaleString() + ' for ' + month_year + ' has been paid by admin.',
       is_read: false,
-    }]).catch(e => console.error('GHA payment notification failed:', e.message));
+    }]);
+    if (notifErr) console.error('GHA payment notification failed (non-blocking):', notifErr.message);
 
     res.json({ success: true, message: 'GHA commission marked as paid' });
   } catch (err) {
@@ -5329,10 +5331,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           console.log('Agent subscription updated:', agentId, tier, subscriptionEnd);
 
           // Also sync to agents table
-          await adminClient.from('agents').update({
+          const { error: agentSyncErr } = await adminClient.from('agents').update({
             subscription_tier: tier,
             subscription_end: subscriptionEnd,
-          }).eq('id', agentId).catch(e => console.error('Agents table sync failed:', e.message));
+          }).eq('id', agentId);
+          if (agentSyncErr) console.error('Agents table sync failed (non-blocking):', agentSyncErr.message);
 
           // Get agent's GHA and SA for earnings calculation
           const { data: agentProfile } = await adminClient
@@ -5361,14 +5364,15 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             else console.log('GHA earnings created:', agentProfile.gha_id, 'commission:', ghaCommission);
 
             // Notify GHA
-            await adminClient.from('notifications').insert([{
+            const { error: ghaNotifErr } = await adminClient.from('notifications').insert([{
               recipient_type: 'GHA',
               recipient_id: agentProfile.gha_id,
               type: 'subscription_payment',
               title: 'Agent Subscription Payment',
               message: 'Agent ' + (agentProfile.full_name || agentProfile.email) + ' subscribed to ' + tier + ' plan. Your commission: NGN ' + ghaCommission.toLocaleString(),
               is_read: false,
-            }]).catch(e => console.error('GHA notification failed:', e.message));
+            }]);
+            if (ghaNotifErr) console.error('GHA notification failed (non-blocking):', ghaNotifErr.message);
           }
 
           // Create SA earnings row (5% commission)
@@ -5389,14 +5393,15 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             else console.log('SA earnings created:', agentProfile.sa_id, 'commission:', saCommission);
 
             // Notify SA
-            await adminClient.from('notifications').insert([{
+            const { error: saNotifErr } = await adminClient.from('notifications').insert([{
               recipient_type: 'SA',
               recipient_id: agentProfile.sa_id,
               type: 'subscription_payment',
               title: 'Agent Subscription Payment',
               message: 'Agent ' + (agentProfile.full_name || agentProfile.email) + ' subscribed to ' + tier + ' plan. Your commission: NGN ' + saCommission.toLocaleString(),
               is_read: false,
-            }]).catch(e => console.error('SA notification failed:', e.message));
+            }]);
+            if (saNotifErr) console.error('SA notification failed (non-blocking):', saNotifErr.message);
           }
         }
       }
