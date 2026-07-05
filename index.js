@@ -2438,13 +2438,26 @@ app.get('/api/sa/earnings', async (req, res) => {
       .eq('sa_id', session.staff_id)
       .eq('month_year', month);
 
+    // Enrich with GHA names
+    const enrichedBreakdown = await Promise.all((ghaBreakdown || []).map(async function(row) {
+      const { data: gha } = await adminClient
+        .from('gha_agents')
+        .select('gha_code, full_name')
+        .eq('id', row.gha_id)
+        .maybeSingle();
+      return Object.assign({}, row, {
+        gha_code: gha?.gha_code || 'Unknown',
+        gha_name: gha?.full_name || 'Unknown',
+      });
+    }));
+
     res.json({
       month,
       earnings: earningsList,
       total_commission: totalCommission,
       is_paid: isPaid,
       paid_at: paidAt,
-      gha_breakdown: ghaBreakdown || [],
+      gha_breakdown: enrichedBreakdown,
     });
   } catch (err) {
     console.error('SA earnings exception:', err.message);
