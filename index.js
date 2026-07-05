@@ -2363,30 +2363,91 @@ https://trygethome.online`
 });
 
 // GET /api/gha/earnings
-app.get('/api/gha/earnings', verifyStaffToken, async (req, res) => {
+app.get('/api/gha/earnings', async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
-    const ghaId = req.staffSession.staff_id;
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
 
-    const { data: earnings, error } = await serviceClient
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    const { data: earnings, error } = await adminClient
       .from('gha_earnings')
       .select('*')
-      .eq('gha_id', ghaId)
-      .order('month_year', { ascending: false });
-    if (error) throw error;
+      .eq('gha_id', session.staff_id)
+      .eq('month_year', month)
+      .order('created_at', { ascending: false });
 
-    const total = (earnings || []).reduce(function(sum, e) {
-      return sum + (parseFloat(e.amount) || 0);
-    }, 0);
+    if (error) {
+      console.error('GHA earnings error:', error.message);
+      return res.json({ earnings: [], total_commission: 0, is_paid: false });
+    }
+
+    const earningsList = earnings || [];
+    const totalCommission = earningsList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    const isPaid = earningsList.length > 0 && earningsList.every(e => e.is_paid === true);
+    const paidAt = isPaid ? earningsList[0]?.paid_at : null;
 
     res.json({
-      earnings: earnings || [],
-      total_earned: total,
-      total_paid: (earnings || []).filter(function(e) { return e.is_paid; }).reduce(function(sum, e) { return sum + (parseFloat(e.amount) || 0); }, 0),
-      total_pending: (earnings || []).filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) { return sum + (parseFloat(e.amount) || 0); }, 0),
+      month,
+      earnings: earningsList,
+      total_commission: totalCommission,
+      is_paid: isPaid,
+      paid_at: paidAt,
     });
   } catch (err) {
-    console.error('GHA earnings error:', err.message);
+    console.error('GHA earnings exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/earnings
+app.get('/api/sa/earnings', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    const { data: earnings, error } = await adminClient
+      .from('sa_earnings')
+      .select('*')
+      .eq('sa_id', session.staff_id)
+      .eq('month_year', month)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('SA earnings error:', error.message);
+      return res.json({ earnings: [], total_commission: 0, is_paid: false });
+    }
+
+    const earningsList = earnings || [];
+    const totalCommission = earningsList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    const isPaid = earningsList.length > 0 && earningsList.every(e => e.is_paid === true);
+    const paidAt = isPaid ? earningsList[0]?.paid_at : null;
+
+    // Also get GHA breakdown for this SA
+    const { data: ghaBreakdown } = await adminClient
+      .from('sa_earnings')
+      .select('gha_id, commission_amount, is_paid, month_year')
+      .eq('sa_id', session.staff_id)
+      .eq('month_year', month);
+
+    res.json({
+      month,
+      earnings: earningsList,
+      total_commission: totalCommission,
+      is_paid: isPaid,
+      paid_at: paidAt,
+      gha_breakdown: ghaBreakdown || [],
+    });
+  } catch (err) {
+    console.error('SA earnings exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
