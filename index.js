@@ -3163,11 +3163,14 @@ app.post('/api/admin/mark-sa-paid', async (req, res) => {
     const { sa_id, month_year } = req.body;
     if (!sa_id || !month_year) return res.status(400).json({ error: 'sa_id and month_year are required' });
 
-    const { error } = await serviceClient
+    const { error, count } = await serviceClient
       .from('sa_earnings')
       .update({ is_paid: true, paid_at: new Date().toISOString(), paid_by: admin.id })
       .eq('sa_id', sa_id)
-      .eq('month_year', month_year);
+      .eq('month_year', month_year)
+      .select();
+
+    console.log('SA mark-paid update result - error:', JSON.stringify(error), '| rows returned:', count, '| sa_id sent:', sa_id, '| month_year sent:', month_year);
     if (error) throw error;
 
     const { data: sa } = await serviceClient
