@@ -5867,6 +5867,130 @@ app.post('/api/admin/staff-kpis', async (req, res) => {
   }
 });
 
+// POST /api/rate-gha - customer submits a rating after inspection
+app.post('/api/rate-gha', async (req, res) => {
+  try {
+    const {
+      inspection_id, gha_id, customer_email, customer_name,
+      rating, review_text, categories
+    } = req.body;
+
+    if (!gha_id || !rating) {
+      return res.status(400).json({ error: 'gha_id and rating are required' });
+    }
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    }
+
+    // Prevent duplicate ratings for same inspection
+    if (inspection_id) {
+      const { data: existing } = await adminClient
+        .from('gha_ratings')
+        .select('id')
+        .eq('inspection_id', inspection_id)
+        .eq('customer_email', customer_email || '')
+        .maybeSingle();
+      if (existing) {
+        return res.status(400).json({ error: 'You have already rated this inspection' });
+      }
+    }
+
+    const { data, error } = await adminClient.from('gha_ratings').insert([{
+      gha_id,
+      inspection_id: inspection_id || null,
+      customer_email: customer_email || null,
+      customer_name: customer_name || null,
+      rating: parseFloat(rating),
+      review_text: review_text || null,
+      rating_categories: categories || {},
+      is_verified: !!inspection_id,
+    }]).select().single();
+
+    if (error) {
+      console.error('Rating insert error:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+
+    // Notify GHA of new rating
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
+      recipient_type: 'GHA',
+      recipient_id: gha_id,
+      type: 'new_rating',
+      title: 'New Customer Rating',
+      message: 'A customer rated your inspection ' + rating + '/5' + (review_text ? ': "' + review_text.substring(0, 80) + '"' : ''),
+      is_read: false,
+    }]);
+    if (notifErr) console.error('Rating notification failed (non-blocking):', notifErr.message);
+
+    console.log('New GHA rating submitted:', gha_id, rating);
+    res.json({ success: true, rating: data });
+  } catch (err) {
+    console.error('Rate GHA exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gha-ratings/:ghaId - get all ratings for a specific GHA
+app.get('/api/gha-ratings/:ghaId', async (req, res) => {
+  try {
+    const { ghaId } = req.params;
+    const { data: ratings, error } = await adminClient
+      .from('gha_ratings')
+      .select('*')
+      .eq('gha_id', ghaId)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    const ratingsList = ratings || [];
+    const average = ratingsList.length > 0
+      ? Math.round((ratingsList.reduce((sum, r) => sum + r.rating, 0) / ratingsList.length) * 10) / 10
+      : 0;
+
+    const distribution = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+    ratingsList.forEach(function(r) {
+      var star = Math.round(r.rating);
+      if (distribution[star] !== undefined) distribution[star]++;
+    });
+
+    res.json({
+      gha_id: ghaId,
+      average_rating: average,
+      total_ratings: ratingsList.length,
+      distribution,
+      ratings: ratingsList,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/all-ratings - admin sees all ratings across all GHAs
+app.get('/api/admin/all-ratings', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: ratings } = await adminClient
+      .from('gha_ratings')
+      .select('*, gha_agents(gha_code, full_name, average_rating, total_ratings)')
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    const { data: ghas } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, average_rating, total_ratings')
+      .order('average_rating', { ascending: false });
+
+    res.json({
+      ratings: ratings || [],
+      gha_leaderboard: ghas || [],
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
