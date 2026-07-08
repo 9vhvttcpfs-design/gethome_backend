@@ -5750,6 +5750,123 @@ app.get('/api/admin/all-payments', async (req, res) => {
   }
 });
 
+// GET /api/admin/staff-kpis - fetch all staff KPIs for a month
+app.get('/api/admin/staff-kpis', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    // Fetch existing KPI records for this month
+    const { data: kpis } = await adminClient
+      .from('staff_kpis')
+      .select('*')
+      .eq('month_year', month)
+      .order('staff_type')
+      .order('staff_code');
+
+    // Fetch all SAs
+    const { data: sas } = await adminClient
+      .from('service_agents')
+      .select('id, sa_code, full_name, status');
+
+    // Fetch all GHAs
+    const { data: ghas } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, status');
+
+    // Merge staff lists with their KPI data
+    const saList = (sas || []).map(function(sa) {
+      var kpi = (kpis || []).find(function(k) { return k.staff_id === sa.id; }) || {};
+      return Object.assign({}, sa, {
+        staff_type: 'SA',
+        staff_code: sa.sa_code,
+        staff_name: sa.full_name,
+        kpi_id: kpi.id || null,
+        attendance_score: kpi.attendance_score || null,
+        csat_score: kpi.csat_score || null,
+        inspection_fidelity_score: kpi.inspection_fidelity_score || null,
+        onboarding_milestones_score: kpi.onboarding_milestones_score || null,
+        response_time_score: kpi.response_time_score || null,
+        management_notes: kpi.management_notes || '',
+        overall_score: kpi.overall_score || null,
+        updated_at: kpi.updated_at || null,
+      });
+    });
+
+    const ghaList = (ghas || []).map(function(gha) {
+      var kpi = (kpis || []).find(function(k) { return k.staff_id === gha.id; }) || {};
+      return Object.assign({}, gha, {
+        staff_type: 'GHA',
+        staff_code: gha.gha_code,
+        staff_name: gha.full_name,
+        kpi_id: kpi.id || null,
+        attendance_score: kpi.attendance_score || null,
+        csat_score: kpi.csat_score || null,
+        inspection_fidelity_score: kpi.inspection_fidelity_score || null,
+        onboarding_milestones_score: kpi.onboarding_milestones_score || null,
+        response_time_score: kpi.response_time_score || null,
+        management_notes: kpi.management_notes || '',
+        overall_score: kpi.overall_score || null,
+        updated_at: kpi.updated_at || null,
+      });
+    });
+
+    res.json({ month, sa_kpis: saList, gha_kpis: ghaList });
+  } catch (err) {
+    console.error('Staff KPIs fetch error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/staff-kpis - save or update KPI scores for a staff member
+app.post('/api/admin/staff-kpis', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const {
+      staff_id, staff_type, staff_code, staff_name, month_year,
+      attendance_score, csat_score, inspection_fidelity_score,
+      onboarding_milestones_score, response_time_score, management_notes
+    } = req.body;
+
+    if (!staff_id || !month_year || !staff_type) {
+      return res.status(400).json({ error: 'staff_id, staff_type and month_year are required' });
+    }
+
+    const { data, error } = await adminClient
+      .from('staff_kpis')
+      .upsert([{
+        staff_id,
+        staff_type,
+        staff_code,
+        staff_name,
+        month_year,
+        attendance_score: attendance_score !== '' ? parseFloat(attendance_score) : null,
+        csat_score: csat_score !== '' ? parseFloat(csat_score) : null,
+        inspection_fidelity_score: inspection_fidelity_score !== '' ? parseFloat(inspection_fidelity_score) : null,
+        onboarding_milestones_score: onboarding_milestones_score !== '' ? parseFloat(onboarding_milestones_score) : null,
+        response_time_score: response_time_score !== '' ? parseFloat(response_time_score) : null,
+        management_notes: management_notes || null,
+        updated_at: new Date().toISOString(),
+      }], { onConflict: 'staff_id,month_year' })
+      .select();
+
+    if (error) {
+      console.error('Staff KPI save error:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+
+    console.log('Staff KPI saved for:', staff_code, month_year);
+    res.json({ success: true, kpi: data?.[0] });
+  } catch (err) {
+    console.error('Staff KPI save exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
