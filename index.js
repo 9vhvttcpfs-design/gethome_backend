@@ -5991,6 +5991,40 @@ app.get('/api/admin/all-ratings', async (req, res) => {
   }
 });
 
+app.post('/api/admin/calculate-kpis', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const month = req.body.month || new Date().toISOString().slice(0, 7);
+    const { data, error } = await adminClient.rpc('calculate_staff_kpis', { target_month: month });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/staff-targets', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { staff_type, month_year, inspections_target, response_time_target_hours, agent_verifications_target, csat_target, agent_approvals_target, territory_revenue_target } = req.body;
+    const { data, error } = await adminClient.from('staff_monthly_targets').upsert([{
+      staff_type, month_year,
+      inspections_target: parseInt(inspections_target) || 10,
+      response_time_target_hours: parseFloat(response_time_target_hours) || 48,
+      agent_verifications_target: parseInt(agent_verifications_target) || 5,
+      csat_target: parseFloat(csat_target) || 4.7,
+      agent_approvals_target: parseInt(agent_approvals_target) || 20,
+      territory_revenue_target: parseFloat(territory_revenue_target) || 0,
+    }], { onConflict: 'staff_type,month_year' }).select();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, targets: data?.[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
