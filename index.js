@@ -376,11 +376,12 @@ app.get('/api/admin/agents', async (req, res) => {
     if (!callerProfile || callerProfile.role !== 'admin') {
       return res.status(403).json({ error: 'Admin access required. Your role: ' + (callerProfile?.role || 'unknown') });
     }
-    // Fetch ALL agents - use adminClient to bypass RLS
+    // Fetch pending agents only - use adminClient to bypass RLS
     const { data: agents, error } = await adminClient
       .from('profiles')
       .select('id, role, status, is_unlimited, created_at, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, kyc_documents, bank_name, account_number, account_name, subscription_tier, subscription_start, subscription_end, subscription_status')
       .eq('role', 'agent')
+      .not('status', 'in', '(approved,rejected)')
       .order('created_at', { ascending: false });
     if (error) {
       console.error('Profiles fetch error:', error.message);
@@ -419,6 +420,24 @@ app.get('/api/admin/agents', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.get('/api/admin/approved-agents', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { data, error } = await adminClient
+      .from('profiles')
+      .select('*')
+      .eq('role', 'agent')
+      .eq('status', 'approved')
+      .order('updated_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/admin/verified-pending-agents', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '').trim();
@@ -524,6 +543,20 @@ app.post('/api/admin/disapprove-agent', async (req, res) => {
     res.json({ success: true, message: 'Agent disapproved. They can no longer upload listings.' });
   } catch (err) {
     console.error('Disapprove agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+app.post('/api/admin/revoke-agent', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { agent_id } = req.body;
+    if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
+    const { error } = await adminClient.from('profiles')
+      .update({ status: 'pending_sa_review' }).eq('id', agent_id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -1406,17 +1439,19 @@ app.post('/api/sa/approve-agent', async (req, res) => {
       return res.status(403).json({ error: 'This agent is assigned to a different SA and cannot be approved by you.' });
     }
 
-    if (agent.gha_id && agent.gha_verified === false) {
-      return res.status(400).json({ error: 'GHA has not yet confirmed this agent. Please wait for GHA verification before approving.' });
+    if (agent.gha_id && agent.gha_verified !== true) {
+      return res.status(400).json({
+        error: 'Please wait for your GHA to confirm this agent before approving.',
+        gha_verified: agent.gha_verified,
+      });
     }
 
-    // Stamp sa_id so the agent is linked to the approving SA
-    const updatePayload = { status: 'approved' };
-    if (!agent.sa_id) updatePayload.sa_id = saId;
-
-    const { error: updateErr } = await adminClient.from('profiles')
-      .update(updatePayload).eq('id', agent_id);
+    const { error: updateErr } = await adminClient
+      .from('profiles')
+      .update({ status: 'approved', sa_id: session.staff_id })
+      .eq('id', agent_id);
     if (updateErr) return res.status(500).json({ error: updateErr.message });
+    console.log('Agent approved:', agent_id, '| previous status:', agent.status, '| new status: approved');
 
     try {
       await sendCustomerEmail(
@@ -5291,7 +5326,7 @@ app.post('/api/admin/assign-agent-gha', adminForceAssignHandler);
 // ──────────────────────────────────────────────────────────
 app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
   try {
-    const { amount, customer_email, customer_name, purpose, property_id, payment_method } = req.body;
+    const { amount, customer_email, customer_name, purpose, property_id } = req.body;
     if (!amount || !customer_email) return res.status(400).json({ error: 'amount and customer_email are required' });
 
     const reference = 'GH-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
@@ -5304,9 +5339,6 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
       customer: { email: customer_email, name: customer_name || customer_email },
       customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
     };
-    if (payment_method === 'card') {
-      flwPayload.payment_options = 'card';
-    }
     flwPayload.meta = req.body.meta || {};
 
     const initRes = await fetch('https://api.flutterwave.com/v3/payments', {
