@@ -1553,10 +1553,11 @@ app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
         gha_id: resolvedGhaId,
         sa_id: saId,
         gha_code: gha.gha_code,
-        status: 'pending_gha_inspection',
+        status: 'approved',
       })
       .eq('id', agent_id);
     if (updateErr) throw updateErr;
+    console.log('Agent auto-approved on GHA assignment:', agent_id);
 
     // Notification is best-effort only - must never block the primary action
     try {
@@ -1837,7 +1838,7 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
         gha_id: ghaRecord.id,
         sa_id: ghaRecord.sa_id,
         gha_code: ghaRecord.gha_code,
-        status: 'pending_gha_inspection',
+        status: 'approved',
       })
       .eq('id', agentProfile.id)
       .select();
@@ -1855,6 +1856,7 @@ app.post('/api/sa/assign-agent-to-gha', async (req, res) => {
     }
 
     console.log('Agent', agentProfile.email, 'assigned to GHA', ghaRecord.gha_code, 'successfully');
+    console.log('Agent auto-approved on GHA assignment:', agentProfile.id);
 
     const updatedProfile = updated[0];
     try {
@@ -3720,7 +3722,7 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
         gha_id: gha_id,
         sa_id: gha.sa_id,
         gha_code: gha.gha_code,
-        status: 'pending_gha_inspection',
+        status: 'approved',
       })
       .eq('id', agent_id)
       .select();
@@ -3738,6 +3740,7 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
     }
 
     console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
+    console.log('Agent auto-approved on GHA assignment:', agent_id);
 
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code, updated_agent: updated[0] });
   } catch (err) {
@@ -4000,6 +4003,7 @@ app.get('/api/sa/notifications', async (req, res) => {
       .select('*')
       .eq('recipient_type', 'SA')
       .eq('recipient_id', saId)
+      .eq('dismissed_by_sa', false)
       .order('created_at', { ascending: false })
       .limit(50);
 
@@ -5274,7 +5278,7 @@ const adminForceAssignHandler = async (req, res) => {
         gha_id: gha_id,
         sa_id: gha.sa_id,
         gha_code: gha.gha_code,
-        status: 'pending_gha_inspection',
+        status: 'approved',
       })
       .eq('id', agent_id)
       .select();
@@ -5292,6 +5296,7 @@ const adminForceAssignHandler = async (req, res) => {
     }
 
     console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
+    console.log('Agent auto-approved on GHA assignment:', agent_id);
 
     try {
       const { error: notifError } = await adminClient
@@ -6054,6 +6059,33 @@ app.post('/api/admin/staff-targets', async (req, res) => {
     }], { onConflict: 'staff_type,month_year' }).select();
     if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true, targets: data?.[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/sa/dismiss-notification', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const { notification_id } = req.body;
+    if (!notification_id) return res.status(400).json({ error: 'notification_id is required' });
+
+    const { error } = await adminClient.from('notifications')
+      .update({
+        dismissed_by_sa: true,
+        dismissed_at: new Date().toISOString(),
+        is_read: true,
+      })
+      .eq('id', notification_id)
+      .eq('recipient_id', session.staff_id);
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
