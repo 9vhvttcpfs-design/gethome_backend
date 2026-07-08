@@ -1439,19 +1439,21 @@ app.post('/api/sa/approve-agent', async (req, res) => {
       return res.status(403).json({ error: 'This agent is assigned to a different SA and cannot be approved by you.' });
     }
 
-    if (agent.gha_id && agent.gha_verified !== true) {
+    if (agent.gha_id && agent.gha_verified === false) {
       return res.status(400).json({
-        error: 'Please wait for your GHA to confirm this agent before approving.',
-        gha_verified: agent.gha_verified,
+        error: 'This agent has been flagged by their GHA. Please review before approving.',
       });
     }
 
     const { error: updateErr } = await adminClient
       .from('profiles')
-      .update({ status: 'approved', sa_id: session.staff_id })
+      .update({
+        status: 'approved',
+        sa_id: session.staff_id,
+      })
       .eq('id', agent_id);
     if (updateErr) return res.status(500).json({ error: updateErr.message });
-    console.log('Agent approved:', agent_id, '| previous status:', agent.status, '| new status: approved');
+    console.log('Agent approved successfully:', agent_id, '| by SA:', session.staff_id);
 
     try {
       await sendCustomerEmail(
