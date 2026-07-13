@@ -3946,28 +3946,29 @@ https://trygethome.online`
 // GET /api/property-sa/:propertyId
 app.get('/api/property-sa/:propertyId', async (req, res) => {
   try {
-    const { propertyId } = req.params;
-    const { data: property } = await serviceClient
-      .from('properties').select('created_by').eq('id', propertyId).single();
-    if (!property?.created_by) return res.json({ fallback: true });
+    const propertyId = parseInt(req.params.propertyId);
+    if (!propertyId) return res.json({});
 
-    const { data: profile } = await serviceClient
-      .from('profiles').select('sa_id').eq('id', property.created_by).single();
-    if (!profile?.sa_id) return res.json({ fallback: true });
+    const { data: result } = await adminClient.rpc('get_property_sa_whatsapp', {
+      property_id_input: propertyId
+    });
 
-    const { data: sa } = await serviceClient
-      .from('service_agents').select('full_name, email, sa_code, whatsapp, phone').eq('id', profile.sa_id).single();
-    if (!sa) return res.json({ fallback: true });
+    if (!result || result.length === 0) {
+      console.log('No SA found for property:', propertyId);
+      return res.json({ fallback: true });
+    }
 
+    const sa = result[0];
     res.json({
-      sa_name: sa.full_name || null,
-      sa_email: sa.email || null,
-      sa_code: sa.sa_code || null,
-      sa_whatsapp: sa.whatsapp || sa.phone || null,
-      fallback: false,
+      sa_id: sa.sa_id,
+      sa_name: sa.sa_name,
+      sa_whatsapp: sa.sa_whatsapp,
+      sa_email: sa.sa_email,
+      sa_code: sa.sa_code,
+      matched_city: sa.matched_city,
     });
   } catch (err) {
-    console.error('property-sa error:', err.message);
+    console.error('Property SA lookup error:', err.message);
     res.json({ fallback: true });
   }
 });
@@ -4191,6 +4192,39 @@ app.get('/api/sa/profile', verifyStaffToken, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('sa/profile error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/my-locations
+app.get('/api/sa/my-locations', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const { data: locations } = await adminClient
+      .from('sa_locations')
+      .select('city, state, is_active')
+      .eq('sa_id', session.staff_id)
+      .eq('is_active', true)
+      .order('city');
+
+    const { data: ghaAssignments } = await adminClient
+      .from('gha_location_assignments')
+      .select('city, is_primary, gha_agents(gha_code, full_name)')
+      .eq('sa_id', session.staff_id)
+      .eq('is_active', true)
+      .order('city');
+
+    res.json({
+      cities: (locations || []).map(function(l) { return l.city; }),
+      locations: locations || [],
+      gha_assignments: ghaAssignments || [],
+    });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -6086,6 +6120,116 @@ app.post('/api/sa/dismiss-notification', async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/sa-locations - get all SA locations for admin management
+app.get('/api/admin/sa-locations', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: sas } = await adminClient
+      .from('service_agents')
+      .select('id, sa_code, full_name, status')
+      .order('sa_code');
+
+    const { data: locations } = await adminClient
+      .from('sa_locations')
+      .select('*')
+      .order('city');
+
+    const { data: ghaAssignments } = await adminClient
+      .from('gha_location_assignments')
+      .select('*, gha_agents(gha_code, full_name)')
+      .order('city');
+
+    const enrichedSas = (sas || []).map(function(sa) {
+      return Object.assign({}, sa, {
+        locations: (locations || []).filter(function(l) { return l.sa_id === sa.id && l.is_active; }),
+        gha_assignments: (ghaAssignments || []).filter(function(g) { return g.sa_id === sa.id && g.is_active; }),
+      });
+    });
+
+    res.json(enrichedSas);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/sa-add-location - admin adds a city to an SA
+app.post('/api/admin/sa-add-location', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { sa_id, city, state } = req.body;
+    if (!sa_id || !city) return res.status(400).json({ error: 'sa_id and city are required' });
+
+    const { data, error } = await adminClient.from('sa_locations').upsert([{
+      sa_id,
+      city: city.trim(),
+      state: state ? state.trim() : null,
+      is_active: true,
+    }], { onConflict: 'sa_id,city' }).select().single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    console.log('Location added to SA:', sa_id, city);
+    res.json({ success: true, location: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/sa-remove-location - admin removes a city from an SA
+app.post('/api/admin/sa-remove-location', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { sa_id, city } = req.body;
+    if (!sa_id || !city) return res.status(400).json({ error: 'sa_id and city are required' });
+
+    const { error } = await adminClient.from('sa_locations')
+      .update({ is_active: false })
+      .eq('sa_id', sa_id)
+      .eq('city', city.trim());
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ success: true, message: city + ' removed from SA coverage' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/gha-assign-location - assign a GHA to cover a specific city
+app.post('/api/admin/gha-assign-location', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { gha_id, sa_id, city, is_primary } = req.body;
+    if (!gha_id || !sa_id || !city) return res.status(400).json({ error: 'gha_id, sa_id and city are required' });
+
+    // Verify GHA belongs to this SA
+    const { data: gha } = await adminClient.from('gha_agents').select('id, gha_code').eq('id', gha_id).eq('sa_id', sa_id).single();
+    if (!gha) return res.status(400).json({ error: 'This GHA does not belong to this SA' });
+
+    const { data, error } = await adminClient.from('gha_location_assignments').upsert([{
+      gha_id,
+      sa_id,
+      city: city.trim(),
+      is_primary: !!is_primary,
+      is_active: true,
+    }], { onConflict: 'gha_id,city' }).select().single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ success: true, assignment: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
