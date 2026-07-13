@@ -6235,6 +6235,78 @@ app.post('/api/admin/gha-assign-location', async (req, res) => {
   }
 });
 
+app.get('/api/admin/gha-inspection-payments', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+
+    const { data: ghas } = await adminClient.from('gha_agents')
+      .select('id, gha_code, full_name, sa_id, service_agents(sa_code, full_name)');
+
+    const results = await Promise.all((ghas || []).map(async function(gha) {
+      const { data: inspections } = await adminClient
+        .from('inspections')
+        .select('id, status, gha_done_at, customer_name, property_address')
+        .eq('gha_id', gha.id)
+        .in('status', ['done', 'confirmed'])
+        .not('gha_done_at', 'is', null)
+        .gte('gha_done_at', month + '-01')
+        .lt('gha_done_at', new Date(new Date(month + '-01').setMonth(new Date(month + '-01').getMonth() + 1)).toISOString().slice(0, 10));
+
+      const count = (inspections || []).length;
+
+      // Tiered payment calculation
+      var payment = 0;
+      var breakdown = [];
+      if (count >= 1) {
+        var tier1 = Math.min(count, 10);
+        payment += tier1 * 1200;
+        breakdown.push({ tier: '1-10', count: tier1, rate: 1200, subtotal: tier1 * 1200 });
+      }
+      if (count >= 11) {
+        var tier2 = Math.min(count - 10, 10);
+        payment += tier2 * 1500;
+        breakdown.push({ tier: '11-20', count: tier2, rate: 1500, subtotal: tier2 * 1500 });
+      }
+      if (count >= 21) {
+        var tier3 = count - 20;
+        payment += tier3 * 1700;
+        breakdown.push({ tier: '21+', count: tier3, rate: 1700, subtotal: tier3 * 1700 });
+      }
+
+      return {
+        gha_id: gha.id,
+        gha_code: gha.gha_code,
+        gha_name: gha.full_name,
+        sa_code: gha.service_agents?.sa_code || null,
+        sa_name: gha.service_agents?.full_name || null,
+        month_year: month,
+        total_inspections: count,
+        payment_breakdown: breakdown,
+        total_payment: payment,
+        inspections: inspections || [],
+      };
+    }));
+
+    // Sort by total inspections descending
+    results.sort(function(a, b) { return b.total_inspections - a.total_inspections; });
+
+    const grandTotal = results.reduce(function(sum, r) { return sum + r.total_payment; }, 0);
+
+    res.json({
+      month,
+      gha_payments: results,
+      grand_total: grandTotal,
+      total_inspections: results.reduce(function(sum, r) { return sum + r.total_inspections; }, 0),
+    });
+  } catch (err) {
+    console.error('GHA inspection payments error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
