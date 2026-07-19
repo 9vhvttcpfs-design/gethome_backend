@@ -6307,6 +6307,513 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
   }
 });
 
+// GET /api/admin/staff-payments - calculate and return all staff payment totals
+app.get('/api/admin/staff-payments', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const monthStart = month + '-01';
+    const monthEnd = new Date(new Date(monthStart).setMonth(new Date(monthStart).getMonth() + 1)).toISOString().slice(0, 10);
+
+    // ── GHA PAYMENTS ────────────────────────────────
+    const { data: ghas } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, email, sa_id, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
+
+    const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
+      // Count completed inspections this month
+      const { count: inspCount } = await adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .in('status', ['done', 'confirmed'])
+        .not('gha_done_at', 'is', null)
+        .gte('gha_done_at', monthStart)
+        .lt('gha_done_at', monthEnd);
+
+      const count = inspCount || 0;
+
+      // Tiered inspection payment
+      var inspPayment = 0;
+      var breakdown = [];
+      if (count >= 1) {
+        var t1 = Math.min(count, 10);
+        inspPayment += t1 * 1200;
+        breakdown.push({ tier: '1-10', count: t1, rate: 1200, subtotal: t1 * 1200 });
+      }
+      if (count >= 11) {
+        var t2 = Math.min(count - 10, 10);
+        inspPayment += t2 * 1500;
+        breakdown.push({ tier: '11-20', count: t2, rate: 1500, subtotal: t2 * 1500 });
+      }
+      if (count >= 21) {
+        var t3 = count - 20;
+        inspPayment += t3 * 1700;
+        breakdown.push({ tier: '21+', count: t3, rate: 1700, subtotal: t3 * 1700 });
+      }
+
+      // Commission from subscriptions
+      const { data: earnings } = await adminClient
+        .from('gha_earnings')
+        .select('commission_amount, is_paid')
+        .eq('gha_id', gha.id)
+        .eq('month_year', month);
+
+      const commissionTotal = (earnings || []).reduce(function(sum, e) {
+        return sum + (parseFloat(e.commission_amount) || 0);
+      }, 0);
+
+      const totalPayment = inspPayment + commissionTotal;
+
+      // Check existing payment record
+      const { data: existingPayment } = await adminClient
+        .from('staff_payments')
+        .select('*')
+        .eq('staff_id', gha.id)
+        .eq('month_year', month)
+        .maybeSingle();
+
+      // Upsert payment record
+      await adminClient.from('staff_payments').upsert([{
+        staff_id: gha.id,
+        staff_type: 'GHA',
+        staff_code: gha.gha_code,
+        staff_name: gha.full_name,
+        staff_email: gha.email,
+        month_year: month,
+        inspection_count: count,
+        inspection_payment: inspPayment,
+        commission_amount: commissionTotal,
+        total_payment: totalPayment,
+        payment_status: existingPayment?.payment_status || 'unpaid',
+        updated_at: new Date().toISOString(),
+      }], { onConflict: 'staff_id,month_year' });
+
+      return {
+        staff_id: gha.id,
+        staff_type: 'GHA',
+        gha_code: gha.gha_code,
+        gha_name: gha.full_name,
+        staff_email: gha.email,
+        sa_code: gha.service_agents?.sa_code || null,
+        sa_name: gha.service_agents?.full_name || null,
+        bank_name: gha.bank_name || null,
+        account_number: gha.account_number || null,
+        account_name: gha.account_name || null,
+        bank_code: gha.bank_code || null,
+        inspection_count: count,
+        inspection_payment: inspPayment,
+        inspection_breakdown: breakdown,
+        commission_amount: commissionTotal,
+        total_payment: totalPayment,
+        payment_status: existingPayment?.payment_status || 'unpaid',
+        paid_at: existingPayment?.paid_at || null,
+        flutterwave_reference: existingPayment?.flutterwave_reference || null,
+      };
+    }));
+
+    // ── SA PAYMENTS ─────────────────────────────────
+    const { data: sas } = await adminClient
+      .from('service_agents')
+      .select('id, sa_code, full_name, email, bank_name, account_number, account_name, bank_code');
+
+    const saPayments = await Promise.all((sas || []).map(async function(sa) {
+      // SA commission from subscriptions
+      const { data: saEarnings } = await adminClient
+        .from('sa_earnings')
+        .select('commission_amount, is_paid')
+        .eq('sa_id', sa.id)
+        .eq('month_year', month);
+
+      const commissionTotal = (saEarnings || []).reduce(function(sum, e) {
+        return sum + (parseFloat(e.commission_amount) || 0);
+      }, 0);
+
+      // SA inspection oversight bonus (optional: ₦500 per confirmed inspection under them)
+      const { count: confirmedCount } = await adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('assigned_by_sa', sa.id)
+        .eq('status', 'confirmed')
+        .gte('created_at', monthStart)
+        .lt('created_at', monthEnd);
+
+      const totalPayment = commissionTotal;
+
+      const { data: existingPayment } = await adminClient
+        .from('staff_payments')
+        .select('*')
+        .eq('staff_id', sa.id)
+        .eq('month_year', month)
+        .maybeSingle();
+
+      await adminClient.from('staff_payments').upsert([{
+        staff_id: sa.id,
+        staff_type: 'SA',
+        staff_code: sa.sa_code,
+        staff_name: sa.full_name,
+        staff_email: sa.email,
+        month_year: month,
+        inspection_count: confirmedCount || 0,
+        inspection_payment: 0,
+        commission_amount: commissionTotal,
+        total_payment: totalPayment,
+        payment_status: existingPayment?.payment_status || 'unpaid',
+        updated_at: new Date().toISOString(),
+      }], { onConflict: 'staff_id,month_year' });
+
+      return {
+        staff_id: sa.id,
+        staff_type: 'SA',
+        sa_code: sa.sa_code,
+        sa_name: sa.full_name,
+        staff_email: sa.email,
+        bank_name: sa.bank_name || null,
+        account_number: sa.account_number || null,
+        account_name: sa.account_name || null,
+        bank_code: sa.bank_code || null,
+        inspections_overseen: confirmedCount || 0,
+        commission_amount: commissionTotal,
+        total_payment: totalPayment,
+        payment_status: existingPayment?.payment_status || 'unpaid',
+        paid_at: existingPayment?.paid_at || null,
+        flutterwave_reference: existingPayment?.flutterwave_reference || null,
+      };
+    }));
+
+    const ghaGrandTotal = ghaPayments.reduce(function(sum, g) { return sum + g.total_payment; }, 0);
+    const saGrandTotal = saPayments.reduce(function(sum, s) { return sum + s.total_payment; }, 0);
+
+    res.json({
+      month,
+      gha_payments: ghaPayments.sort(function(a, b) { return b.total_payment - a.total_payment; }),
+      sa_payments: saPayments.sort(function(a, b) { return b.total_payment - a.total_payment; }),
+      totals: {
+        gha_total: ghaGrandTotal,
+        sa_total: saGrandTotal,
+        grand_total: ghaGrandTotal + saGrandTotal,
+        unpaid_count: [...ghaPayments, ...saPayments].filter(function(p) { return p.payment_status === 'unpaid' && p.total_payment > 0; }).length,
+      }
+    });
+  } catch (err) {
+    console.error('Staff payments error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/pay-staff-flutterwave - initiate Flutterwave payment to staff
+app.post('/api/admin/pay-staff-flutterwave', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { staff_id, staff_type, month_year, total_payment, staff_email, staff_name, staff_code } = req.body;
+    if (!staff_id || !total_payment || !staff_email) {
+      return res.status(400).json({ error: 'staff_id, total_payment and staff_email are required' });
+    }
+
+    const reference = 'GHSTAFF-' + staff_code + '-' + month_year.replace('-', '') + '-' + Date.now();
+
+    // Initialize Flutterwave transfer/payment
+    const flwRes = await fetch('https://api.flutterwave.com/v3/payments', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        tx_ref: reference,
+        amount: parseFloat(total_payment),
+        currency: 'NGN',
+        redirect_url: 'https://trygethome.online/?staff_payment=complete',
+        customer: {
+          email: staff_email,
+          name: staff_name || staff_code,
+        },
+        customizations: {
+          title: 'GetHome Staff Payment',
+          description: staff_type + ' ' + staff_code + ' payment for ' + month_year,
+        },
+        meta: {
+          payment_type: 'staff_payment',
+          staff_id: staff_id,
+          staff_type: staff_type,
+          month_year: month_year,
+        },
+      }),
+    });
+
+    const flwData = await flwRes.json();
+    if (flwData.status !== 'success') {
+      console.error('Flutterwave staff payment init failed:', JSON.stringify(flwData));
+      return res.status(500).json({ error: 'Payment initialization failed: ' + (flwData.message || 'Unknown error') });
+    }
+
+    // Update payment record to processing
+    await adminClient.from('staff_payments').update({
+      payment_status: 'processing',
+      flutterwave_reference: reference,
+      updated_at: new Date().toISOString(),
+    }).eq('staff_id', staff_id).eq('month_year', month_year);
+
+    res.json({
+      success: true,
+      checkout_url: flwData.data.link,
+      reference: reference,
+    });
+  } catch (err) {
+    console.error('Staff payment init error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/mark-staff-paid - manually mark staff payment as paid
+app.post('/api/admin/mark-staff-paid', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { staff_id, month_year, payment_notes } = req.body;
+    if (!staff_id || !month_year) return res.status(400).json({ error: 'staff_id and month_year are required' });
+
+    const { data: payment } = await adminClient.from('staff_payments')
+      .select('*').eq('staff_id', staff_id).eq('month_year', month_year).single();
+    if (!payment) return res.status(404).json({ error: 'Payment record not found' });
+
+    const { error: updateErr } = await adminClient.from('staff_payments').update({
+      payment_status: 'paid',
+      paid_at: new Date().toISOString(),
+      paid_by: admin.id,
+      payment_notes: payment_notes || null,
+      updated_at: new Date().toISOString(),
+    }).eq('staff_id', staff_id).eq('month_year', month_year);
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    // Notify staff member
+    const { error: notifErr } = await adminClient.from('notifications').insert([{
+      recipient_type: payment.staff_type,
+      recipient_id: staff_id,
+      type: 'payment_received',
+      title: 'Payment Received',
+      message: 'Your payment of NGN ' + parseFloat(payment.total_payment).toLocaleString() + ' for ' + month_year + ' has been processed. Thank you for your service!',
+      is_read: false,
+    }]);
+    if (notifErr) console.error('Staff payment notification failed:', notifErr.message);
+
+    res.json({ success: true, message: 'Payment marked as paid successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/update-bank-details - SA updates their bank account
+app.post('/api/sa/update-bank-details', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const { bank_name, account_number, account_name, bank_code } = req.body;
+    if (!bank_name || !account_number || !account_name) {
+      return res.status(400).json({ error: 'bank_name, account_number and account_name are required' });
+    }
+    if (account_number.length < 10 || account_number.length > 10) {
+      return res.status(400).json({ error: 'Account number must be exactly 10 digits' });
+    }
+
+    const { data, error } = await adminClient.from('service_agents')
+      .update({
+        bank_name: bank_name.trim(),
+        account_number: account_number.trim(),
+        account_name: account_name.trim(),
+        bank_code: bank_code || null,
+      })
+      .eq('id', session.staff_id)
+      .select('id, sa_code, full_name, bank_name, account_number, account_name')
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    console.log('SA bank details updated:', session.staff_id);
+    res.json({ success: true, message: 'Bank details updated successfully', data });
+  } catch (err) {
+    console.error('SA bank update error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/update-bank-details - GHA updates their bank account
+app.post('/api/gha/update-bank-details', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { bank_name, account_number, account_name, bank_code } = req.body;
+    if (!bank_name || !account_number || !account_name) {
+      return res.status(400).json({ error: 'bank_name, account_number and account_name are required' });
+    }
+    if (account_number.length !== 10) {
+      return res.status(400).json({ error: 'Account number must be exactly 10 digits' });
+    }
+
+    const { data, error } = await adminClient.from('gha_agents')
+      .update({
+        bank_name: bank_name.trim(),
+        account_number: account_number.trim(),
+        account_name: account_name.trim(),
+        bank_code: bank_code || null,
+      })
+      .eq('id', session.staff_id)
+      .select('id, gha_code, full_name, bank_name, account_number, account_name')
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    console.log('GHA bank details updated:', session.staff_id);
+    res.json({ success: true, message: 'Bank details updated successfully', data });
+  } catch (err) {
+    console.error('GHA bank update error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/verify-bank-account - verify bank account via Flutterwave before paying
+app.post('/api/admin/verify-bank-account', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { account_number, bank_code } = req.body;
+    if (!account_number || !bank_code) {
+      return res.status(400).json({ error: 'account_number and bank_code are required' });
+    }
+
+    const flwRes = await fetch('https://api.flutterwave.com/v3/accounts/resolve', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ account_number, account_bank: bank_code }),
+    });
+
+    const flwData = await flwRes.json();
+    if (flwData.status !== 'success') {
+      return res.status(400).json({ error: 'Could not verify account: ' + (flwData.message || 'Invalid account details') });
+    }
+
+    res.json({
+      success: true,
+      account_name: flwData.data.account_name,
+      account_number: flwData.data.account_number,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/pay-staff-transfer - pay staff via Flutterwave bank transfer
+app.post('/api/admin/pay-staff-transfer', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { staff_id, staff_type, month_year } = req.body;
+    if (!staff_id || !staff_type || !month_year) {
+      return res.status(400).json({ error: 'staff_id, staff_type and month_year are required' });
+    }
+
+    const table = staff_type === 'SA' ? 'service_agents' : 'gha_agents';
+    const { data: staff } = await adminClient.from(table)
+      .select('id, full_name, email, bank_name, account_number, account_name, bank_code')
+      .eq('id', staff_id).single();
+
+    if (!staff) return res.status(404).json({ error: 'Staff member not found' });
+    if (!staff.account_number || !staff.bank_code) {
+      return res.status(400).json({
+        error: staff.full_name + ' has not added their bank account details yet. Please ask them to update their profile first.',
+      });
+    }
+
+    const { data: payment } = await adminClient.from('staff_payments')
+      .select('*').eq('staff_id', staff_id).eq('month_year', month_year).single();
+    if (!payment) return res.status(404).json({ error: 'No payment record found for this month' });
+    if (payment.total_payment <= 0) return res.status(400).json({ error: 'Payment amount is zero — nothing to pay' });
+    if (payment.payment_status === 'paid') return res.status(400).json({ error: 'This payment has already been processed' });
+
+    const reference = 'GHSTAFF-' + (staff_type === 'SA' ? 'SA' : 'GHA') + '-' + month_year.replace('-', '') + '-' + Date.now();
+
+    // Initiate Flutterwave transfer
+    const transferRes = await fetch('https://api.flutterwave.com/v3/transfers', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        account_bank: staff.bank_code,
+        account_number: staff.account_number,
+        amount: parseFloat(payment.total_payment),
+        narration: 'GetHome ' + staff_type + ' payment ' + month_year,
+        currency: 'NGN',
+        reference: reference,
+        beneficiary_name: staff.account_name || staff.full_name,
+        meta: {
+          sender: 'GetHome',
+          sender_country: 'NG',
+          mobile_number: '',
+        },
+      }),
+    });
+
+    const transferData = await transferRes.json();
+    console.log('Flutterwave transfer response:', JSON.stringify(transferData));
+
+    if (transferData.status !== 'success') {
+      return res.status(500).json({
+        error: 'Transfer failed: ' + (transferData.message || 'Unknown Flutterwave error'),
+        details: transferData,
+      });
+    }
+
+    // Mark as processing
+    await adminClient.from('staff_payments').update({
+      payment_status: 'processing',
+      flutterwave_reference: reference,
+      flutterwave_tx_id: transferData.data?.id?.toString() || null,
+      updated_at: new Date().toISOString(),
+    }).eq('staff_id', staff_id).eq('month_year', month_year);
+
+    // Notify staff
+    await adminClient.from('notifications').insert([{
+      recipient_type: staff_type,
+      recipient_id: staff_id,
+      type: 'payment_processing',
+      title: 'Payment Processing',
+      message: 'Your payment of NGN ' + parseFloat(payment.total_payment).toLocaleString() + ' for ' + month_year + ' is being processed to your ' + staff.bank_name + ' account ending ' + staff.account_number.slice(-4) + '.',
+      is_read: false,
+    }]).catch(e => console.error('Payment notification failed:', e.message));
+
+    res.json({
+      success: true,
+      message: 'Transfer initiated successfully to ' + staff.bank_name + ' ' + staff.account_number,
+      reference: reference,
+      transfer_id: transferData.data?.id,
+    });
+  } catch (err) {
+    console.error('Staff transfer error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
