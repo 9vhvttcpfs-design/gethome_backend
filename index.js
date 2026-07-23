@@ -3565,6 +3565,30 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
       .eq('id', inspection_id);
     if (error) throw error;
 
+    // After successfully updating the inspection send detailed message to SA
+    const { data: inspDetails } = await adminClient.from('inspections')
+      .select('*, gha_agents(gha_code, full_name)').eq('id', inspection_id).single();
+
+    if (inspDetails?.assigned_by_sa) {
+      await adminClient.from('staff_messages').insert([{
+        sender_type: 'GHA',
+        sender_id: req.staffSession.staff_id,
+        sender_name: inspDetails.gha_agents?.full_name,
+        sender_code: inspDetails.gha_agents?.gha_code,
+        recipient_type: 'SA',
+        recipient_id: inspDetails.assigned_by_sa,
+        subject: 'Inspection Complete: ' + (inspDetails.property_address || 'Property'),
+        message: 'Inspection completed for customer ' + (inspDetails.customer_name || 'N/A') +
+          '\n\nProperty: ' + (inspDetails.property_address || 'N/A') +
+          '\nCustomer Email: ' + (inspDetails.customer_email || 'N/A') +
+          '\nCustomer Phone: ' + (inspDetails.customer_phone || 'N/A') +
+          '\nInspection Date: ' + new Date(inspDetails.gha_done_at || Date.now()).toLocaleString() +
+          '\n\nGHA Notes:\n' + notes,
+        message_type: 'inspection_note',
+        related_inspection_id: inspection_id,
+      }]).catch(e => console.error('Inspection message failed:', e.message));
+    }
+
     // Notify SA that inspection is done
     try {
       const { error: notifSaErr } = await adminClient.from('notifications').insert([{
@@ -4863,6 +4887,36 @@ app.post('/api/properties', async (req, res) => {
       console.error('uploadProperty insert error:', error.message, error.code, error.details, error.hint);
       throw error;
     }
+
+    // Notify the agent's SA about the new listing
+    if (agentId) {
+      try {
+        const { data: agentProfile } = await adminClient.from('profiles')
+          .select('sa_id, full_name, email, gha_id, gha_code').eq('id', agentId).single();
+
+        if (agentProfile?.sa_id) {
+          const messageText = 'Agent ' + (agentProfile.full_name || agentProfile.email) +
+            ' has posted a new listing: ' + title +
+            '\nLocation: ' + location +
+            '\nPrice: NGN ' + parseFloat(price || 0).toLocaleString() +
+            '\n\nPlease instruct the assigned GHA (' + (agentProfile.gha_code || 'GHA') + ') to verify this property.';
+
+          await adminClient.from('staff_messages').insert([{
+            sender_type: 'ADMIN',
+            sender_id: agentProfile.sa_id,
+            sender_name: 'System',
+            sender_code: 'SYSTEM',
+            recipient_type: 'SA',
+            recipient_id: agentProfile.sa_id,
+            subject: 'New Listing: ' + title,
+            message: messageText,
+            message_type: 'new_listing_alert',
+            related_property_id: data[0].id,
+          }]).catch(e => console.error('New listing SA alert failed:', e.message));
+        }
+      } catch (e) { console.error('New listing SA alert lookup failed:', e.message); }
+    }
+
     res.status(201).json(data[0]);
   } catch (err) {
     console.error('uploadProperty unexpected error:', err);
@@ -6251,6 +6305,7 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
         .select('id, status, gha_done_at, customer_name, property_address')
         .eq('gha_id', gha.id)
         .in('status', ['done', 'confirmed'])
+        .eq('inspection_type', 'customer')
         .not('gha_done_at', 'is', null)
         .gte('gha_done_at', month + '-01')
         .lt('gha_done_at', new Date(new Date(month + '-01').setMonth(new Date(month + '-01').getMonth() + 1)).toISOString().slice(0, 10));
@@ -6329,6 +6384,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         .select('id', { count: 'exact', head: true })
         .eq('gha_id', gha.id)
         .in('status', ['done', 'confirmed'])
+        .eq('inspection_type', 'customer')
         .not('gha_done_at', 'is', null)
         .gte('gha_done_at', monthStart)
         .lt('gha_done_at', monthEnd);
@@ -6810,6 +6866,226 @@ app.post('/api/admin/pay-staff-transfer', async (req, res) => {
     });
   } catch (err) {
     console.error('Staff transfer error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/staff/messages - fetch inbox for SA or GHA
+app.get('/api/staff/messages', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: messages } = await adminClient
+      .from('staff_messages')
+      .select('*')
+      .eq('recipient_type', session.staff_role)
+      .eq('recipient_id', session.staff_id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    const unread = (messages || []).filter(function(m) { return !m.is_read; }).length;
+    res.json({ messages: messages || [], unread_count: unread });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/staff/sent-messages - fetch sent messages
+app.get('/api/staff/sent-messages', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: messages } = await adminClient
+      .from('staff_messages')
+      .select('*')
+      .eq('sender_type', session.staff_role)
+      .eq('sender_id', session.staff_id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    res.json({ messages: messages || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/staff/send-message - send a message
+app.post('/api/staff/send-message', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { recipient_type, recipient_id, subject, message, message_type, related_inspection_id, related_property_id } = req.body;
+    if (!recipient_type || !recipient_id || !message) {
+      return res.status(400).json({ error: 'recipient_type, recipient_id and message are required' });
+    }
+
+    // Get sender details
+    const senderTable = session.staff_role === 'SA' ? 'service_agents' : 'gha_agents';
+    const senderCode = session.staff_role === 'SA' ? 'sa_code' : 'gha_code';
+    const { data: sender } = await adminClient.from(senderTable)
+      .select('full_name, ' + senderCode).eq('id', session.staff_id).single();
+
+    // Get recipient details
+    let recipientName = null;
+    let recipientCode = null;
+    if (recipient_type === 'SA') {
+      const { data: rec } = await adminClient.from('service_agents')
+        .select('full_name, sa_code').eq('id', recipient_id).single();
+      recipientName = rec?.full_name;
+      recipientCode = rec?.sa_code;
+    } else if (recipient_type === 'GHA') {
+      const { data: rec } = await adminClient.from('gha_agents')
+        .select('full_name, gha_code').eq('id', recipient_id).single();
+      recipientName = rec?.full_name;
+      recipientCode = rec?.gha_code;
+    } else if (recipient_type === 'ADMIN') {
+      recipientName = 'Admin';
+      recipientCode = 'ADMIN';
+    }
+
+    const { data: newMessage, error: insertErr } = await adminClient
+      .from('staff_messages')
+      .insert([{
+        sender_type: session.staff_role,
+        sender_id: session.staff_id,
+        sender_name: sender?.full_name,
+        sender_code: sender?.[senderCode],
+        recipient_type,
+        recipient_id,
+        recipient_name: recipientName,
+        recipient_code: recipientCode,
+        subject: subject || null,
+        message: message.trim(),
+        message_type: message_type || 'general',
+        related_inspection_id: related_inspection_id || null,
+        related_property_id: related_property_id || null,
+      }])
+      .select().single();
+
+    if (insertErr) return res.status(500).json({ error: insertErr.message });
+
+    // Also insert a notification so recipient sees it immediately
+    await adminClient.from('notifications').insert([{
+      recipient_type,
+      recipient_id,
+      type: 'new_message',
+      title: 'New Message from ' + (sender?.[senderCode] || session.staff_role),
+      message: (subject ? subject + ': ' : '') + message.trim().substring(0, 100),
+      is_read: false,
+    }]).catch(e => console.error('Message notification failed:', e.message));
+
+    res.json({ success: true, message: newMessage });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/staff/mark-message-read
+app.post('/api/staff/mark-message-read', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { message_id } = req.body;
+    if (message_id) {
+      await adminClient.from('staff_messages').update({ is_read: true, read_at: new Date().toISOString() })
+        .eq('id', message_id).eq('recipient_id', session.staff_id);
+    } else {
+      await adminClient.from('staff_messages').update({ is_read: true, read_at: new Date().toISOString() })
+        .eq('recipient_type', session.staff_role).eq('recipient_id', session.staff_id).eq('is_read', false);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/send-message - admin sends message to SA or GHA
+app.post('/api/admin/send-message', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { recipient_type, recipient_id, subject, message, message_type, related_inspection_id, related_property_id } = req.body;
+    if (!recipient_type || !recipient_id || !message) {
+      return res.status(400).json({ error: 'recipient_type, recipient_id and message are required' });
+    }
+
+    const { data: newMessage, error: insertErr } = await adminClient
+      .from('staff_messages')
+      .insert([{
+        sender_type: 'ADMIN',
+        sender_id: admin.id,
+        sender_name: 'Admin',
+        sender_code: 'ADMIN',
+        recipient_type,
+        recipient_id,
+        subject: subject || null,
+        message: message.trim(),
+        message_type: message_type || 'general',
+        related_inspection_id: related_inspection_id || null,
+        related_property_id: related_property_id || null,
+      }])
+      .select().single();
+
+    if (insertErr) return res.status(500).json({ error: insertErr.message });
+
+    await adminClient.from('notifications').insert([{
+      recipient_type,
+      recipient_id,
+      type: 'new_message',
+      title: 'New Message from Admin',
+      message: (subject ? subject + ': ' : '') + message.trim().substring(0, 100),
+      is_read: false,
+    }]).catch(e => console.error('Admin message notification failed:', e.message));
+
+    res.json({ success: true, message: newMessage });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/messages - admin views all messages
+app.get('/api/admin/messages', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: inbox } = await adminClient
+      .from('staff_messages')
+      .select('*')
+      .eq('recipient_type', 'ADMIN')
+      .order('created_at', { ascending: false })
+      .limit(100);
+
+    const { data: sent } = await adminClient
+      .from('staff_messages')
+      .select('*')
+      .eq('sender_type', 'ADMIN')
+      .order('created_at', { ascending: false })
+      .limit(100);
+
+    res.json({
+      inbox: inbox || [],
+      sent: sent || [],
+      unread_count: (inbox || []).filter(function(m) { return !m.is_read; }).length,
+    });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
