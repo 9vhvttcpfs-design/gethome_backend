@@ -7103,14 +7103,41 @@ app.get('/api/sa/my-listings', async (req, res) => {
       .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    // Get all agents under this SA
-    const { data: agents } = await adminClient
+    // Approach 1: agents directly assigned to this SA
+    const { data: directAgents } = await adminClient
       .from('profiles')
       .select('id, full_name, email, gha_id, gha_code')
       .eq('sa_id', session.staff_id)
       .eq('role', 'agent');
 
-    if (!agents || agents.length === 0) return res.json([]);
+    // Approach 2: agents under GHAs that belong to this SA
+    const { data: saGhas } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code')
+      .eq('sa_id', session.staff_id);
+
+    const ghaIds = (saGhas || []).map(function(g) { return g.id; });
+
+    let ghaAgents = [];
+    if (ghaIds.length > 0) {
+      const { data: agentsViaGha } = await adminClient
+        .from('profiles')
+        .select('id, full_name, email, gha_id, gha_code')
+        .in('gha_id', ghaIds)
+        .eq('role', 'agent');
+      ghaAgents = agentsViaGha || [];
+    }
+
+    // Merge and deduplicate by agent id
+    const agentMap = {};
+    [...(directAgents || []), ...ghaAgents].forEach(function(a) {
+      agentMap[a.id] = a;
+    });
+    const agents = Object.values(agentMap);
+
+    console.log('SA', session.staff_id, 'total agents for listings:', agents.length);
+
+    if (agents.length === 0) return res.json([]);
 
     const agentIds = agents.map(function(a) { return a.id; });
 
@@ -7123,17 +7150,15 @@ app.get('/api/sa/my-listings', async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Enrich with agent details
-    const agentMap = {};
-    agents.forEach(function(a) { agentMap[a.id] = a; });
-
+    // Enrich each listing with its agent's details and GHA info
     const enriched = (listings || []).map(function(listing) {
       const agent = agentMap[listing.created_by] || {};
+      const gha = (saGhas || []).find(function(g) { return g.id === agent.gha_id; }) || {};
       return Object.assign({}, listing, {
         agent_name: agent.full_name || 'Unknown',
         agent_email: agent.email || null,
         agent_gha_id: agent.gha_id || null,
-        agent_gha_code: agent.gha_code || null,
+        agent_gha_code: agent.gha_code || gha.gha_code || null,
       });
     });
 
@@ -7141,6 +7166,27 @@ app.get('/api/sa/my-listings', async (req, res) => {
     res.json(enriched);
   } catch (err) {
     console.error('SA listings error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/sa/peer-sas', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const { data: sas } = await adminClient
+      .from('service_agents')
+      .select('id, sa_code, full_name')
+      .neq('id', session.staff_id)
+      .eq('status', 'active')
+      .order('sa_code');
+
+    res.json(sas || []);
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
