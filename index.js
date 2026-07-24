@@ -7138,12 +7138,17 @@ app.get('/api/admin/messages', async (req, res) => {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { data: inbox } = await adminClient
+    console.log('Admin messages endpoint hit - admin id:', admin?.id);
+
+    const { data: inbox, error: inboxErr } = await adminClient
       .from('staff_messages')
       .select('*')
       .eq('recipient_type', 'ADMIN')
       .order('created_at', { ascending: false })
       .limit(100);
+
+    console.log('Admin inbox query result - count:', (inbox || []).length, '| error:', inboxErr?.message);
+    console.log('Raw inbox data:', JSON.stringify(inbox?.slice(0, 2)));
 
     const { data: sent } = await adminClient
       .from('staff_messages')
