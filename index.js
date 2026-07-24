@@ -7225,7 +7225,7 @@ app.get('/api/sa/my-listings', async (req, res) => {
 
       const { data: listings, error } = await adminClient
         .from('properties')
-        .select('id, title, location, price, images, status, created_at, created_by, property_type, gha_verified, gha_verified_by, gha_verified_at, verification_notes')
+        .select('id, title, rent, price, location, image_urls, created_at, created_by, property_type, deposit_status, gha_verified, gha_verified_by, gha_verified_at, verification_notes, agency_fee, agreement_fee, caution_fee')
         .in('created_by', agentIds)
         .order('created_at', { ascending: false });
 
@@ -7241,6 +7241,8 @@ app.get('/api/sa/my-listings', async (req, res) => {
           agent_email: agent.email || null,
           agent_gha_id: agent.gha_id || null,
           agent_gha_code: agent.gha_code || gha.gha_code || null,
+          display_price: listing.rent || listing.price || 0,
+          display_image: (listing.image_urls && listing.image_urls[0]) || null,
         });
       });
 
