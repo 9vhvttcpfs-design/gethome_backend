@@ -7218,35 +7218,38 @@ app.get('/api/sa/my-listings', async (req, res) => {
     const agentIds = agents.map(function(a) { return a.id; });
 
     console.log('Total unique agents:', agents.length, '| agent ids:', agentIds);
-    console.log('SA', session.staff_id, 'total agents for listings:', agents.length);
 
-    if (agents.length === 0) return res.json([]);
+    try {
+      const agentIds = agents.map(function(a) { return a.id; });
+      console.log('Fetching listings for', agentIds.length, 'agents');
 
-    // Get all listings by these agents
-    const { data: listings, error } = await adminClient
-      .from('properties')
-      .select('id, title, location, price, images, status, created_at, created_by, property_type')
-      .in('created_by', agentIds)
-      .order('created_at', { ascending: false });
+      const { data: listings, error } = await adminClient
+        .from('properties')
+        .select('id, title, location, price, images, status, created_at, created_by, property_type, gha_verified, gha_verified_by, gha_verified_at, verification_notes')
+        .in('created_by', agentIds)
+        .order('created_at', { ascending: false });
 
-    if (error) return res.status(500).json({ error: error.message });
+      console.log('Properties query done - count:', (listings || []).length, '| error:', error?.message);
 
-    console.log('Listings found:', (listings || []).length);
+      if (error) return res.status(500).json({ error: 'Properties query failed: ' + error.message });
 
-    // Enrich each listing with its agent's details and GHA info
-    const enriched = (listings || []).map(function(listing) {
-      const agent = agentMap[listing.created_by] || {};
-      const gha = (saGhas || []).find(function(g) { return g.id === agent.gha_id; }) || {};
-      return Object.assign({}, listing, {
-        agent_name: agent.full_name || 'Unknown',
-        agent_email: agent.email || null,
-        agent_gha_id: agent.gha_id || null,
-        agent_gha_code: agent.gha_code || gha.gha_code || null,
+      const enriched = (listings || []).map(function(listing) {
+        const agent = agentMap[listing.created_by] || {};
+        const gha = (saGhas || []).find(function(g) { return g.id === agent.gha_id; }) || {};
+        return Object.assign({}, listing, {
+          agent_name: agent.full_name || 'Unknown',
+          agent_email: agent.email || null,
+          agent_gha_id: agent.gha_id || null,
+          agent_gha_code: agent.gha_code || gha.gha_code || null,
+        });
       });
-    });
 
-    console.log('SA', session.staff_id, 'listings count:', enriched.length);
-    res.json(enriched);
+      console.log('Enrichment done - final count:', enriched.length);
+      res.json(enriched);
+    } catch (innerErr) {
+      console.error('SA listings INNER ERROR:', innerErr.message, innerErr.stack);
+      res.status(500).json({ error: innerErr.message });
+    }
   } catch (err) {
     console.error('SA listings error:', err.message);
     res.status(500).json({ error: err.message });
@@ -7334,6 +7337,49 @@ app.post('/api/gha/verify-listing', async (req, res) => {
     res.json({ success: true, message: 'Property verified successfully', property: updated });
   } catch (err) {
     console.error('Verify listing error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/mark-message-read
+app.post('/api/admin/mark-message-read', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { message_id } = req.body;
+    if (message_id) {
+      await adminClient.from('staff_messages')
+        .update({ is_read: true, read_at: new Date().toISOString() })
+        .eq('id', message_id)
+        .eq('recipient_type', 'ADMIN');
+    } else {
+      await adminClient.from('staff_messages')
+        .update({ is_read: true, read_at: new Date().toISOString() })
+        .eq('recipient_type', 'ADMIN')
+        .eq('is_read', false);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/sent-messages
+app.get('/api/admin/sent-messages', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: sent } = await adminClient
+      .from('staff_messages')
+      .select('*')
+      .eq('sender_type', 'ADMIN')
+      .order('created_at', { ascending: false })
+      .limit(100);
+
+    res.json({ sent: sent || [] });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
