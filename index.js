@@ -7028,11 +7028,11 @@ app.post('/api/staff/send-message', async (req, res) => {
     const { data: newMessage, error: insertErr } = await adminClient
       .from('staff_messages')
       .insert([{
-        sender_type: session.staff_role,
+        sender_type: session.staff_role.toUpperCase(),
         sender_id: session.staff_id,
         sender_name: sender?.full_name,
         sender_code: sender?.[senderCode],
-        recipient_type,
+        recipient_type: (recipient_type || '').toUpperCase(),
         recipient_id: finalRecipientId,
         recipient_name: recipientName,
         recipient_code: recipientCode,
@@ -7104,7 +7104,7 @@ app.post('/api/admin/send-message', async (req, res) => {
         sender_id: admin.id,
         sender_name: 'Admin',
         sender_code: 'ADMIN',
-        recipient_type,
+        recipient_type: (recipient_type || '').toUpperCase(),
         recipient_id,
         subject: subject || null,
         message: message.trim(),
