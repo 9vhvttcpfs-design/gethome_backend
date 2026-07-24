@@ -6297,6 +6297,8 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
     const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const monthStart = month + '-01';
+    const monthEnd = new Date(new Date(monthStart).setMonth(new Date(monthStart).getMonth() + 1)).toISOString().slice(0, 10);
 
     const { data: ghas } = await adminClient.from('gha_agents')
       .select('id, gha_code, full_name, sa_id, service_agents(sa_code, full_name)');
@@ -6304,15 +6306,44 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
     const results = await Promise.all((ghas || []).map(async function(gha) {
       const { data: inspections } = await adminClient
         .from('inspections')
-        .select('id, status, gha_done_at, customer_name, property_address')
+        .select('id, status, gha_done_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
-        .in('status', ['done', 'confirmed'])
         .eq('inspection_type', 'customer')
+        .in('status', ['done', 'confirmed'])
         .not('gha_done_at', 'is', null)
-        .gte('gha_done_at', month + '-01')
-        .lt('gha_done_at', new Date(new Date(month + '-01').setMonth(new Date(month + '-01').getMonth() + 1)).toISOString().slice(0, 10));
+        .gte('gha_done_at', monthStart)
+        .lt('gha_done_at', monthEnd);
 
-      const count = (inspections || []).length;
+      // For each inspection, get the property title if property_id exists
+      const enrichedInspections = await Promise.all((inspections || []).map(async function(insp) {
+        var propertyTitle = insp.property_address || 'N/A';
+        if (insp.property_id) {
+          const { data: prop } = await adminClient
+            .from('properties')
+            .select('title, location, created_by')
+            .eq('id', insp.property_id)
+            .maybeSingle();
+          if (prop) {
+            propertyTitle = prop.title || insp.property_address || 'N/A';
+            // Get the agent's GHA
+            if (prop.created_by) {
+              const { data: agentProfile } = await adminClient
+                .from('profiles')
+                .select('gha_id, gha_code')
+                .eq('id', prop.created_by)
+                .maybeSingle();
+              insp.agent_gha_id = agentProfile?.gha_id || null;
+              insp.agent_gha_code = agentProfile?.gha_code || null;
+            }
+          }
+        }
+        return Object.assign({}, insp, {
+          property_title: propertyTitle,
+          customer_display: insp.customer_email || insp.customer_name || 'Unknown Customer',
+        });
+      }));
+
+      const count = enrichedInspections.length;
 
       // Tiered payment calculation
       var payment = 0;
@@ -6343,7 +6374,7 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
         total_inspections: count,
         payment_breakdown: breakdown,
         total_payment: payment,
-        inspections: inspections || [],
+        inspections: enrichedInspections,
       };
     }));
 
@@ -6380,18 +6411,47 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       .select('id, gha_code, full_name, email, sa_id, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
 
     const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
-      // Count completed inspections this month
-      const { count: inspCount } = await adminClient
+      // Get completed inspections this month
+      const { data: inspections } = await adminClient
         .from('inspections')
-        .select('id', { count: 'exact', head: true })
+        .select('id, status, gha_done_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
-        .in('status', ['done', 'confirmed'])
         .eq('inspection_type', 'customer')
+        .in('status', ['done', 'confirmed'])
         .not('gha_done_at', 'is', null)
         .gte('gha_done_at', monthStart)
         .lt('gha_done_at', monthEnd);
 
-      const count = inspCount || 0;
+      // For each inspection, get the property title if property_id exists
+      const enrichedInspections = await Promise.all((inspections || []).map(async function(insp) {
+        var propertyTitle = insp.property_address || 'N/A';
+        if (insp.property_id) {
+          const { data: prop } = await adminClient
+            .from('properties')
+            .select('title, location, created_by')
+            .eq('id', insp.property_id)
+            .maybeSingle();
+          if (prop) {
+            propertyTitle = prop.title || insp.property_address || 'N/A';
+            // Get the agent's GHA
+            if (prop.created_by) {
+              const { data: agentProfile } = await adminClient
+                .from('profiles')
+                .select('gha_id, gha_code')
+                .eq('id', prop.created_by)
+                .maybeSingle();
+              insp.agent_gha_id = agentProfile?.gha_id || null;
+              insp.agent_gha_code = agentProfile?.gha_code || null;
+            }
+          }
+        }
+        return Object.assign({}, insp, {
+          property_title: propertyTitle,
+          customer_display: insp.customer_email || insp.customer_name || 'Unknown Customer',
+        });
+      }));
+
+      const count = enrichedInspections.length;
 
       // Tiered inspection payment
       var inspPayment = 0;
@@ -6464,6 +6524,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         inspection_count: count,
         inspection_payment: inspPayment,
         inspection_breakdown: breakdown,
+        inspections: enrichedInspections,
         commission_amount: commissionTotal,
         total_payment: totalPayment,
         payment_status: existingPayment?.payment_status || 'unpaid',
@@ -6958,6 +7019,12 @@ app.post('/api/staff/send-message', async (req, res) => {
       recipientCode = 'ADMIN';
     }
 
+    // When sending to ADMIN use a fixed known value instead of a placeholder UUID
+    var finalRecipientId = recipient_id;
+    if (recipient_type === 'ADMIN') {
+      finalRecipientId = 'admin';
+    }
+
     const { data: newMessage, error: insertErr } = await adminClient
       .from('staff_messages')
       .insert([{
@@ -6966,7 +7033,7 @@ app.post('/api/staff/send-message', async (req, res) => {
         sender_name: sender?.full_name,
         sender_code: sender?.[senderCode],
         recipient_type,
-        recipient_id,
+        recipient_id: finalRecipientId,
         recipient_name: recipientName,
         recipient_code: recipientCode,
         subject: subject || null,
@@ -6982,7 +7049,7 @@ app.post('/api/staff/send-message', async (req, res) => {
     // Also insert a notification so recipient sees it immediately
     const { error: msgNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type,
-      recipient_id,
+      recipient_id: finalRecipientId,
       type: 'new_message',
       title: 'New Message from ' + (sender?.[senderCode] || session.staff_role),
       message: (subject ? subject + ': ' : '') + message.trim().substring(0, 100),
@@ -7103,12 +7170,16 @@ app.get('/api/sa/my-listings', async (req, res) => {
       .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
+    console.log('SA listings request - staff_id:', session.staff_id);
+
     // Approach 1: agents directly assigned to this SA
     const { data: directAgents } = await adminClient
       .from('profiles')
       .select('id, full_name, email, gha_id, gha_code')
       .eq('sa_id', session.staff_id)
       .eq('role', 'agent');
+
+    console.log('Direct agents (sa_id match):', (directAgents || []).length);
 
     // Approach 2: agents under GHAs that belong to this SA
     const { data: saGhas } = await adminClient
@@ -7117,6 +7188,8 @@ app.get('/api/sa/my-listings', async (req, res) => {
       .eq('sa_id', session.staff_id);
 
     const ghaIds = (saGhas || []).map(function(g) { return g.id; });
+
+    console.log('GHAs under this SA:', (saGhas || []).length, '| GHA ids:', ghaIds);
 
     let ghaAgents = [];
     if (ghaIds.length > 0) {
@@ -7128,6 +7201,8 @@ app.get('/api/sa/my-listings', async (req, res) => {
       ghaAgents = agentsViaGha || [];
     }
 
+    console.log('Agents via GHA:', ghaAgents.length);
+
     // Merge and deduplicate by agent id
     const agentMap = {};
     [...(directAgents || []), ...ghaAgents].forEach(function(a) {
@@ -7135,11 +7210,12 @@ app.get('/api/sa/my-listings', async (req, res) => {
     });
     const agents = Object.values(agentMap);
 
+    const agentIds = agents.map(function(a) { return a.id; });
+
+    console.log('Total unique agents:', agents.length, '| agent ids:', agentIds);
     console.log('SA', session.staff_id, 'total agents for listings:', agents.length);
 
     if (agents.length === 0) return res.json([]);
-
-    const agentIds = agents.map(function(a) { return a.id; });
 
     // Get all listings by these agents
     const { data: listings, error } = await adminClient
@@ -7149,6 +7225,8 @@ app.get('/api/sa/my-listings', async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) return res.status(500).json({ error: error.message });
+
+    console.log('Listings found:', (listings || []).length);
 
     // Enrich each listing with its agent's details and GHA info
     const enriched = (listings || []).map(function(listing) {
