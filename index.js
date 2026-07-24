@@ -3570,7 +3570,7 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
       .select('*, gha_agents(gha_code, full_name)').eq('id', inspection_id).single();
 
     if (inspDetails?.assigned_by_sa) {
-      await adminClient.from('staff_messages').insert([{
+      const { error: inspMsgErr } = await adminClient.from('staff_messages').insert([{
         sender_type: 'GHA',
         sender_id: req.staffSession.staff_id,
         sender_name: inspDetails.gha_agents?.full_name,
@@ -3586,7 +3586,8 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
           '\n\nGHA Notes:\n' + notes,
         message_type: 'inspection_note',
         related_inspection_id: inspection_id,
-      }]).catch(e => console.error('Inspection message failed:', e.message));
+      }]);
+      if (inspMsgErr) console.error('Inspection message failed:', inspMsgErr.message);
     }
 
     // Notify SA that inspection is done
@@ -4901,7 +4902,7 @@ app.post('/api/properties', async (req, res) => {
             '\nPrice: NGN ' + parseFloat(price || 0).toLocaleString() +
             '\n\nPlease instruct the assigned GHA (' + (agentProfile.gha_code || 'GHA') + ') to verify this property.';
 
-          await adminClient.from('staff_messages').insert([{
+          const { error: listingAlertErr } = await adminClient.from('staff_messages').insert([{
             sender_type: 'ADMIN',
             sender_id: agentProfile.sa_id,
             sender_name: 'System',
@@ -4912,7 +4913,8 @@ app.post('/api/properties', async (req, res) => {
             message: messageText,
             message_type: 'new_listing_alert',
             related_property_id: data[0].id,
-          }]).catch(e => console.error('New listing SA alert failed:', e.message));
+          }]);
+          if (listingAlertErr) console.error('New listing SA alert failed:', listingAlertErr.message);
         }
       } catch (e) { console.error('New listing SA alert lookup failed:', e.message); }
     }
@@ -6849,14 +6851,15 @@ app.post('/api/admin/pay-staff-transfer', async (req, res) => {
     }).eq('staff_id', staff_id).eq('month_year', month_year);
 
     // Notify staff
-    await adminClient.from('notifications').insert([{
+    const { error: paymentNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type: staff_type,
       recipient_id: staff_id,
       type: 'payment_processing',
       title: 'Payment Processing',
       message: 'Your payment of NGN ' + parseFloat(payment.total_payment).toLocaleString() + ' for ' + month_year + ' is being processed to your ' + staff.bank_name + ' account ending ' + staff.account_number.slice(-4) + '.',
       is_read: false,
-    }]).catch(e => console.error('Payment notification failed:', e.message));
+    }]);
+    if (paymentNotifErr) console.error('Payment notification failed:', paymentNotifErr.message);
 
     res.json({
       success: true,
@@ -6977,14 +6980,15 @@ app.post('/api/staff/send-message', async (req, res) => {
     if (insertErr) return res.status(500).json({ error: insertErr.message });
 
     // Also insert a notification so recipient sees it immediately
-    await adminClient.from('notifications').insert([{
+    const { error: msgNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type,
       recipient_id,
       type: 'new_message',
       title: 'New Message from ' + (sender?.[senderCode] || session.staff_role),
       message: (subject ? subject + ': ' : '') + message.trim().substring(0, 100),
       is_read: false,
-    }]).catch(e => console.error('Message notification failed:', e.message));
+    }]);
+    if (msgNotifErr) console.error('Message notification failed:', msgNotifErr.message);
 
     res.json({ success: true, message: newMessage });
   } catch (err) {
@@ -7045,14 +7049,15 @@ app.post('/api/admin/send-message', async (req, res) => {
 
     if (insertErr) return res.status(500).json({ error: insertErr.message });
 
-    await adminClient.from('notifications').insert([{
+    const { error: adminMsgNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type,
       recipient_id,
       type: 'new_message',
       title: 'New Message from Admin',
       message: (subject ? subject + ': ' : '') + message.trim().substring(0, 100),
       is_read: false,
-    }]).catch(e => console.error('Admin message notification failed:', e.message));
+    }]);
+    if (adminMsgNotifErr) console.error('Admin message notification failed:', adminMsgNotifErr.message);
 
     res.json({ success: true, message: newMessage });
   } catch (err) {
@@ -7086,6 +7091,56 @@ app.get('/api/admin/messages', async (req, res) => {
       unread_count: (inbox || []).filter(function(m) { return !m.is_read; }).length,
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/sa/my-listings', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    // Get all agents under this SA
+    const { data: agents } = await adminClient
+      .from('profiles')
+      .select('id, full_name, email, gha_id, gha_code')
+      .eq('sa_id', session.staff_id)
+      .eq('role', 'agent');
+
+    if (!agents || agents.length === 0) return res.json([]);
+
+    const agentIds = agents.map(function(a) { return a.id; });
+
+    // Get all listings by these agents
+    const { data: listings, error } = await adminClient
+      .from('properties')
+      .select('id, title, location, price, images, status, created_at, created_by, property_type')
+      .in('created_by', agentIds)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Enrich with agent details
+    const agentMap = {};
+    agents.forEach(function(a) { agentMap[a.id] = a; });
+
+    const enriched = (listings || []).map(function(listing) {
+      const agent = agentMap[listing.created_by] || {};
+      return Object.assign({}, listing, {
+        agent_name: agent.full_name || 'Unknown',
+        agent_email: agent.email || null,
+        agent_gha_id: agent.gha_id || null,
+        agent_gha_code: agent.gha_code || null,
+      });
+    });
+
+    console.log('SA', session.staff_id, 'listings count:', enriched.length);
+    res.json(enriched);
+  } catch (err) {
+    console.error('SA listings error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
