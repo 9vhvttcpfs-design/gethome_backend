@@ -7274,6 +7274,70 @@ app.get('/api/sa/peer-sas', async (req, res) => {
   }
 });
 
+app.post('/api/gha/verify-listing', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { property_id, verification_notes } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+
+    const { data: gha } = await adminClient.from('gha_agents')
+      .select('gha_code, full_name, sa_id').eq('id', session.staff_id).single();
+
+    const { data: updated, error: updateErr } = await adminClient
+      .from('properties')
+      .update({
+        gha_verified: true,
+        gha_verified_by: session.staff_id,
+        gha_verified_at: new Date().toISOString(),
+        verification_notes: verification_notes || null,
+      })
+      .eq('id', property_id)
+      .select('id, title, created_by')
+      .single();
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    // Notify SA that property has been verified
+    if (gha?.sa_id) {
+      const { error: notifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'SA',
+        recipient_id: gha.sa_id,
+        type: 'listing_verified',
+        title: 'Property Verified by GHA',
+        message: gha.gha_code + ' has verified property: ' + (updated?.title || 'Property #' + property_id) + (verification_notes ? '\n\nNotes: ' + verification_notes : ''),
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Verification notification failed:', notifErr.message);
+
+      // Also send inbox message to SA
+      const { error: msgErr } = await adminClient.from('staff_messages').insert([{
+        sender_type: 'GHA',
+        sender_id: session.staff_id,
+        sender_name: gha.full_name,
+        sender_code: gha.gha_code,
+        recipient_type: 'SA',
+        recipient_id: gha.sa_id,
+        subject: 'Property Verified: ' + (updated?.title || 'Property #' + property_id),
+        message: 'I have completed the physical verification of this property.\n\nProperty: ' + (updated?.title || 'Property #' + property_id) + '\n\nVerification Status: VERIFIED ✓' + (verification_notes ? '\n\nVerification Notes:\n' + verification_notes : '\n\nNo issues found. Property details are accurate.'),
+        message_type: 'listing_verification',
+        related_property_id: property_id,
+      }]);
+      if (msgErr) console.error('Verification message failed:', msgErr.message);
+    }
+
+    console.log('Property', property_id, 'verified by GHA', gha?.gha_code);
+    res.json({ success: true, message: 'Property verified successfully', property: updated });
+  } catch (err) {
+    console.error('Verify listing error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
