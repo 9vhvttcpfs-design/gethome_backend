@@ -4797,61 +4797,75 @@ app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, purpose, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, cost_per_night, created_by } = req.body;
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
-    // Resolve agent ID and build a JWT-scoped client so RLS sees auth.uid()
-    let agentId = created_by || null;
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (token) {
-      const { data: userData, error: authErr } = await supabase.auth.getUser(token);
-      if (!authErr && userData?.user?.id) {
-        agentId = userData.user.id;
-      } else if (authErr) {
-        console.error('uploadProperty auth lookup error:', authErr.message);
-      }
+    // Strictly resolve agent identity from token only - never trust client-supplied IDs for auth
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication required. Please log in again.' });
     }
+
+    const { data: authData, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !authData?.user) {
+      console.error('Token validation failed:', authError?.message);
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    }
+
+    const agentId = authData.user.id;
+    console.log('Authenticated agent ID:', agentId);
+
     // Authenticated client: passes the user's JWT so Supabase RLS evaluates
     // auth.uid() correctly for this request.
-    const userSupabase = token
-      ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-          global: { headers: { Authorization: 'Bearer ' + token } },
-        })
-      : serviceClient;
+    const userSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: 'Bearer ' + token } },
+    });
+
+    // Fetch profile using the verified ID from token - never from request body
+    const { data: profileData, error: profileErr } = await adminClient
+      .from('profiles')
+      .select('id, role, status, verification_level, is_unlimited')
+      .eq('id', agentId)
+      .single();
+
+    console.log('Profile lookup result - status:', profileData?.status, '| error:', profileErr?.message);
+
+    if (profileErr || !profileData) {
+      console.error('Profile not found for agent:', agentId, profileErr?.message);
+      return res.status(403).json({ error: 'Agent profile not found. Please contact support.' });
+    }
+
+    const isAdmin     = profileData.role === 'admin';
+    const isUnlimited = profileData.is_unlimited === true;
+    const level       = profileData.verification_level || 'basic';
+    const limits      = { basic: 3, verified: 15, premium: 999 };
+    const limit       = limits[level] || 3;
+
+    // Approval check
+    if (!isAdmin && profileData.status !== 'approved') {
+      console.log('Agent not approved - status:', profileData.status, '| agent:', agentId);
+      const statusMsg = profileData.status === 'disapproved'
+        ? 'Your agent account has been suspended. Please contact admin.'
+        : 'Your agent account is not yet approved. Please wait for admin approval.';
+      return res.status(403).json({ error: statusMsg, status: profileData.status });
+    }
+
+    // Override created_by with the authenticated user ID so agents can't post as other agents
+    req.body.created_by = agentId;
+
     // Check listing limit for free tier agents
-    if (agentId) {
-      const { data: profileData } = await supabase
-        .from('profiles')
-        .select('verification_level, is_unlimited, role, status')
-        .eq('id', agentId)
-        .single();
+    if (!isAdmin && !isUnlimited) {
+      const { count } = await supabase
+        .from('properties')
+        .select('id', { count: 'exact', head: true })
+        .eq('created_by', agentId);
 
-      const isAdmin     = profileData?.role === 'admin';
-      const isUnlimited = profileData?.is_unlimited === true;
-      const level       = profileData?.verification_level || 'basic';
-      const limits      = { basic: 3, verified: 15, premium: 999 };
-      const limit       = limits[level] || 3;
+      console.log('Listing limit check:', { agentId, tier: level, current: count, limit });
 
-      if (!isAdmin && profileData?.status !== 'approved') {
-        const statusMsg = profileData?.status === 'disapproved'
-          ? 'Your agent account has been suspended. Please contact admin.'
-          : 'Your agent account is not yet approved. Please wait for admin approval.';
-        return res.status(403).json({ error: statusMsg, status: profileData?.status });
-      }
-
-      if (!isAdmin && !isUnlimited) {
-        const { count } = await supabase
-          .from('properties')
-          .select('id', { count: 'exact', head: true })
-          .eq('created_by', agentId);
-
-        console.log('Listing limit check:', { agentId, tier: level, current: count, limit });
-
-        if (count >= limit) {
-          return res.status(403).json({
-            error: 'Listing limit reached. Your ' + level + ' tier allows up to ' + limit + ' listings. Please contact admin to upgrade your verification tier.',
-            limit,
-            current: count,
-            tier: level,
-          });
-        }
+      if (count >= limit) {
+        return res.status(403).json({
+          error: 'Listing limit reached. Your ' + level + ' tier allows up to ' + limit + ' listings. Please contact admin to upgrade your verification tier.',
+          limit,
+          current: count,
+          tier: level,
+        });
       }
     }
 
