@@ -4907,9 +4907,33 @@ app.post('/api/properties', async (req, res) => {
     if (agentId) {
       try {
         const { data: agentProfile } = await adminClient.from('profiles')
-          .select('sa_id, full_name, email, gha_id, gha_code').eq('id', agentId).single();
+          .select('sa_id, gha_id, full_name, email, gha_code').eq('id', agentId).single();
 
-        if (agentProfile?.sa_id) {
+        // Find SA via direct assignment or via GHA
+        var notifySaId = agentProfile?.sa_id;
+
+        if (!notifySaId && agentProfile?.gha_id) {
+          const { data: ghaRecord } = await adminClient
+            .from('gha_agents')
+            .select('sa_id')
+            .eq('id', agentProfile.gha_id)
+            .single();
+          notifySaId = ghaRecord?.sa_id || null;
+        }
+
+        if (notifySaId) {
+          const { error: notifErr } = await adminClient.from('notifications').insert([{
+            recipient_type: 'SA',
+            recipient_id: notifySaId,
+            type: 'new_listing_alert',
+            title: 'New Property Listed',
+            message: 'Agent ' + (agentProfile?.full_name || agentProfile?.email || 'Unknown') +
+              ' posted a new listing: ' + title +
+              ' in ' + location,
+            is_read: false,
+          }]);
+          if (notifErr) console.error('SA new listing notification failed:', notifErr.message);
+
           const messageText = 'Agent ' + (agentProfile.full_name || agentProfile.email) +
             ' has posted a new listing: ' + title +
             '\nLocation: ' + location +
@@ -4918,17 +4942,21 @@ app.post('/api/properties', async (req, res) => {
 
           const { error: listingAlertErr } = await adminClient.from('staff_messages').insert([{
             sender_type: 'ADMIN',
-            sender_id: agentProfile.sa_id,
+            sender_id: notifySaId,
             sender_name: 'System',
             sender_code: 'SYSTEM',
             recipient_type: 'SA',
-            recipient_id: agentProfile.sa_id,
+            recipient_id: notifySaId,
             subject: 'New Listing: ' + title,
             message: messageText,
             message_type: 'new_listing_alert',
             related_property_id: data[0].id,
           }]);
           if (listingAlertErr) console.error('New listing SA alert failed:', listingAlertErr.message);
+
+          console.log('SA', notifySaId, 'notified of new listing by agent', agentId);
+        } else {
+          console.log('No SA found for agent', agentId, '- notification skipped');
         }
       } catch (e) { console.error('New listing SA alert lookup failed:', e.message); }
     }
@@ -7425,11 +7453,24 @@ app.post('/api/sa/set-inspection-fee', async (req, res) => {
 
     const { data: agentProfile } = await adminClient
       .from('profiles')
-      .select('sa_id')
+      .select('sa_id, gha_id')
       .eq('id', property.created_by)
       .single();
 
-    if (!agentProfile || agentProfile.sa_id !== session.staff_id) {
+    // Check direct SA assignment first
+    var isUnderThisSA = agentProfile?.sa_id === session.staff_id;
+
+    // If not directly assigned check via GHA
+    if (!isUnderThisSA && agentProfile?.gha_id) {
+      const { data: ghaRecord } = await adminClient
+        .from('gha_agents')
+        .select('sa_id')
+        .eq('id', agentProfile.gha_id)
+        .single();
+      isUnderThisSA = ghaRecord?.sa_id === session.staff_id;
+    }
+
+    if (!isUnderThisSA) {
       return res.status(403).json({ error: 'This property is not under your territory' });
     }
 
@@ -7462,7 +7503,7 @@ app.get('/api/admin/inspection-fees', async (req, res) => {
 
     const { data: properties } = await adminClient
       .from('properties')
-      .select('id, title, location, property_type, inspection_fee, inspection_fee_set_by, inspection_fee_set_at, created_by')
+      .select('id, title, location, property_type, image_urls, inspection_fee, inspection_fee_set_by, inspection_fee_set_at, created_by')
       .order('inspection_fee_set_at', { ascending: false });
 
     // Enrich with SA and agent details
