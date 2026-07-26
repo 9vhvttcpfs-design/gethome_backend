@@ -699,7 +699,8 @@ app.get('/api/admin/transactions', async (req, res) => {
     const { data: properties, error: propsErr } = await adminClient
       .from('properties')
       .select('*')
-      .eq('is_sold', true);
+      .eq('is_sold', true)
+      .or('is_deleted.eq.false,is_deleted.is.null');
     if (propsErr) throw propsErr;
     const agentIds = [...new Set((properties || []).map(p => p.created_by).filter(Boolean))];
     let agentMap = {};
@@ -796,6 +797,7 @@ app.get('/api/admin/all-listings', async (req, res) => {
     const { data: properties, error: propsErr } = await adminClient
       .from('properties')
       .select('*')
+      .or('is_deleted.eq.false,is_deleted.is.null')
       .order('created_at', { ascending: false });
     if (propsErr) throw propsErr;
     const agentIds = [...new Set((properties || []).map(p => p.created_by).filter(Boolean))];
@@ -848,6 +850,7 @@ app.get('/api/agent/sold-listings', async (req, res) => {
       .select('*')
       .eq('created_by', user.id)
       .eq('is_sold', true)
+      .or('is_deleted.eq.false,is_deleted.is.null')
       .order('sold_at', { ascending: false });
     if (error) throw error;
     res.json(data || []);
@@ -919,6 +922,7 @@ app.get('/api/admin/deposits', async (req, res) => {
       .select('*')
       .not('deposit_status', 'is', null)
       .neq('deposit_status', 'none')
+      .or('is_deleted.eq.false,is_deleted.is.null')
       .order('deposit_date', { ascending: false });
     if (depositsErr) throw depositsErr;
     res.json(deposits || []);
@@ -1971,6 +1975,7 @@ app.get('/api/sa/deposits', verifyStaffToken, async (req, res) => {
       .in('created_by', agentIds)
       .not('deposit_status', 'is', null)
       .neq('deposit_status', 'none')
+      .or('is_deleted.eq.false,is_deleted.is.null')
       .order('deposit_date', { ascending: false });
     if (error) throw error;
 
@@ -2171,6 +2176,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
             .select('id', { count: 'exact', head: true })
             .in('created_by', agentIds)
             .eq('is_sold', true)
+            .or('is_deleted.eq.false,is_deleted.is.null')
         : Promise.resolve({ count: 0, error: null }),
 
       agentIds.length > 0
@@ -2179,6 +2185,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
             .select('id', { count: 'exact', head: true })
             .in('created_by', agentIds)
             .eq('is_sold', false)
+            .or('is_deleted.eq.false,is_deleted.is.null')
         : Promise.resolve({ count: 0, error: null }),
     ]);
 
@@ -2222,7 +2229,8 @@ app.get('/api/gha/my-agents', verifyStaffToken, async (req, res) => {
       const { count: listingCount } = await adminClient
         .from('properties')
         .select('id', { count: 'exact', head: true })
-        .eq('created_by', agent.id);
+        .eq('created_by', agent.id)
+        .or('is_deleted.eq.false,is_deleted.is.null');
 
       const isExpired = agent.subscription_end && new Date(agent.subscription_end) < new Date();
 
@@ -2261,6 +2269,7 @@ app.get('/api/gha/my-listings', verifyStaffToken, async (req, res) => {
       .from('properties')
       .select('*')
       .in('created_by', agentIds)
+      .or('is_deleted.eq.false,is_deleted.is.null')
       .order('created_at', { ascending: false });
     if (error) throw error;
 
@@ -2621,7 +2630,8 @@ app.get('/api/admin/all-sas', async (req, res) => {
           const { count } = await serviceClient
             .from('properties')
             .select('id', { count: 'exact', head: true })
-            .in('created_by', agentIds);
+            .in('created_by', agentIds)
+            .or('is_deleted.eq.false,is_deleted.is.null');
           totalListings = count || 0;
         }
 
@@ -2693,7 +2703,8 @@ app.get('/api/admin/all-ghas', async (req, res) => {
         const { count } = await serviceClient
           .from('properties')
           .select('id', { count: 'exact', head: true })
-          .in('created_by', agentIds);
+          .in('created_by', agentIds)
+          .or('is_deleted.eq.false,is_deleted.is.null');
         totalListings = count || 0;
       }
 
@@ -4718,7 +4729,9 @@ app.get('/api/properties', async (req, res) => {
       console.error('Properties fetch: Supabase env vars missing');
       return res.status(500).json({ error: 'Database not configured on server' });
     }
-    const { data, error } = await supabase.from('properties').select('*').order('id', { ascending: false });
+    const { data, error } = await supabase.from('properties').select('*')
+      .or('is_deleted.eq.false,is_deleted.is.null')
+      .order('id', { ascending: false });
     if (error) {
       console.error('Supabase properties error:', error.message, '| code:', error.code);
       return res.status(500).json({ error: error.message });
@@ -4855,7 +4868,8 @@ app.post('/api/properties', async (req, res) => {
       const { count } = await supabase
         .from('properties')
         .select('id', { count: 'exact', head: true })
-        .eq('created_by', agentId);
+        .eq('created_by', agentId)
+        .or('is_deleted.eq.false,is_deleted.is.null');
 
       console.log('Listing limit check:', { agentId, tier: level, current: count, limit });
 
@@ -5010,16 +5024,42 @@ app.put('/api/properties/:id', async (req, res) => {
 });
 // DELETE /api/properties/:id  — permanently remove a listing
 app.delete('/api/properties/:id', async (req, res) => {
-  const { id } = req.params;
   try {
-    const { error } = await supabase
-      .from('properties')
-      .delete()
-      .eq('id', id);
-    if (error) throw error;
-    res.status(200).json({ success: true, deletedId: id });
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    const { data: authData } = await supabase.auth.getUser(token);
+    if (!authData?.user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const propertyId = req.params.id;
+
+    // Verify the agent owns this listing or is admin
+    const { data: prop } = await adminClient.from('properties')
+      .select('id, title, created_by').eq('id', propertyId).single();
+    if (!prop) return res.status(404).json({ error: 'Property not found' });
+
+    const { data: profile } = await adminClient.from('profiles')
+      .select('role').eq('id', authData.user.id).single();
+
+    if (prop.created_by !== authData.user.id && profile?.role !== 'admin') {
+      return res.status(403).json({ error: 'You can only delete your own listings' });
+    }
+
+    // Soft delete - mark as deleted but keep in database for history
+    const { error: deleteErr } = await adminClient.from('properties')
+      .update({
+        is_deleted: true,
+        deleted_at: new Date().toISOString(),
+        deleted_by: authData.user.id,
+      })
+      .eq('id', propertyId);
+
+    if (deleteErr) return res.status(500).json({ error: deleteErr.message });
+
+    console.log('Property soft deleted:', propertyId, '| by:', authData.user.id);
+    res.json({ success: true, message: 'Listing deleted successfully' });
   } catch (err) {
-    console.error("Error deleting property:", err.message);
+    console.error('Delete property error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -5331,7 +5371,8 @@ app.get('/api/agent/listing-count/:userId', async (req, res) => {
     const { count, error } = await supabase
       .from('properties')
       .select('*', { count: 'exact', head: true })
-      .eq('created_by', userId);
+      .eq('created_by', userId)
+      .or('is_deleted.eq.false,is_deleted.is.null');
     if (error) throw error;
     res.status(200).json({ count: count || 0 });
   } catch (err) {
@@ -5894,6 +5935,7 @@ app.get('/api/admin/all-payments', async (req, res) => {
       .from('properties')
       .select('id, title, location, deposit_amount, deposit_status, deposit_confirmed, deposit_reference, created_at')
       .not('deposit_amount', 'is', null)
+      .or('is_deleted.eq.false,is_deleted.is.null')
       .order('created_at', { ascending: false });
 
     // Calculate totals
@@ -7269,6 +7311,7 @@ app.get('/api/sa/my-listings', async (req, res) => {
         .from('properties')
         .select('id, title, rent, price, location, image_urls, created_at, created_by, property_type, deposit_status, gha_verified, gha_verified_by, gha_verified_at, verification_notes, agency_fee, agreement_fee, caution_fee, inspection_fee, inspection_fee_set_at, is_featured')
         .in('created_by', agentIds)
+        .or('is_deleted.eq.false,is_deleted.is.null')
         .order('created_at', { ascending: false });
 
       console.log('Properties query done - count:', (listings || []).length, '| error:', error?.message);
@@ -7317,70 +7360,6 @@ app.get('/api/sa/peer-sas', async (req, res) => {
 
     res.json(sas || []);
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/gha/verify-listing', async (req, res) => {
-  try {
-    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
-    const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false }).limit(1).maybeSingle();
-    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
-
-    const { property_id, verification_notes } = req.body;
-    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
-
-    const { data: gha } = await adminClient.from('gha_agents')
-      .select('gha_code, full_name, sa_id').eq('id', session.staff_id).single();
-
-    const { data: updated, error: updateErr } = await adminClient
-      .from('properties')
-      .update({
-        gha_verified: true,
-        gha_verified_by: session.staff_id,
-        gha_verified_at: new Date().toISOString(),
-        verification_notes: verification_notes || null,
-      })
-      .eq('id', property_id)
-      .select('id, title, created_by')
-      .single();
-
-    if (updateErr) return res.status(500).json({ error: updateErr.message });
-
-    // Notify SA that property has been verified
-    if (gha?.sa_id) {
-      const { error: notifErr } = await adminClient.from('notifications').insert([{
-        recipient_type: 'SA',
-        recipient_id: gha.sa_id,
-        type: 'listing_verified',
-        title: 'Property Verified by GHA',
-        message: gha.gha_code + ' has verified property: ' + (updated?.title || 'Property #' + property_id) + (verification_notes ? '\n\nNotes: ' + verification_notes : ''),
-        is_read: false,
-      }]);
-      if (notifErr) console.error('Verification notification failed:', notifErr.message);
-
-      // Also send inbox message to SA
-      const { error: msgErr } = await adminClient.from('staff_messages').insert([{
-        sender_type: 'GHA',
-        sender_id: session.staff_id,
-        sender_name: gha.full_name,
-        sender_code: gha.gha_code,
-        recipient_type: 'SA',
-        recipient_id: gha.sa_id,
-        subject: 'Property Verified: ' + (updated?.title || 'Property #' + property_id),
-        message: 'I have completed the physical verification of this property.\n\nProperty: ' + (updated?.title || 'Property #' + property_id) + '\n\nVerification Status: VERIFIED ✓' + (verification_notes ? '\n\nVerification Notes:\n' + verification_notes : '\n\nNo issues found. Property details are accurate.'),
-        message_type: 'listing_verification',
-        related_property_id: property_id,
-      }]);
-      if (msgErr) console.error('Verification message failed:', msgErr.message);
-    }
-
-    console.log('Property', property_id, 'verified by GHA', gha?.gha_code);
-    res.json({ success: true, message: 'Property verified successfully', property: updated });
-  } catch (err) {
-    console.error('Verify listing error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -7504,6 +7483,7 @@ app.get('/api/admin/inspection-fees', async (req, res) => {
     const { data: properties } = await adminClient
       .from('properties')
       .select('id, title, location, property_type, image_urls, inspection_fee, inspection_fee_set_by, inspection_fee_set_at, created_by')
+      .or('is_deleted.eq.false,is_deleted.is.null')
       .order('inspection_fee_set_at', { ascending: false });
 
     // Enrich with SA and agent details
