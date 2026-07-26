@@ -7239,7 +7239,7 @@ app.get('/api/sa/my-listings', async (req, res) => {
 
       const { data: listings, error } = await adminClient
         .from('properties')
-        .select('id, title, rent, price, location, image_urls, created_at, created_by, property_type, deposit_status, gha_verified, gha_verified_by, gha_verified_at, verification_notes, agency_fee, agreement_fee, caution_fee')
+        .select('id, title, rent, price, location, image_urls, created_at, created_by, property_type, deposit_status, gha_verified, gha_verified_by, gha_verified_at, verification_notes, agency_fee, agreement_fee, caution_fee, inspection_fee, inspection_fee_set_at, is_featured')
         .in('created_by', agentIds)
         .order('created_at', { ascending: false });
 
@@ -7395,6 +7395,139 @@ app.get('/api/admin/sent-messages', async (req, res) => {
       .limit(100);
 
     res.json({ sent: sent || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/set-inspection-fee
+app.post('/api/sa/set-inspection-fee', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const { property_id, inspection_fee } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+    if (inspection_fee === undefined || inspection_fee === null) return res.status(400).json({ error: 'inspection_fee is required' });
+    if (parseFloat(inspection_fee) < 0) return res.status(400).json({ error: 'Inspection fee cannot be negative' });
+
+    // Verify this property belongs to an agent under this SA
+    const { data: property } = await adminClient
+      .from('properties')
+      .select('id, title, created_by')
+      .eq('id', property_id)
+      .single();
+
+    if (!property) return res.status(404).json({ error: 'Property not found' });
+
+    const { data: agentProfile } = await adminClient
+      .from('profiles')
+      .select('sa_id')
+      .eq('id', property.created_by)
+      .single();
+
+    if (!agentProfile || agentProfile.sa_id !== session.staff_id) {
+      return res.status(403).json({ error: 'This property is not under your territory' });
+    }
+
+    const { data: updated, error: updateErr } = await adminClient
+      .from('properties')
+      .update({
+        inspection_fee: parseFloat(inspection_fee),
+        inspection_fee_set_by: session.staff_id,
+        inspection_fee_set_at: new Date().toISOString(),
+      })
+      .eq('id', property_id)
+      .select('id, title, inspection_fee')
+      .single();
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    console.log('Inspection fee set:', property_id, '| fee:', inspection_fee, '| by SA:', session.staff_id);
+    res.json({ success: true, message: 'Inspection fee set to NGN ' + parseFloat(inspection_fee).toLocaleString(), property: updated });
+  } catch (err) {
+    console.error('Set inspection fee error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/inspection-fees - admin views all properties with inspection fees
+app.get('/api/admin/inspection-fees', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: properties } = await adminClient
+      .from('properties')
+      .select('id, title, location, property_type, inspection_fee, inspection_fee_set_by, inspection_fee_set_at, created_by')
+      .order('inspection_fee_set_at', { ascending: false });
+
+    // Enrich with SA and agent details
+    const enriched = await Promise.all((properties || []).map(async function(prop) {
+      var saName = null;
+      var saCode = null;
+      var agentName = null;
+
+      if (prop.inspection_fee_set_by) {
+        const { data: sa } = await adminClient
+          .from('service_agents')
+          .select('sa_code, full_name')
+          .eq('id', prop.inspection_fee_set_by)
+          .maybeSingle();
+        saCode = sa?.sa_code || null;
+        saName = sa?.full_name || null;
+      }
+
+      if (prop.created_by) {
+        const { data: agent } = await adminClient
+          .from('profiles')
+          .select('full_name, email')
+          .eq('id', prop.created_by)
+          .maybeSingle();
+        agentName = agent?.full_name || agent?.email || null;
+      }
+
+      return Object.assign({}, prop, {
+        sa_code: saCode,
+        sa_name: saName,
+        agent_name: agentName,
+      });
+    }));
+
+    res.json(enriched);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/set-inspection-fee - admin sets or adjusts inspection fee
+app.post('/api/admin/set-inspection-fee', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { property_id, inspection_fee } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+    if (inspection_fee === undefined || inspection_fee === null) return res.status(400).json({ error: 'inspection_fee is required' });
+
+    const { data: updated, error: updateErr } = await adminClient
+      .from('properties')
+      .update({
+        inspection_fee: parseFloat(inspection_fee),
+        inspection_fee_set_by: admin.id,
+        inspection_fee_set_at: new Date().toISOString(),
+      })
+      .eq('id', property_id)
+      .select('id, title, inspection_fee')
+      .single();
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    console.log('Admin set inspection fee:', property_id, '| fee:', inspection_fee);
+    res.json({ success: true, message: 'Inspection fee updated to NGN ' + parseFloat(inspection_fee).toLocaleString(), property: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
