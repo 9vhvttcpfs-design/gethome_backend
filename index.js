@@ -7554,6 +7554,74 @@ app.post('/api/admin/set-inspection-fee', async (req, res) => {
   }
 });
 
+// POST /api/verify-nin - verify NIN via Prembly API
+app.post('/api/verify-nin', async (req, res) => {
+  try {
+    const { nin, user_id } = req.body;
+    if (!nin) return res.status(400).json({ error: 'NIN is required' });
+    if (!/^\d{11}$/.test(nin.trim())) {
+      return res.status(400).json({ error: 'NIN must be exactly 11 digits' });
+    }
+
+    console.log('Verifying NIN for user:', user_id);
+
+    const premblyRes = await fetch('https://api.prembly.com/identitypass/verification/nin', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.PREMBLY_API_KEY,
+        'app-id': process.env.PREMBLY_APP_ID,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ number: nin.trim() }),
+    });
+
+    const premblyData = await premblyRes.json();
+    console.log('Prembly NIN response:', JSON.stringify(premblyData));
+
+    if (!premblyData.verification?.status) {
+      return res.status(400).json({
+        error: 'NIN verification failed. Please check your NIN and try again.',
+        details: premblyData.detail || premblyData.message || 'Verification unsuccessful',
+      });
+    }
+
+    const verifiedData = premblyData.verification?.data || {};
+    const verifiedName = [
+      verifiedData.firstname,
+      verifiedData.middlename,
+      verifiedData.lastname,
+    ].filter(Boolean).join(' ');
+
+    // If user_id provided update both tables with verified status
+    if (user_id) {
+      await adminClient.from('agents').update({
+        nin_verified: true,
+        nin_verified_at: new Date().toISOString(),
+        nin_verified_name: verifiedName || null,
+        nin_verified_dob: verifiedData.birthdate || null,
+        nin_verification_ref: premblyData.verification?.reference || null,
+      }).eq('id', user_id).catch(e => console.error('Agents NIN update failed:', e.message));
+
+      await adminClient.from('profiles').update({
+        nin_verified: true,
+        nin_verified_name: verifiedName || null,
+      }).eq('id', user_id).catch(e => console.error('Profiles NIN update failed:', e.message));
+    }
+
+    res.json({
+      success: true,
+      verified: true,
+      verified_name: verifiedName,
+      dob: verifiedData.birthdate || null,
+      gender: verifiedData.gender || null,
+      photo: verifiedData.photo || null,
+    });
+  } catch (err) {
+    console.error('NIN verification exception:', err.message);
+    res.status(500).json({ error: 'Verification service unavailable. Please try again.' });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
