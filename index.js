@@ -7568,9 +7568,10 @@ app.post('/api/verify-nin', async (req, res) => {
     const premblyRes = await fetch('https://api.prembly.com/identitypass/verification/nin', {
       method: 'POST',
       headers: {
-        'x-api-key': process.env.PREMBLY_API_KEY,
-        'app-id': process.env.PREMBLY_APP_ID,
+        'x-api-key': process.env.PREMBLY_SECRET_KEY,
+        'app-id': process.env.PREMBLY_PUBLIC_KEY,
         'Content-Type': 'application/json',
+        'Accept': 'application/json',
       },
       body: JSON.stringify({ number: nin.trim() }),
     });
