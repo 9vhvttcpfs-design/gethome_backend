@@ -7616,7 +7616,7 @@ app.post('/api/verify-nin', async (req, res) => {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
-      body: JSON.stringify({ nin: ninClean }),
+      body: JSON.stringify({ number_nin: ninClean }),
     });
 
     const premblyData = await premblyRes.json();
@@ -7778,7 +7778,7 @@ app.get('/api/test-prembly', async (req, res) => {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
-      body: JSON.stringify({ nin: '00000000000' }),
+      body: JSON.stringify({ number_nin: '00000000000' }),
     });
 
     const testData = await testRes.json();
