@@ -7796,6 +7796,94 @@ app.get('/api/test-prembly', async (req, res) => {
   }
 });
 
+// POST /api/verify-cac - verify company RC number via Prembly API
+app.post('/api/verify-cac', async (req, res) => {
+  try {
+    const { rc_number, company_name, user_id } = req.body;
+    if (!rc_number) return res.status(400).json({ error: 'RC number is required' });
+
+    var rcClean = rc_number.trim().replace(/[^a-zA-Z0-9]/g, '');
+    if (rcClean.length < 4) return res.status(400).json({ error: 'Please enter a valid RC number' });
+
+    console.log('Verifying CAC RC number:', rcClean, '| user:', user_id);
+
+    const premblyRes = await fetch('https://api.prembly.com/verification/cac/advance', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.PREMBLY_SECRET_KEY,
+        'app-id': process.env.PREMBLY_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        rc_number: rcClean,
+        company_name: company_name || undefined,
+        company_type: 'RC',
+      }),
+    });
+
+    const premblyData = await premblyRes.json();
+    console.log('Prembly CAC response status:', premblyData.status);
+    console.log('Prembly CAC response:', JSON.stringify(premblyData).substring(0, 500));
+
+    if (!premblyData.status) {
+      var errMsg = premblyData.detail || premblyData.message || 'CAC verification failed';
+      if (errMsg.toLowerCase().includes('insufficient') || errMsg.toLowerCase().includes('balance')) {
+        return res.status(503).json({ error: 'Verification service temporarily unavailable. Please try again later.' });
+      }
+      return res.status(400).json({ error: 'CAC number not found in registry. Please check your RC number.' });
+    }
+
+    // Parse response
+    var companyData = (premblyData.data && premblyData.data[0]) || {};
+    var verifiedName = companyData.company_name || null;
+    var companyStatus = companyData.company_status || null;
+    var registrationDate = companyData.registrationDate || null;
+    var verificationRef = premblyData.verification?.reference || null;
+
+    if (!verifiedName) {
+      return res.status(400).json({ error: 'Could not retrieve company details. Please check your RC number.' });
+    }
+
+    // Check if company is active
+    if (companyStatus && companyStatus.toUpperCase() === 'INACTIVE') {
+      return res.status(400).json({
+        error: 'This company (' + verifiedName + ') is marked as INACTIVE in the CAC registry. Only active businesses can register on GetHome.',
+        company_name: verifiedName,
+        company_status: companyStatus,
+      });
+    }
+
+    // Save verification to database
+    if (user_id) {
+      await adminClient.from('agents').update({
+        cac_verified: true,
+        cac_verified_name: verifiedName,
+        cac_verified_status: companyStatus,
+        cac_verification_ref: verificationRef,
+      }).eq('id', user_id).catch(e => console.error('Agents CAC update failed:', e.message));
+
+      await adminClient.from('profiles').update({
+        cac_verified: true,
+        cac_verified_name: verifiedName,
+      }).eq('id', user_id).catch(e => console.error('Profiles CAC update failed:', e.message));
+    }
+
+    console.log('CAC verified successfully:', verifiedName, '| status:', companyStatus);
+    res.json({
+      success: true,
+      verified: true,
+      company_name: verifiedName,
+      company_status: companyStatus,
+      registration_date: registrationDate,
+      directors_count: (companyData.directors || []).length,
+    });
+  } catch (err) {
+    console.error('CAC verification exception:', err.message);
+    res.status(500).json({ error: 'Verification service unavailable. Please try again.' });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
