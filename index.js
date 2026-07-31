@@ -7867,19 +7867,15 @@ app.post('/api/verify-cac', async (req, res) => {
       return res.status(400).json({ error: errMsg });
     }
 
-    // Parse successful response - data is an ARRAY when successful
-    var dataArray = Array.isArray(premblyData.data)
-      ? premblyData.data
-      : (premblyData.data?.data && Array.isArray(premblyData.data.data) ? premblyData.data.data : []);
+    // Prembly CAC returns data as a plain object (not array) when successful
+    var companyData = premblyData.data || {};
 
-    var companyData = dataArray[0] || {};
     var verifiedName = companyData.company_name || null;
-    var companyStatus = companyData.company_status || null;
-    var registrationDate = companyData.registrationDate || null;
-    var verificationRef = premblyData.verification?.reference ||
-      premblyData.data?.verification?.reference || null;
+    var companyStatus = companyData.company_status || companyData.status || null;
+    var registrationDate = companyData.date_of_registration || null;
+    var verificationRef = premblyData.verification?.reference || null;
 
-    console.log('CAC parsed - company:', verifiedName, '| status:', companyStatus, '| ref:', verificationRef);
+    console.log('CAC parsed - company:', verifiedName, '| status:', companyStatus);
 
     if (!verifiedName) {
       console.error('CAC returned no company name - full data:', JSON.stringify(companyData));
