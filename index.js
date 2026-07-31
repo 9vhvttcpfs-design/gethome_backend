@@ -4590,8 +4590,13 @@ https://trygethome.online`
 // violations to absorb the auth.users replication delay.
 app.post('/api/auth/create-agent-row', async (req, res) => {
   try {
-    const { id, email, full_name, name, phone, phone_number, office_address, address, city, experience, specialty, nin, nin_number, cac, cac_number, about, about_self, country, requested_gha_code } = req.body;
+    const { id, email, full_name, name, phone, phone_number, office_address, address, city, experience, specialty, nin, nin_number, cac, cac_number, about, about_self, country, requested_gha_code, agent_type, agency_name } = req.body;
     if (!id || !email) return res.status(400).json({ error: 'id and email are required' });
+
+    const isAgency = agent_type === 'agency';
+    const displayName = isAgency
+      ? (agency_name || 'Unknown Agency')
+      : (full_name || name || 'Unknown Agent');
 
     console.log('Calling create_agent_with_retry RPC for id:', id);
 
@@ -4616,7 +4621,19 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
-    console.log('Agent created successfully via RPC:', JSON.stringify(data));
+    console.log('Agent created successfully via RPC:', JSON.stringify(data), '| type:', isAgency ? 'agency' : 'agent', '| displayName:', displayName);
+
+    // Save agent_type/agency_name - the RPC doesn't accept these params, so set them
+    // via a direct follow-up update on both tables after the row exists.
+    await adminClient.from('agents').update({
+      agent_type: isAgency ? 'agency' : 'agent',
+      agency_name: isAgency ? (agency_name || null) : null,
+    }).eq('id', id).catch(e => console.error('Agent type update failed:', e.message));
+
+    await adminClient.from('profiles').update({
+      agent_type: isAgency ? 'agency' : 'agent',
+      agency_name: isAgency ? (agency_name || null) : null,
+    }).eq('id', id).catch(e => console.error('Profile type update failed:', e.message));
 
     // Check if agent was referred by a GHA via requested_gha_code
     const referralGhaCode = (requested_gha_code || '').toUpperCase().trim();
@@ -4858,7 +4875,7 @@ app.post('/api/properties', async (req, res) => {
     // Fetch profile using the verified ID from token - never from request body
     const { data: profileData, error: profileErr } = await adminClient
       .from('profiles')
-      .select('id, role, status, verification_level, is_unlimited')
+      .select('id, role, status, verification_level, is_unlimited, full_name, agency_name, agent_type, nin_verified')
       .eq('id', agentId)
       .single();
 
@@ -4940,6 +4957,16 @@ app.post('/api/properties', async (req, res) => {
       console.error('uploadProperty insert error:', error.message, error.code, error.details, error.hint);
       throw error;
     }
+
+    // Set agent_display_name using agency name or agent name
+    const listingDisplayName = profileData?.agent_type === 'agency'
+      ? (profileData?.agency_name || 'Agency')
+      : (profileData?.full_name || 'Agent');
+
+    await adminClient.from('properties')
+      .update({ agent_display_name: listingDisplayName })
+      .eq('id', data[0].id)
+      .catch(e => console.error('Display name update failed:', e.message));
 
     // Notify the agent's SA about the new listing
     if (agentId) {
