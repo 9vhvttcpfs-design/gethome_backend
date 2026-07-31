@@ -7822,10 +7822,27 @@ app.post('/api/verify-cac', async (req, res) => {
     const { rc_number, company_name, user_id } = req.body;
     if (!rc_number) return res.status(400).json({ error: 'RC number is required' });
 
-    var rcClean = rc_number.trim().replace(/[^a-zA-Z0-9]/g, '');
+    var rcClean = rc_number.trim().replace(/\s/g, '').toUpperCase();
+
+    // Detect company type from prefix
+    var companyType = 'RC'; // default
+    if (rcClean.startsWith('BN')) {
+      companyType = 'BN';
+      rcClean = rcClean.replace('BN', '').replace(/^0+/, ''); // strip BN prefix and leading zeros
+    } else if (rcClean.startsWith('RC')) {
+      companyType = 'RC';
+      rcClean = rcClean.replace('RC', '').replace(/^0+/, ''); // strip RC prefix and leading zeros
+    } else if (rcClean.startsWith('IT')) {
+      companyType = 'IT';
+      rcClean = rcClean.replace('IT', '').replace(/^0+/, '');
+    } else if (rcClean.startsWith('LP')) {
+      companyType = 'LP';
+      rcClean = rcClean.replace('LP', '').replace(/^0+/, '');
+    }
+
     if (rcClean.length < 4) return res.status(400).json({ error: 'Please enter a valid RC number' });
 
-    console.log('Verifying CAC RC number:', rcClean, '| user:', user_id);
+    console.log('Verifying CAC - type:', companyType, '| number:', rcClean, '| user:', user_id);
 
     const premblyRes = await fetch('https://api.prembly.com/verification/cac/advance', {
       method: 'POST',
@@ -7837,8 +7854,8 @@ app.post('/api/verify-cac', async (req, res) => {
       },
       body: JSON.stringify({
         rc_number: rcClean,
+        company_type: companyType,
         company_name: company_name || undefined,
-        company_type: 'RC',
       }),
     });
 
@@ -7918,6 +7935,54 @@ app.post('/api/verify-cac', async (req, res) => {
   } catch (err) {
     console.error('CAC verification exception:', err.message);
     res.status(500).json({ error: 'Verification service unavailable. Please try again.' });
+  }
+});
+
+// POST /api/verify-ghana-card - verify Ghanaian agents via Ghana Card
+app.post('/api/verify-ghana-card', async (req, res) => {
+  try {
+    const { card_number, user_id } = req.body;
+    if (!card_number) return res.status(400).json({ error: 'Ghana Card number is required' });
+
+    var cardClean = card_number.trim().toUpperCase();
+    // Ghana Card format: GHA-XXXXXXXXX-X
+    if (!cardClean.startsWith('GHA-') && !cardClean.startsWith('GHA')) {
+      return res.status(400).json({ error: 'Invalid Ghana Card format. Should start with GHA-' });
+    }
+
+    console.log('Verifying Ghana Card:', cardClean.substring(0, 8) + '...');
+
+    const premblyRes = await fetch('https://api.prembly.com/identitypass/verification/gh/drivers_license', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.PREMBLY_SECRET_KEY,
+        'app-id': process.env.PREMBLY_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ id_number: cardClean }),
+    });
+
+    const premblyData = await premblyRes.json();
+    console.log('Ghana Card response:', JSON.stringify(premblyData));
+
+    if (!premblyData.status) {
+      return res.status(400).json({ error: 'Ghana Card not verified. Please check your card number.' });
+    }
+
+    var cardData = premblyData.data || {};
+    var verifiedName = [cardData.first_name, cardData.middle_name, cardData.last_name].filter(Boolean).join(' ');
+
+    if (user_id && verifiedName) {
+      await adminClient.from('agents').update({
+        nin_verified: true,
+        nin_verified_name: verifiedName,
+      }).eq('id', user_id).catch(e => console.error('Ghana Card update failed:', e.message));
+    }
+
+    res.json({ success: true, verified: true, verified_name: verifiedName });
+  } catch (err) {
+    console.error('Ghana Card verification error:', err.message);
+    res.status(500).json({ error: 'Verification service unavailable.' });
   }
 });
 
