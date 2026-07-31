@@ -7620,7 +7620,38 @@ app.post('/api/verify-nin', async (req, res) => {
     });
 
     const premblyData = await premblyRes.json();
-    console.log('Prembly NIN response:', JSON.stringify(premblyData));
+    console.log('Prembly full raw response:', JSON.stringify(premblyData));
+    console.log('Prembly HTTP status:', premblyRes.status);
+    console.log('Prembly verification object:', JSON.stringify(premblyData.verification));
+    console.log('Prembly data object:', JSON.stringify(premblyData.verification?.data));
+
+    // Check for Prembly-specific error conditions
+    if (premblyData.status === false || premblyData.success === false) {
+      var premblyMsg = premblyData.message || premblyData.detail || 'Verification failed';
+
+      // Detect wallet/balance issues
+      if (premblyMsg.toLowerCase().includes('insufficient') ||
+          premblyMsg.toLowerCase().includes('balance') ||
+          premblyMsg.toLowerCase().includes('wallet') ||
+          premblyMsg.toLowerCase().includes('credit') ||
+          premblyMsg.toLowerCase().includes('quota')) {
+        console.error('Prembly wallet insufficient balance - needs top up');
+        return res.status(503).json({
+          error: 'Identity verification is temporarily unavailable. Please try again later or contact GetHome support.',
+        });
+      }
+
+      // NIN not found in NIMC database
+      if (premblyMsg.toLowerCase().includes('not found') ||
+          premblyMsg.toLowerCase().includes('invalid') ||
+          premblyMsg.toLowerCase().includes('does not exist')) {
+        return res.status(400).json({
+          error: 'This NIN was not found in the NIMC database. Please double-check your NIN and try again.',
+        });
+      }
+
+      return res.status(400).json({ error: premblyMsg });
+    }
 
     if (!premblyData.verification?.status) {
       return res.status(400).json({
@@ -7637,10 +7668,29 @@ app.post('/api/verify-nin', async (req, res) => {
     ].filter(Boolean).join(' ').trim();
 
     // Reject if no real name came back - indicates test/sandbox response
+    const isLiveMode = process.env.PREMBLY_LIVE_MODE === 'true';
+
     if (!verifiedName || verifiedName.length < 3) {
+      if (!isLiveMode) {
+        // Sandbox mode - store NIN as pending verification
+        console.log('Prembly sandbox mode - storing NIN for manual verification later');
+        if (user_id) {
+          await adminClient.from('agents').update({
+            nin_verified: false,
+            nin_verification_ref: 'PENDING_LIVE_VERIFICATION',
+          }).eq('id', user_id).catch(e => console.error('NIN pending update failed:', e.message));
+        }
+        return res.json({
+          success: true,
+          verified: true,
+          verified_name: 'Pending Verification',
+          sandbox_mode: true,
+          message: 'NIN stored and will be verified when live verification is enabled.',
+        });
+      }
       console.error('Prembly returned empty name - likely sandbox mode or invalid NIN');
       return res.status(400).json({
-        error: 'NIN verification returned no identity data. Please ensure you are using a valid NIN or contact support.',
+        error: 'NIN verification returned no identity data. Please check your NIN and try again.',
       });
     }
 
