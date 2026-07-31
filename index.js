@@ -4625,15 +4625,21 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
 
     // Save agent_type/agency_name - the RPC doesn't accept these params, so set them
     // via a direct follow-up update on both tables after the row exists.
-    await adminClient.from('agents').update({
-      agent_type: isAgency ? 'agency' : 'agent',
-      agency_name: isAgency ? (agency_name || null) : null,
-    }).eq('id', id).catch(e => console.error('Agent type update failed:', e.message));
+    const { error: agentTypeErr } = await adminClient.from('agents')
+      .update({
+        agent_type: isAgency ? 'agency' : 'agent',
+        agency_name: isAgency ? (agency_name || null) : null,
+      })
+      .eq('id', id);
+    if (agentTypeErr) console.error('Agent type update failed:', agentTypeErr.message);
 
-    await adminClient.from('profiles').update({
-      agent_type: isAgency ? 'agency' : 'agent',
-      agency_name: isAgency ? (agency_name || null) : null,
-    }).eq('id', id).catch(e => console.error('Profile type update failed:', e.message));
+    const { error: profileTypeErr } = await adminClient.from('profiles')
+      .update({
+        agent_type: isAgency ? 'agency' : 'agent',
+        agency_name: isAgency ? (agency_name || null) : null,
+      })
+      .eq('id', id);
+    if (profileTypeErr) console.error('Profile type update failed:', profileTypeErr.message);
 
     // Check if agent was referred by a GHA via requested_gha_code
     const referralGhaCode = (requested_gha_code || '').toUpperCase().trim();
@@ -4963,10 +4969,10 @@ app.post('/api/properties', async (req, res) => {
       ? (profileData?.agency_name || 'Agency')
       : (profileData?.full_name || 'Agent');
 
-    await adminClient.from('properties')
+    const { error: displayNameErr } = await adminClient.from('properties')
       .update({ agent_display_name: listingDisplayName })
-      .eq('id', data[0].id)
-      .catch(e => console.error('Display name update failed:', e.message));
+      .eq('id', data[0].id);
+    if (displayNameErr) console.error('Display name update failed:', displayNameErr.message);
 
     // Notify the agent's SA about the new listing
     if (agentId) {
@@ -7680,10 +7686,13 @@ app.post('/api/verify-nin', async (req, res) => {
       if (!isLiveMode) {
         console.log('Prembly sandbox mode - storing NIN as pending verification');
         if (user_id) {
-          await adminClient.from('agents').update({
-            nin_verified: false,
-            nin_verification_ref: 'PENDING_LIVE_VERIFICATION',
-          }).eq('id', user_id).catch(e => console.error('NIN pending update failed:', e.message));
+          const { error: ninPendingErr } = await adminClient.from('agents')
+            .update({
+              nin_verified: false,
+              nin_verification_ref: 'PENDING_LIVE_VERIFICATION',
+            })
+            .eq('id', user_id);
+          if (ninPendingErr) console.error('NIN pending update failed:', ninPendingErr.message);
         }
         return res.json({
           success: true,
@@ -7704,18 +7713,24 @@ app.post('/api/verify-nin', async (req, res) => {
 
     // Save to database if user_id provided
     if (user_id && verifiedName) {
-      await adminClient.from('agents').update({
-        nin_verified: true,
-        nin_verified_at: new Date().toISOString(),
-        nin_verified_name: verifiedName,
-        nin_verified_dob: verifiedData.birthdate || null,
-        nin_verification_ref: premblyData.verification?.reference || premblyData.billing_info?.transaction_id || null,
-      }).eq('id', user_id).catch(e => console.error('Agents NIN update failed:', e.message));
+      const { error: ninAgentErr } = await adminClient.from('agents')
+        .update({
+          nin_verified: true,
+          nin_verified_at: new Date().toISOString(),
+          nin_verified_name: verifiedName,
+          nin_verified_dob: verifiedData.birthdate || null,
+          nin_verification_ref: premblyData.verification?.reference || premblyData.billing_info?.transaction_id || null,
+        })
+        .eq('id', user_id);
+      if (ninAgentErr) console.error('Agents NIN update failed:', ninAgentErr.message);
 
-      await adminClient.from('profiles').update({
-        nin_verified: true,
-        nin_verified_name: verifiedName,
-      }).eq('id', user_id).catch(e => console.error('Profiles NIN update failed:', e.message));
+      const { error: ninProfileErr } = await adminClient.from('profiles')
+        .update({
+          nin_verified: true,
+          nin_verified_name: verifiedName,
+        })
+        .eq('id', user_id);
+      if (ninProfileErr) console.error('Profiles NIN update failed:', ninProfileErr.message);
     }
 
     res.json({
@@ -7910,17 +7925,23 @@ app.post('/api/verify-cac', async (req, res) => {
 
     // Save to database if user_id provided
     if (user_id) {
-      await adminClient.from('agents').update({
-        cac_verified: true,
-        cac_verified_name: verifiedName,
-        cac_verified_status: companyStatus,
-        cac_verification_ref: verificationRef,
-      }).eq('id', user_id).catch(e => console.error('Agents CAC update failed:', e.message));
+      const { error: cacAgentErr } = await adminClient.from('agents')
+        .update({
+          cac_verified: true,
+          cac_verified_name: verifiedName,
+          cac_verified_status: companyStatus,
+          cac_verification_ref: verificationRef,
+        })
+        .eq('id', user_id);
+      if (cacAgentErr) console.error('Agents CAC update failed:', cacAgentErr.message);
 
-      await adminClient.from('profiles').update({
-        cac_verified: true,
-        cac_verified_name: verifiedName,
-      }).eq('id', user_id).catch(e => console.error('Profiles CAC update failed:', e.message));
+      const { error: cacProfileErr } = await adminClient.from('profiles')
+        .update({
+          cac_verified: true,
+          cac_verified_name: verifiedName,
+        })
+        .eq('id', user_id);
+      if (cacProfileErr) console.error('Profiles CAC update failed:', cacProfileErr.message);
     }
 
     console.log('CAC verified successfully:', verifiedName, '| directors:', (companyData.directors || []).length);
@@ -7973,10 +7994,13 @@ app.post('/api/verify-ghana-card', async (req, res) => {
     var verifiedName = [cardData.first_name, cardData.middle_name, cardData.last_name].filter(Boolean).join(' ');
 
     if (user_id && verifiedName) {
-      await adminClient.from('agents').update({
-        nin_verified: true,
-        nin_verified_name: verifiedName,
-      }).eq('id', user_id).catch(e => console.error('Ghana Card update failed:', e.message));
+      const { error: ghanaCardErr } = await adminClient.from('agents')
+        .update({
+          nin_verified: true,
+          nin_verified_name: verifiedName,
+        })
+        .eq('id', user_id);
+      if (ghanaCardErr) console.error('Ghana Card update failed:', ghanaCardErr.message);
     }
 
     res.json({ success: true, verified: true, verified_name: verifiedName });
