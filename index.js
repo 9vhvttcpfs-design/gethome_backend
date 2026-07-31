@@ -7608,7 +7608,7 @@ app.post('/api/verify-nin', async (req, res) => {
 
     console.log('Calling Prembly NIN verification for NIN starting with:', ninClean.substring(0, 3) + '...');
 
-    const premblyRes = await fetch('https://api.prembly.com/identitypass/verification/nin', {
+    const premblyRes = await fetch('https://api.prembly.com/verification/vnin', {
       method: 'POST',
       headers: {
         'x-api-key': process.env.PREMBLY_SECRET_KEY,
@@ -7621,59 +7621,37 @@ app.post('/api/verify-nin', async (req, res) => {
 
     const premblyData = await premblyRes.json();
     console.log('Prembly full raw response:', JSON.stringify(premblyData));
-    console.log('Prembly HTTP status:', premblyRes.status);
-    console.log('Prembly verification object:', JSON.stringify(premblyData.verification));
-    console.log('Prembly data object:', JSON.stringify(premblyData.verification?.data));
 
-    // Check for Prembly-specific error conditions
-    if (premblyData.status === false || premblyData.success === false) {
+    // Check for failure
+    if (!premblyData.status) {
       var premblyMsg = premblyData.message || premblyData.detail || 'Verification failed';
+      console.error('Prembly verification failed:', premblyMsg);
 
-      // Detect wallet/balance issues
       if (premblyMsg.toLowerCase().includes('insufficient') ||
-          premblyMsg.toLowerCase().includes('balance') ||
-          premblyMsg.toLowerCase().includes('wallet') ||
-          premblyMsg.toLowerCase().includes('credit') ||
-          premblyMsg.toLowerCase().includes('quota')) {
-        console.error('Prembly wallet insufficient balance - needs top up');
-        return res.status(503).json({
-          error: 'Identity verification is temporarily unavailable. Please try again later or contact GetHome support.',
-        });
+        premblyMsg.toLowerCase().includes('balance') ||
+        premblyMsg.toLowerCase().includes('wallet')) {
+        return res.status(503).json({ error: 'Verification service temporarily unavailable. Please try again later.' });
       }
 
-      // NIN not found in NIMC database
-      if (premblyMsg.toLowerCase().includes('not found') ||
-          premblyMsg.toLowerCase().includes('invalid') ||
-          premblyMsg.toLowerCase().includes('does not exist')) {
-        return res.status(400).json({
-          error: 'This NIN was not found in the NIMC database. Please double-check your NIN and try again.',
-        });
-      }
-
-      return res.status(400).json({ error: premblyMsg });
+      return res.status(400).json({ error: 'NIN not found in NIMC database. Please check your NIN and try again.' });
     }
 
-    if (!premblyData.verification?.status) {
-      return res.status(400).json({
-        error: 'NIN verification failed. Please check your NIN and try again.',
-        details: premblyData.detail || premblyData.message || 'Verification unsuccessful',
-      });
-    }
+    // Parse response - data is in premblyData.data or premblyData.nin_data
+    const verifiedData = premblyData.data || premblyData.nin_data || {};
 
-    const verifiedData = premblyData.verification?.data || {};
+    // Build verified name from correct field names
     const verifiedName = [
       verifiedData.firstname,
       verifiedData.middlename,
-      verifiedData.lastname,
+      verifiedData.surname,
     ].filter(Boolean).join(' ').trim();
 
-    // Reject if no real name came back - indicates test/sandbox response
-    const isLiveMode = process.env.PREMBLY_LIVE_MODE === 'true';
+    console.log('NIN verified - name:', verifiedName, '| dob:', verifiedData.birthdate);
 
     if (!verifiedName || verifiedName.length < 3) {
+      var isLiveMode = process.env.PREMBLY_LIVE_MODE === 'true';
       if (!isLiveMode) {
-        // Sandbox mode - store NIN as pending verification
-        console.log('Prembly sandbox mode - storing NIN for manual verification later');
+        console.log('Prembly sandbox mode - storing NIN as pending verification');
         if (user_id) {
           await adminClient.from('agents').update({
             nin_verified: false,
@@ -7685,38 +7663,31 @@ app.post('/api/verify-nin', async (req, res) => {
           verified: true,
           verified_name: 'Pending Verification',
           sandbox_mode: true,
-          message: 'NIN stored and will be verified when live verification is enabled.',
         });
       }
-      console.error('Prembly returned empty name - likely sandbox mode or invalid NIN');
       return res.status(400).json({
         error: 'NIN verification returned no identity data. Please check your NIN and try again.',
       });
     }
 
-    // Reject obviously fake test names that sandbox returns
-    const testNames = ['test user', 'john doe', 'jane doe', 'test test', 'sandbox user'];
-    if (testNames.includes(verifiedName.toLowerCase())) {
-      return res.status(400).json({
-        error: 'Verification service is in test mode. Please contact GetHome support.',
-      });
+    // Check for suspended NIN
+    if (verifiedData.nin_suspension_status === true) {
+      return res.status(400).json({ error: 'This NIN has been suspended. Please contact NIMC.' });
     }
 
-    console.log('NIN verified successfully - name:', verifiedName.substring(0, 5) + '...');
-
-    // If user_id provided update both tables with verified status
-    if (user_id) {
+    // Save to database if user_id provided
+    if (user_id && verifiedName) {
       await adminClient.from('agents').update({
         nin_verified: true,
         nin_verified_at: new Date().toISOString(),
-        nin_verified_name: verifiedName || null,
+        nin_verified_name: verifiedName,
         nin_verified_dob: verifiedData.birthdate || null,
-        nin_verification_ref: premblyData.verification?.reference || null,
+        nin_verification_ref: premblyData.verification?.reference || premblyData.billing_info?.transaction_id || null,
       }).eq('id', user_id).catch(e => console.error('Agents NIN update failed:', e.message));
 
       await adminClient.from('profiles').update({
         nin_verified: true,
-        nin_verified_name: verifiedName || null,
+        nin_verified_name: verifiedName,
       }).eq('id', user_id).catch(e => console.error('Profiles NIN update failed:', e.message));
     }
 
@@ -7726,7 +7697,7 @@ app.post('/api/verify-nin', async (req, res) => {
       verified_name: verifiedName,
       dob: verifiedData.birthdate || null,
       gender: verifiedData.gender || null,
-      photo: verifiedData.photo || null,
+      phone: verifiedData.telephoneno || null,
     });
   } catch (err) {
     console.error('NIN verification exception:', err.message);
@@ -7770,13 +7741,12 @@ app.get('/api/test-prembly', async (req, res) => {
     console.log('Secret key starts with:', (process.env.PREMBLY_SECRET_KEY || '').substring(0, 8));
 
     // Test the NIN endpoint with a known format
-    const testRes = await fetch('https://api.prembly.com/identitypass/verification/nin', {
+    const testRes = await fetch('https://api.prembly.com/verification/vnin', {
       method: 'POST',
       headers: {
         'x-api-key': process.env.PREMBLY_SECRET_KEY,
         'app-id': process.env.PREMBLY_PUBLIC_KEY,
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
       },
       body: JSON.stringify({ number_nin: '00000000000' }),
     });
