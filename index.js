@@ -7762,6 +7762,43 @@ app.get('/api/gha/my-referrals', async (req, res) => {
   }
 });
 
+app.get('/api/test-prembly', async (req, res) => {
+  try {
+    console.log('Testing Prembly connection...');
+    console.log('Secret key exists:', !!process.env.PREMBLY_SECRET_KEY);
+    console.log('Public key exists:', !!process.env.PREMBLY_PUBLIC_KEY);
+    console.log('Secret key starts with:', (process.env.PREMBLY_SECRET_KEY || '').substring(0, 8));
+
+    // Test the NIN endpoint with a known format
+    const testRes = await fetch('https://api.prembly.com/identitypass/verification/nin', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.PREMBLY_SECRET_KEY,
+        'app-id': process.env.PREMBLY_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ number: '00000000000' }),
+    });
+
+    const testData = await testRes.json();
+    console.log('Prembly test HTTP status:', testRes.status);
+    console.log('Prembly test response:', JSON.stringify(testData));
+
+    res.json({
+      http_status: testRes.status,
+      prembly_response: testData,
+      keys_present: {
+        secret: !!process.env.PREMBLY_SECRET_KEY,
+        public: !!process.env.PREMBLY_PUBLIC_KEY,
+      }
+    });
+  } catch (err) {
+    console.error('Prembly test error:', err.message);
+    res.json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
