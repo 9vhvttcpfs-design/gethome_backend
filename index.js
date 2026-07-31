@@ -7796,6 +7796,26 @@ app.get('/api/test-prembly', async (req, res) => {
   }
 });
 
+// TEMPORARY - GET /api/test-cac - manual test route for CAC verification, remove after testing
+app.get('/api/test-cac', async (req, res) => {
+  try {
+    const testRes = await fetch('https://api.prembly.com/verification/cac/advance', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.PREMBLY_SECRET_KEY,
+        'app-id': process.env.PREMBLY_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ rc_number: '092932', company_type: 'RC' }),
+    });
+    const data = await testRes.json();
+    console.log('CAC test full response:', JSON.stringify(data));
+    res.json({ http_status: testRes.status, response: data });
+  } catch(err) {
+    res.json({ error: err.message });
+  }
+});
+
 // POST /api/verify-cac - verify company RC number via Prembly API
 app.post('/api/verify-cac', async (req, res) => {
   try {
@@ -7823,8 +7843,9 @@ app.post('/api/verify-cac', async (req, res) => {
     });
 
     const premblyData = await premblyRes.json();
+    console.log('Prembly CAC HTTP status:', premblyRes.status);
     console.log('Prembly CAC response status:', premblyData.status);
-    console.log('Prembly CAC response:', JSON.stringify(premblyData).substring(0, 500));
+    console.log('Prembly CAC FULL response:', JSON.stringify(premblyData));
 
     if (!premblyData.status) {
       var errMsg = premblyData.detail || premblyData.message || 'CAC verification failed';
