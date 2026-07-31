@@ -7844,38 +7844,58 @@ app.post('/api/verify-cac', async (req, res) => {
 
     const premblyData = await premblyRes.json();
     console.log('Prembly CAC HTTP status:', premblyRes.status);
-    console.log('Prembly CAC response status:', premblyData.status);
     console.log('Prembly CAC FULL response:', JSON.stringify(premblyData));
 
-    if (!premblyData.status) {
-      var errMsg = premblyData.detail || premblyData.message || 'CAC verification failed';
-      if (errMsg.toLowerCase().includes('insufficient') || errMsg.toLowerCase().includes('balance')) {
+    // Check both top-level and nested status
+    var isSuccess = premblyData.status === true &&
+      (Array.isArray(premblyData.data) || premblyData.response_code === '00');
+
+    // Handle failed verification
+    if (!isSuccess) {
+      var errMsg = premblyData.detail || premblyData.message || 'Verification failed';
+
+      if (errMsg.toLowerCase().includes('insufficient') ||
+        errMsg.toLowerCase().includes('balance') ||
+        errMsg.toLowerCase().includes('wallet')) {
         return res.status(503).json({ error: 'Verification service temporarily unavailable. Please try again later.' });
       }
-      return res.status(400).json({ error: 'CAC number not found in registry. Please check your RC number.' });
+
+      if (errMsg.toLowerCase().includes('not found') || errMsg.toLowerCase().includes('record not found')) {
+        return res.status(400).json({ error: 'RC number not found in CAC registry. Please check your registration number and try again.' });
+      }
+
+      return res.status(400).json({ error: errMsg });
     }
 
-    // Parse response
-    var companyData = (premblyData.data && premblyData.data[0]) || {};
+    // Parse successful response - data is an ARRAY when successful
+    var dataArray = Array.isArray(premblyData.data)
+      ? premblyData.data
+      : (premblyData.data?.data && Array.isArray(premblyData.data.data) ? premblyData.data.data : []);
+
+    var companyData = dataArray[0] || {};
     var verifiedName = companyData.company_name || null;
     var companyStatus = companyData.company_status || null;
     var registrationDate = companyData.registrationDate || null;
-    var verificationRef = premblyData.verification?.reference || null;
+    var verificationRef = premblyData.verification?.reference ||
+      premblyData.data?.verification?.reference || null;
+
+    console.log('CAC parsed - company:', verifiedName, '| status:', companyStatus, '| ref:', verificationRef);
 
     if (!verifiedName) {
-      return res.status(400).json({ error: 'Could not retrieve company details. Please check your RC number.' });
+      console.error('CAC returned no company name - full data:', JSON.stringify(companyData));
+      return res.status(400).json({ error: 'Could not retrieve company details. Please try again or contact support.' });
     }
 
     // Check if company is active
     if (companyStatus && companyStatus.toUpperCase() === 'INACTIVE') {
       return res.status(400).json({
-        error: 'This company (' + verifiedName + ') is marked as INACTIVE in the CAC registry. Only active businesses can register on GetHome.',
+        error: 'This company (' + verifiedName + ') is INACTIVE in the CAC registry. Only active businesses can register.',
         company_name: verifiedName,
         company_status: companyStatus,
       });
     }
 
-    // Save verification to database
+    // Save to database if user_id provided
     if (user_id) {
       await adminClient.from('agents').update({
         cac_verified: true,
@@ -7890,12 +7910,12 @@ app.post('/api/verify-cac', async (req, res) => {
       }).eq('id', user_id).catch(e => console.error('Profiles CAC update failed:', e.message));
     }
 
-    console.log('CAC verified successfully:', verifiedName, '| status:', companyStatus);
+    console.log('CAC verified successfully:', verifiedName, '| directors:', (companyData.directors || []).length);
     res.json({
       success: true,
       verified: true,
       company_name: verifiedName,
-      company_status: companyStatus,
+      company_status: companyStatus || 'ACTIVE',
       registration_date: registrationDate,
       directors_count: (companyData.directors || []).length,
     });
