@@ -379,7 +379,7 @@ app.get('/api/admin/agents', async (req, res) => {
     // Fetch pending agents only - use adminClient to bypass RLS
     const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, office_address, experience, specialty, nin_number, cac_number, about, verification_level, kyc_documents, bank_name, account_number, account_name, subscription_tier, subscription_start, subscription_end, subscription_status')
+      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, city, office_address, experience, specialty, nin_number, cac_number, agent_type, agency_name, nin_verified, cac_verified, gha_id, sa_id, gha_code, requested_gha_code, about, verification_level, kyc_documents, bank_name, account_number, account_name, subscription_tier, subscription_start, subscription_end, subscription_status')
       .eq('role', 'agent')
       .not('status', 'in', '(approved,rejected)')
       .order('created_at', { ascending: false });
