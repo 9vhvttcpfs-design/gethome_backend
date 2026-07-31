@@ -4617,6 +4617,30 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
     }
 
     console.log('Agent created successfully via RPC:', JSON.stringify(data));
+
+    // Check if agent was referred by a GHA via requested_gha_code
+    const referralGhaCode = (requested_gha_code || '').toUpperCase().trim();
+    if (referralGhaCode) {
+      const { data: referringGha } = await adminClient
+        .from('gha_agents')
+        .select('id, gha_code')
+        .eq('gha_code', referralGhaCode)
+        .maybeSingle();
+
+      if (referringGha) {
+        const { error: refErr } = await adminClient.from('gha_referrals').insert([{
+          gha_id: referringGha.id,
+          gha_code: referringGha.gha_code,
+          referred_agent_id: id,
+          referred_agent_email: email,
+          referred_agent_name: full_name || name || null,
+          status: 'registered',
+        }]);
+        if (refErr) console.error('Referral tracking failed (non-blocking):', refErr.message);
+        else console.log('Referral tracked: GHA', referringGha.gha_code, 'referred agent', email);
+      }
+    }
+
     res.status(201).json({ success: true, agent: data });
   } catch (err) {
     console.error('create-agent-row exception:', err.message);
@@ -7559,11 +7583,30 @@ app.post('/api/verify-nin', async (req, res) => {
   try {
     const { nin, user_id } = req.body;
     if (!nin) return res.status(400).json({ error: 'NIN is required' });
-    if (!/^\d{11}$/.test(nin.trim())) {
+
+    const ninClean = nin.trim().replace(/\D/g, '');
+
+    // Basic format check
+    if (ninClean.length !== 11) {
       return res.status(400).json({ error: 'NIN must be exactly 11 digits' });
     }
 
-    console.log('Verifying NIN for user:', user_id);
+    // Reject obviously fake NINs
+    const obviousFakes = [
+      '00000000000', '11111111111', '22222222222', '33333333333',
+      '44444444444', '55555555555', '66666666666', '77777777777',
+      '88888888888', '99999999999', '12345678901', '09876543210',
+    ];
+    if (obviousFakes.includes(ninClean)) {
+      return res.status(400).json({ error: 'Invalid NIN. Please enter your real National Identity Number.' });
+    }
+
+    // NIN must start with a non-zero digit
+    if (ninClean[0] === '0') {
+      return res.status(400).json({ error: 'Invalid NIN format. Nigerian NINs do not start with 0.' });
+    }
+
+    console.log('Calling Prembly NIN verification for NIN starting with:', ninClean.substring(0, 3) + '...');
 
     const premblyRes = await fetch('https://api.prembly.com/identitypass/verification/nin', {
       method: 'POST',
@@ -7573,7 +7616,7 @@ app.post('/api/verify-nin', async (req, res) => {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
-      body: JSON.stringify({ number: nin.trim() }),
+      body: JSON.stringify({ number: ninClean }),
     });
 
     const premblyData = await premblyRes.json();
@@ -7591,7 +7634,25 @@ app.post('/api/verify-nin', async (req, res) => {
       verifiedData.firstname,
       verifiedData.middlename,
       verifiedData.lastname,
-    ].filter(Boolean).join(' ');
+    ].filter(Boolean).join(' ').trim();
+
+    // Reject if no real name came back - indicates test/sandbox response
+    if (!verifiedName || verifiedName.length < 3) {
+      console.error('Prembly returned empty name - likely sandbox mode or invalid NIN');
+      return res.status(400).json({
+        error: 'NIN verification returned no identity data. Please ensure you are using a valid NIN or contact support.',
+      });
+    }
+
+    // Reject obviously fake test names that sandbox returns
+    const testNames = ['test user', 'john doe', 'jane doe', 'test test', 'sandbox user'];
+    if (testNames.includes(verifiedName.toLowerCase())) {
+      return res.status(400).json({
+        error: 'Verification service is in test mode. Please contact GetHome support.',
+      });
+    }
+
+    console.log('NIN verified successfully - name:', verifiedName.substring(0, 5) + '...');
 
     // If user_id provided update both tables with verified status
     if (user_id) {
@@ -7620,6 +7681,34 @@ app.post('/api/verify-nin', async (req, res) => {
   } catch (err) {
     console.error('NIN verification exception:', err.message);
     res.status(500).json({ error: 'Verification service unavailable. Please try again.' });
+  }
+});
+
+// GET /api/gha/my-referrals - GHA sees all agents they referred
+app.get('/api/gha/my-referrals', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { data: referrals } = await adminClient
+      .from('gha_referrals')
+      .select('*')
+      .eq('gha_id', session.staff_id)
+      .order('registered_at', { ascending: false });
+
+    const total = (referrals || []).length;
+    const approved = (referrals || []).filter(r => r.status === 'approved' || r.status === 'subscribed').length;
+    const subscribed = (referrals || []).filter(r => r.status === 'subscribed').length;
+
+    res.json({
+      referrals: referrals || [],
+      stats: { total, approved, subscribed }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
