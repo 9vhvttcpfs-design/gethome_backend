@@ -1001,6 +1001,19 @@ async function verifyAdminToken(req) {
   return user;
 }
 
+// GetHome billing cycle: month ends on 28th
+// Payments on/after 28th count toward next month's cycle
+function getBillingMonth() {
+  var now = new Date();
+  var day = now.getDate();
+  if (day >= 28) {
+    // On or after 28th - next month's cycle
+    var nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    return nextMonth.toISOString().slice(0, 7);
+  }
+  return now.toISOString().slice(0, 7);
+}
+
 async function verifyStaffToken(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -3573,6 +3586,21 @@ app.post('/api/sa/cancel-inspection', verifyStaffToken, async (req, res) => {
       .eq('id', inspection_id);
     if (error) throw error;
 
+    // Notify GHA that inspection is cancelled
+    if (inspection.gha_id) {
+      const { error: notifErr } = await serviceClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: inspection.gha_id,
+        type: 'inspection_cancelled',
+        title: 'Inspection Cancelled',
+        message: 'Inspection for ' + (inspection.property_address || 'property') +
+          ' has been cancelled by SA.' +
+          (cancellation_reason ? ' Reason: ' + cancellation_reason : ''),
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Cancel notification failed:', notifErr.message);
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error('SA cancel-inspection error:', err.message);
@@ -3586,7 +3614,7 @@ app.post('/api/sa/reschedule-inspection', verifyStaffToken, async (req, res) => 
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    const { inspection_id, rescheduled_date } = req.body;
+    const { inspection_id, rescheduled_date, new_gha_id } = req.body;
     if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
     if (!rescheduled_date) return res.status(400).json({ error: 'rescheduled_date is required' });
 
@@ -3594,11 +3622,28 @@ app.post('/api/sa/reschedule-inspection', verifyStaffToken, async (req, res) => 
       .from('inspections').select('*').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
     if (!inspection) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
 
+    var updateData = { rescheduled_date: rescheduled_date };
+    if (new_gha_id) updateData.gha_id = new_gha_id;
+
     const { error } = await serviceClient
       .from('inspections')
-      .update({ rescheduled_date: rescheduled_date })
+      .update(updateData)
       .eq('id', inspection_id);
     if (error) throw error;
+
+    // Notify GHA of rescheduled inspection
+    const targetGhaId = new_gha_id || inspection.gha_id;
+    if (targetGhaId) {
+      const { error: notifErr } = await serviceClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: targetGhaId,
+        type: 'inspection_rescheduled',
+        title: 'Inspection Rescheduled',
+        message: 'An inspection has been rescheduled to ' + new Date(rescheduled_date).toLocaleDateString() + '. Please confirm availability.',
+        is_read: false,
+      }]);
+      if (notifErr) console.error('Reschedule notification failed:', notifErr.message);
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -5794,7 +5839,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             .eq('id', agentId)
             .single();
 
-          const monthYear = new Date().toISOString().slice(0, 7);
+          const monthYear = getBillingMonth();
 
           // Create GHA earnings row (5% commission)
           if (agentProfile?.gha_id) {
@@ -6646,7 +6691,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const month = req.query.month || getBillingMonth();
     const monthStart = month + '-01';
     const monthEnd = new Date(new Date(monthStart).setMonth(new Date(monthStart).getMonth() + 1)).toISOString().slice(0, 10);
 
@@ -8150,11 +8195,11 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
       .eq('email', agent_email);
 
     // Create earnings rows for GHA and SA
-    const monthYear = new Date().toISOString().slice(0, 7);
+    const monthYear = getBillingMonth();
     const commission = Math.round(subscriptionAmount * 0.05);
 
     if (profile.gha_id) {
-      await adminClient.from('gha_earnings').insert([{
+      const { error: ghaEarnErr } = await adminClient.from('gha_earnings').insert([{
         gha_id: profile.gha_id,
         agent_id: profile.id,
         agent_email: agent_email,
@@ -8163,11 +8208,12 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         commission_amount: commission,
         month_year: monthYear,
         is_paid: false,
-      }]).catch(e => console.error('GHA earnings insert failed:', e.message));
+      }]);
+      if (ghaEarnErr) console.error('GHA earnings insert failed:', ghaEarnErr.message);
     }
 
     if (profile.sa_id) {
-      await adminClient.from('sa_earnings').insert([{
+      const { error: saEarnErr } = await adminClient.from('sa_earnings').insert([{
         sa_id: profile.sa_id,
         gha_id: profile.gha_id || null,
         agent_id: profile.id,
@@ -8176,7 +8222,8 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         commission_amount: commission,
         month_year: monthYear,
         is_paid: false,
-      }]).catch(e => console.error('SA earnings insert failed:', e.message));
+      }]);
+      if (saEarnErr) console.error('SA earnings insert failed:', saEarnErr.message);
     }
 
     console.log('Manual upgrade:', agent_email, tier, '| by admin:', admin.id);
