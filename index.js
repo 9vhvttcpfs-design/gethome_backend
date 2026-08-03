@@ -1912,20 +1912,15 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    const { data: ghas } = await serviceClient
-      .from('gha_agents')
-      .select('id')
-      .eq('sa_id', saId);
-    const ghaIds = (ghas || []).map(function(g) { return g.id; });
-
-    if (ghaIds.length === 0) return res.json({ agents: [], total_revenue: 0, sa_commission: 0, by_month: [] });
-
     const { data: agents, error } = await serviceClient
       .from('profiles')
-      .select('id, full_name, email, gha_id, subscription_tier, subscription_amount, subscription_start, subscription_end')
-      .in('gha_id', ghaIds)
-      .eq('role', 'agent');
+      .select('id, full_name, email, gha_id, subscription_tier, subscription_amount, subscription_start, subscription_end, subscription_status')
+      .eq('sa_id', saId)
+      .eq('role', 'agent')
+      .eq('subscription_status', 'active');
     if (error) throw error;
+
+    if ((agents || []).length === 0) return res.json({ agents: [], total_revenue: 0, sa_commission: 0, by_month: [] });
 
     const { data: saEarnings } = await serviceClient
       .from('sa_earnings')
@@ -2153,36 +2148,45 @@ app.post('/api/gha/confirm-agent', async (req, res) => {
 app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
   try {
     if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
-    // staff_code holds the 'GHA0001' string; profiles.gha_code is how agents are linked
+    // staff_code holds the 'GHA0001' string; profiles are linked via gha_code and/or gha_id
+    // depending on which assignment path claimed the agent, so match on either.
     const ghaCode = req.staffSession.staff_code;
-    console.log('GHA overview - gha_code:', ghaCode);
+    const ghaId = req.staffSession.staff_id;
+    console.log('GHA overview - gha_code:', ghaCode, '| gha_id:', ghaId);
 
-    // Fetch agent IDs first — needed for property queries
-    const { data: agentRows, error: agentErr } = await adminClient
+    // Get all agents under this GHA
+    const { data: myAgents, error: agentErr } = await adminClient
       .from('profiles')
-      .select('id')
-      .eq('gha_code', ghaCode)
+      .select('id, email, subscription_tier, subscription_status, subscription_end, full_name')
+      .or('gha_code.eq.' + ghaCode + ',gha_id.eq.' + ghaId)
       .eq('role', 'agent');
 
     if (agentErr) {
       console.error('GHA overview agent fetch error:', agentErr.message);
-      return res.json({ totalAgents: 0, activeSubscriptions: 0, propertiesSold: 0, activeListings: 0 });
+      return res.json({ total_agents: 0, active_subscriptions: 0, expired_subscriptions: 0, free_agents: 0, agents: [] });
     }
 
-    const agentIds = (agentRows || []).map(function(a) { return a.id; });
-    const totalAgents = agentIds.length;
-    console.log('GHA overview - found', totalAgents, 'agents for', ghaCode);
-    const now = new Date().toISOString();
+    const agentIds = (myAgents || []).map(function(a) { return a.id; });
+    console.log('GHA overview - found', agentIds.length, 'agents for', ghaCode);
 
-    // Run remaining counts in parallel
-    const [subResult, soldResult, activeResult] = await Promise.all([
-      adminClient
-        .from('profiles')
-        .select('id', { count: 'exact', head: true })
-        .eq('gha_code', ghaCode)
-        .eq('role', 'agent')
-        .gt('subscription_end', now),
+    var now = new Date();
+    var activeAgents = (myAgents || []).filter(function(a) {
+      return a.subscription_status === 'active' &&
+        a.subscription_end &&
+        new Date(a.subscription_end) > now;
+    });
 
+    var expiredAgents = (myAgents || []).filter(function(a) {
+      return a.subscription_end && new Date(a.subscription_end) <= now &&
+        a.subscription_tier !== 'free';
+    });
+
+    var freeAgents = (myAgents || []).filter(function(a) {
+      return !a.subscription_tier || a.subscription_tier === 'free';
+    });
+
+    // Run remaining property counts in parallel
+    const [soldResult, activeResult] = await Promise.all([
       agentIds.length > 0
         ? adminClient
             .from('properties')
@@ -2202,15 +2206,20 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
         : Promise.resolve({ count: 0, error: null }),
     ]);
 
-    if (subResult.error) console.error('GHA overview sub count error:', subResult.error.message);
     if (soldResult.error) console.error('GHA overview sold count error:', soldResult.error.message);
     if (activeResult.error) console.error('GHA overview active count error:', activeResult.error.message);
 
     res.json({
-      totalAgents,
-      activeSubscriptions: subResult.count || 0,
+      total_agents: agentIds.length,
+      active_subscriptions: activeAgents.length,
+      expired_subscriptions: expiredAgents.length,
+      free_agents: freeAgents.length,
+      agents: myAgents || [],
       propertiesSold: soldResult.count || 0,
       activeListings: activeResult.count || 0,
+      // legacy camelCase fields kept for existing callers during frontend migration
+      totalAgents: agentIds.length,
+      activeSubscriptions: activeAgents.length,
     });
   } catch (err) {
     console.error('GHA overview error:', err.message);
@@ -2370,7 +2379,41 @@ app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
       });
     });
 
-    res.json(enriched);
+    // Count inspections by status accurately
+    const { count: pendingCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('gha_id', ghaId)
+      .in('status', ['pending', 'assigned']);
+
+    const { count: doneCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('gha_id', ghaId)
+      .eq('status', 'done');
+
+    const { count: confirmedCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('gha_id', ghaId)
+      .eq('status', 'confirmed');
+
+    const { count: cancelledCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('gha_id', ghaId)
+      .eq('status', 'cancelled');
+
+    res.json({
+      inspections: enriched,
+      counts: {
+        pending: pendingCount || 0,
+        done: doneCount || 0,
+        confirmed: confirmedCount || 0,
+        cancelled: cancelledCount || 0,
+        total: (pendingCount || 0) + (doneCount || 0) + (confirmedCount || 0),
+      }
+    });
   } catch (err) {
     console.error('GHA inspections error:', err.message);
     res.status(500).json({ error: err.message });
@@ -2473,7 +2516,7 @@ app.get('/api/sa/earnings', async (req, res) => {
       .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const month = req.query.month || getBillingMonth();
 
     const { data: earnings, error } = await adminClient
       .from('sa_earnings')
@@ -2489,8 +2532,18 @@ app.get('/api/sa/earnings', async (req, res) => {
 
     const earningsList = earnings || [];
     const totalCommission = earningsList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    const paidCommission = earningsList.filter(function(e) { return e.is_paid; }).reduce(function(sum, e) { return sum + (parseFloat(e.commission_amount) || 0); }, 0);
     const isPaid = earningsList.length > 0 && earningsList.every(e => e.is_paid === true);
     const paidAt = isPaid ? earningsList[0]?.paid_at : null;
+
+    // Active subscriptions = agents under this SA with active subscription_status
+    const { count: activeSubsCount } = await adminClient
+      .from('profiles')
+      .select('id', { count: 'exact', head: true })
+      .eq('sa_id', session.staff_id)
+      .eq('role', 'agent')
+      .eq('subscription_status', 'active')
+      .gt('subscription_end', new Date().toISOString());
 
     // Also get GHA breakdown for this SA
     const { data: ghaBreakdown } = await adminClient
@@ -2519,6 +2572,10 @@ app.get('/api/sa/earnings', async (req, res) => {
       is_paid: isPaid,
       paid_at: paidAt,
       gha_breakdown: enrichedBreakdown,
+      active_subscriptions: activeSubsCount || 0,
+      total_earnings_this_month: totalCommission,
+      paid_earnings: paidCommission,
+      unpaid_earnings: totalCommission - paidCommission,
     });
   } catch (err) {
     console.error('SA earnings exception:', err.message);
@@ -3359,7 +3416,7 @@ app.get('/api/admin/earnings', async (req, res) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
-    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const month = req.query.month || getBillingMonth();
 
     const { data: ghaEarnings } = await adminClient
       .from('gha_earnings').select('*').eq('month_year', month);
@@ -3519,7 +3576,41 @@ app.get('/api/sa/inspections', verifyStaffToken, async (req, res) => {
       });
     });
 
-    res.json(enriched);
+    // Count inspections by status accurately
+    const { count: pendingCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('assigned_by_sa', saId)
+      .in('status', ['pending', 'assigned']);
+
+    const { count: doneCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('assigned_by_sa', saId)
+      .eq('status', 'done');
+
+    const { count: confirmedCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('assigned_by_sa', saId)
+      .eq('status', 'confirmed');
+
+    const { count: cancelledCount } = await serviceClient
+      .from('inspections')
+      .select('id', { count: 'exact', head: true })
+      .eq('assigned_by_sa', saId)
+      .eq('status', 'cancelled');
+
+    res.json({
+      inspections: enriched,
+      counts: {
+        pending: pendingCount || 0,
+        done: doneCount || 0,
+        confirmed: confirmedCount || 0,
+        cancelled: cancelledCount || 0,
+        total: (pendingCount || 0) + (doneCount || 0) + (confirmedCount || 0),
+      }
+    });
   } catch (err) {
     console.error('SA inspections error:', err.message);
     res.status(500).json({ error: err.message });
@@ -6121,7 +6212,7 @@ app.get('/api/admin/all-payments', async (req, res) => {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const month = req.query.month || getBillingMonth();
 
     // Agent subscription payments from earnings tables
     const { data: ghaEarnings } = await adminClient
@@ -6144,11 +6235,24 @@ app.get('/api/admin/all-payments', async (req, res) => {
       .or('is_deleted.eq.false,is_deleted.is.null')
       .order('created_at', { ascending: false });
 
+    // Get actual totals from earnings tables
+    const { data: ghaEarningsTotal } = await adminClient
+      .from('gha_earnings')
+      .select('commission_amount, is_paid, gha_id')
+      .eq('month_year', month);
+
+    const { data: saEarningsTotal } = await adminClient
+      .from('sa_earnings')
+      .select('commission_amount, is_paid, sa_id')
+      .eq('month_year', month);
+
     // Calculate totals
     const totalAgentRevenue = (ghaEarnings || []).reduce((sum, e) => sum + (parseFloat(e.subscription_amount) || 0), 0);
     const totalCustomerRevenue = (deposits || []).filter(d => d.deposit_confirmed).reduce((sum, d) => sum + (parseFloat(d.deposit_amount) || 0), 0);
-    const totalGhaCommission = (ghaEarnings || []).reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
-    const totalSaCommission = (saEarnings || []).reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    var totalGhaCommission = (ghaEarningsTotal || []).reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+    var totalSaCommission = (saEarningsTotal || []).reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+    var unpaidGha = (ghaEarningsTotal || []).filter(function(e) { return !e.is_paid; }).length;
+    var unpaidSa = (saEarningsTotal || []).filter(function(e) { return !e.is_paid; }).length;
 
     res.json({
       month,
@@ -6160,6 +6264,8 @@ app.get('/api/admin/all-payments', async (req, res) => {
         customer_deposit_revenue: totalCustomerRevenue,
         total_gha_commission: totalGhaCommission,
         total_sa_commission: totalSaCommission,
+        unpaid_gha_count: unpaidGha,
+        unpaid_sa_count: unpaidSa,
         grand_total_revenue: totalAgentRevenue + totalCustomerRevenue,
       }
     });
@@ -6774,6 +6880,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       }, 0);
 
       const totalPayment = inspPayment + commissionTotal;
+      console.log('GHA', gha.gha_code, '| inspections:', count, '| insp pay:', inspPayment, '| commission:', commissionTotal, '| total:', totalPayment);
 
       // Check existing payment record
       const { data: existingPayment } = await adminClient
