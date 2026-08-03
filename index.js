@@ -3554,6 +3554,59 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
   }
 });
 
+// POST /api/sa/cancel-inspection
+app.post('/api/sa/cancel-inspection', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { inspection_id, cancellation_reason } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
+
+    const { data: inspection } = await serviceClient
+      .from('inspections').select('*').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
+    if (!inspection) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
+
+    const { error } = await serviceClient
+      .from('inspections')
+      .update({ status: 'cancelled', cancellation_reason: cancellation_reason || null, cancelled_at: new Date().toISOString() })
+      .eq('id', inspection_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('SA cancel-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sa/reschedule-inspection
+app.post('/api/sa/reschedule-inspection', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const saId = req.staffSession.staff_id;
+
+    const { inspection_id, rescheduled_date } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
+    if (!rescheduled_date) return res.status(400).json({ error: 'rescheduled_date is required' });
+
+    const { data: inspection } = await serviceClient
+      .from('inspections').select('*').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
+    if (!inspection) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
+
+    const { error } = await serviceClient
+      .from('inspections')
+      .update({ rescheduled_date: rescheduled_date })
+      .eq('id', inspection_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('SA reschedule-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/gha/mark-inspection-done
 app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => {
   try {
@@ -3902,6 +3955,51 @@ https://trygethome.online`
     res.json({ success: true });
   } catch (err) {
     console.error('Admin confirm-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/cancel-inspection
+app.post('/api/admin/cancel-inspection', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { inspection_id, cancellation_reason } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
+
+    const { error } = await serviceClient
+      .from('inspections')
+      .update({ status: 'cancelled', cancellation_reason: cancellation_reason || null, cancelled_at: new Date().toISOString() })
+      .eq('id', inspection_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin cancel-inspection error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/reschedule-inspection
+app.post('/api/admin/reschedule-inspection', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { inspection_id, rescheduled_date } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
+    if (!rescheduled_date) return res.status(400).json({ error: 'rescheduled_date is required' });
+
+    const { error } = await serviceClient
+      .from('inspections')
+      .update({ rescheduled_date: rescheduled_date })
+      .eq('id', inspection_id);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin reschedule-inspection error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
