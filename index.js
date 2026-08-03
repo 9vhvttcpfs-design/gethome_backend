@@ -5610,6 +5610,8 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
 });
 
 app.post('/api/flutterwave/webhook', async (req, res) => {
+  console.log('Flutterwave webhook received:', JSON.stringify(req.body).substring(0, 200));
+  console.log('Webhook headers:', JSON.stringify(req.headers['verif-hash'] || req.headers['v-hash'] || 'no-hash'));
   try {
     const signature = req.headers['verif-hash'];
     if (!signature || signature !== process.env.FLW_WEBHOOK_HASH) {
@@ -5652,7 +5654,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     }
 
     // Handle agent subscription payments
+    console.log('Webhook payment type:', event?.data?.meta?.payment_type);
+    console.log('Webhook meta:', JSON.stringify(event?.data?.meta));
     if (status === 'successful' && event?.data?.meta?.payment_type === 'subscription') {
+      console.log('Webhook payment type:', event?.data?.meta?.payment_type);
+      console.log('Webhook meta:', JSON.stringify(event?.data?.meta));
       const agentId = event?.data?.meta?.agent_id;
       const tier = event?.data?.meta?.tier;
       const amount = parseFloat(event?.data?.amount || 0);
@@ -8007,6 +8013,83 @@ app.post('/api/verify-ghana-card', async (req, res) => {
   } catch (err) {
     console.error('Ghana Card verification error:', err.message);
     res.status(500).json({ error: 'Verification service unavailable.' });
+  }
+});
+
+app.post('/api/admin/manual-upgrade', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { agent_email, tier, amount } = req.body;
+    if (!agent_email || !tier) return res.status(400).json({ error: 'agent_email and tier are required' });
+
+    const tierAmounts = { premium: 8500, agency: 35000 };
+    const subscriptionAmount = amount || tierAmounts[tier] || 0;
+    const subscriptionEnd = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Update profiles
+    const { data: profile, error: profileErr } = await adminClient
+      .from('profiles')
+      .update({
+        subscription_tier: tier,
+        subscription_status: 'active',
+        subscription_amount: subscriptionAmount,
+        subscription_start: new Date().toISOString(),
+        subscription_end: subscriptionEnd,
+      })
+      .eq('email', agent_email)
+      .eq('role', 'agent')
+      .select('id, email, full_name, gha_id, sa_id')
+      .single();
+
+    if (profileErr) return res.status(500).json({ error: profileErr.message });
+    if (!profile) return res.status(404).json({ error: 'Agent not found' });
+
+    // Update agents table
+    await adminClient.from('agents')
+      .update({ subscription_tier: tier })
+      .eq('email', agent_email);
+
+    // Create earnings rows for GHA and SA
+    const monthYear = new Date().toISOString().slice(0, 7);
+    const commission = Math.round(subscriptionAmount * 0.05);
+
+    if (profile.gha_id) {
+      await adminClient.from('gha_earnings').insert([{
+        gha_id: profile.gha_id,
+        agent_id: profile.id,
+        agent_email: agent_email,
+        subscription_amount: subscriptionAmount,
+        commission_rate: 5,
+        commission_amount: commission,
+        month_year: monthYear,
+        is_paid: false,
+      }]).catch(e => console.error('GHA earnings insert failed:', e.message));
+    }
+
+    if (profile.sa_id) {
+      await adminClient.from('sa_earnings').insert([{
+        sa_id: profile.sa_id,
+        gha_id: profile.gha_id || null,
+        agent_id: profile.id,
+        subscription_amount: subscriptionAmount,
+        commission_rate: 5,
+        commission_amount: commission,
+        month_year: monthYear,
+        is_paid: false,
+      }]).catch(e => console.error('SA earnings insert failed:', e.message));
+    }
+
+    console.log('Manual upgrade:', agent_email, tier, '| by admin:', admin.id);
+    res.json({
+      success: true,
+      message: agent_email + ' upgraded to ' + tier + ' successfully',
+      subscription_end: subscriptionEnd,
+    });
+  } catch (err) {
+    console.error('Manual upgrade error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
