@@ -6700,12 +6700,13 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
       .select('id, gha_code, full_name, sa_id, service_agents(sa_code, full_name)');
 
     const results = await Promise.all((ghas || []).map(async function(gha) {
+      // Only count confirmed inspections - GHA payment is earned when SA confirms
       const { data: inspections } = await adminClient
         .from('inspections')
         .select('id, status, gha_done_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
         .eq('inspection_type', 'customer')
-        .in('status', ['done', 'confirmed'])
+        .eq('status', 'confirmed')  // CONFIRMED only - not done
         .not('gha_done_at', 'is', null)
         .gte('gha_done_at', monthStart)
         .lt('gha_done_at', monthEnd);
@@ -6807,13 +6808,13 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       .select('id, gha_code, full_name, email, sa_id, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
 
     const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
-      // Get completed inspections this month
+      // Only count confirmed inspections - GHA payment is earned when SA confirms
       const { data: inspections } = await adminClient
         .from('inspections')
         .select('id, status, gha_done_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
         .eq('inspection_type', 'customer')
-        .in('status', ['done', 'confirmed'])
+        .eq('status', 'confirmed')  // CONFIRMED only - not done
         .not('gha_done_at', 'is', null)
         .gte('gha_done_at', monthStart)
         .lt('gha_done_at', monthEnd);
