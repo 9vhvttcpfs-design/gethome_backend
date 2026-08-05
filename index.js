@@ -6055,7 +6055,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       if (updateErr) console.error('Deposit confirm update failed (non-blocking):', updateErr.message);
 
       const { data: property } = await adminClient.from('properties')
-        .select('title, created_by').eq('deposit_reference', reference).single();
+        .select('id, title, location, created_by').eq('deposit_reference', reference).single();
 
       if (property) {
         const { data: agentProfile } = await adminClient.from('profiles')
@@ -6072,6 +6072,48 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           }]);
           if (notifErr) console.error('Notification insert failed (non-blocking):', notifErr.message);
         }
+      }
+
+      // After successful deposit confirmation send WhatsApp to GetHome admin
+      if (property) {
+        var propertyId = property.id;
+        var updatedProperty = property;
+        var paymentAmount = parseFloat(event?.data?.amount || 0).toLocaleString();
+        var currency = event?.data?.currency || 'NGN';
+        var customerEmail = event?.data?.customer?.email || 'Unknown';
+        var customerName = event?.data?.customer?.name || 'Unknown';
+        var txRef = event?.data?.tx_ref || 'N/A';
+
+        // WhatsApp number is admin-configurable via app_settings (payment_whatsapp),
+        // falling back to the env var, falling back to a hardcoded default
+        const { data: waSetting } = await adminClient.from('app_settings')
+          .select('setting_value').eq('setting_key', 'payment_whatsapp').maybeSingle();
+        var getHomeWhatsApp = waSetting?.setting_value || process.env.GETHOME_WHATSAPP || '+234 913 064 9368';
+
+        var paymentMsg = 'New Payment Received on GetHome 💰\n\n' +
+          'Amount: ' + currency + ' ' + paymentAmount + '\n' +
+          'Customer: ' + customerName + '\n' +
+          'Email: ' + customerEmail + '\n' +
+          'Property: ' + (updatedProperty?.title || 'Property #' + propertyId) + '\n' +
+          'Location: ' + (updatedProperty?.location || 'N/A') + '\n' +
+          'Reference: ' + txRef + '\n' +
+          'Time: ' + new Date().toLocaleString('en-NG', { timeZone: 'Africa/Lagos' });
+
+        // wa.me requires digits only (no +, spaces or dashes) for the link to open in one tap
+        var waNumber = getHomeWhatsApp.replace(/[^\d]/g, '');
+        var waLink = 'https://wa.me/' + waNumber + '?text=' + encodeURIComponent(paymentMsg);
+
+        // Store in notifications with WhatsApp link so admin can tap to notify
+        const { error: notifErr } = await adminClient.from('notifications').insert([{
+          recipient_type: 'ADMIN',
+          recipient_id: 'admin',
+          type: 'payment_received',
+          title: 'Payment: ' + currency + ' ' + paymentAmount + ' — Tap to notify via WhatsApp',
+          message: paymentMsg,
+          is_read: false,
+          meta: JSON.stringify({ whatsapp_link: waLink, amount: paymentAmount, customer: customerName }),
+        }]);
+        if (notifErr) console.error('Payment notification failed:', notifErr.message);
       }
     }
 
@@ -8546,6 +8588,86 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
     });
   } catch (err) {
     console.error('Manual upgrade error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/settings - public endpoint to fetch app settings
+app.get('/api/settings', async (req, res) => {
+  try {
+    const { data: settings } = await adminClient
+      .from('app_settings')
+      .select('setting_key, setting_value, setting_json');
+
+    var result = {};
+    (settings || []).forEach(function(s) {
+      result[s.setting_key] = s.setting_json || s.setting_value;
+    });
+
+    // Ensure the WhatsApp number is always present for the frontend, even if
+    // no admin has customized it yet (falls back to env var, then hardcoded default)
+    if (!result.payment_whatsapp) {
+      result.payment_whatsapp = process.env.GETHOME_WHATSAPP || '+234 913 064 9368';
+    }
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/settings - admin updates any setting
+// Also used to save 'payment_whatsapp' (the number the Flutterwave webhook
+// notifies on) — this overrides the GETHOME_WHATSAPP env var since the
+// webhook reads the number from app_settings first, falling back to the env var.
+app.post('/api/admin/settings', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { setting_key, setting_value, setting_json } = req.body;
+    if (!setting_key) return res.status(400).json({ error: 'setting_key is required' });
+
+    const { data, error } = await adminClient
+      .from('app_settings')
+      .upsert([{
+        setting_key,
+        setting_value: setting_value || null,
+        setting_json: setting_json || null,
+        updated_at: new Date().toISOString(),
+        updated_by: admin.id,
+      }], { onConflict: 'setting_key' })
+      .select().single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    console.log('Setting updated:', setting_key, '| by admin:', admin.id);
+    res.json({ success: true, setting: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/toggle-ads - toggle ads on/off
+app.post('/api/admin/toggle-ads', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: current } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'ads_enabled')
+      .single();
+
+    var newValue = current?.setting_value === 'true' ? 'false' : 'true';
+
+    await adminClient.from('app_settings')
+      .update({ setting_value: newValue, updated_at: new Date().toISOString() })
+      .eq('setting_key', 'ads_enabled');
+
+    console.log('Ads toggled:', newValue);
+    res.json({ success: true, ads_enabled: newValue === 'true' });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
