@@ -8672,6 +8672,128 @@ app.post('/api/admin/toggle-ads', async (req, res) => {
   }
 });
 
+// POST /api/admin/make-admin - only super admin can promote users to admin
+app.post('/api/admin/make-admin', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Check if the requesting admin is super admin
+    const { data: adminProfile } = await adminClient
+      .from('profiles')
+      .select('email, admin_level, role')
+      .eq('id', admin.id)
+      .single();
+
+    if (adminProfile?.email !== 'medibrhm07@gmail.com' && adminProfile?.admin_level !== 'super_admin') {
+      return res.status(403).json({ error: 'Only the super admin can grant admin access.' });
+    }
+
+    const { target_email, target_user_id } = req.body;
+    if (!target_email && !target_user_id) {
+      return res.status(400).json({ error: 'target_email or target_user_id is required' });
+    }
+
+    // Find the target user
+    var query = adminClient.from('profiles').select('id, email, full_name, role');
+    if (target_user_id) {
+      query = query.eq('id', target_user_id);
+    } else {
+      query = query.eq('email', target_email.trim().toLowerCase());
+    }
+
+    const { data: targetProfile } = await query.single();
+    if (!targetProfile) return res.status(404).json({ error: 'User not found. Make sure they have a GetHome account.' });
+
+    // Prevent super admin from being overwritten
+    if (targetProfile.email === 'medibrhm07@gmail.com') {
+      return res.status(400).json({ error: 'Cannot modify super admin account.' });
+    }
+
+    // Grant admin role
+    const { error: updateErr } = await adminClient.from('profiles')
+      .update({ role: 'admin', admin_level: 'admin' })
+      .eq('id', targetProfile.id);
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    console.log('Admin granted to:', targetProfile.email, '| by super admin:', adminProfile.email);
+    res.json({
+      success: true,
+      message: targetProfile.full_name || targetProfile.email + ' has been granted admin access.',
+      user: { id: targetProfile.id, email: targetProfile.email, full_name: targetProfile.full_name },
+    });
+  } catch (err) {
+    console.error('Make admin error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/revoke-admin - only super admin can remove admin access
+app.post('/api/admin/revoke-admin', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: adminProfile } = await adminClient
+      .from('profiles')
+      .select('email, admin_level')
+      .eq('id', admin.id)
+      .single();
+
+    if (adminProfile?.email !== 'medibrhm07@gmail.com' && adminProfile?.admin_level !== 'super_admin') {
+      return res.status(403).json({ error: 'Only the super admin can revoke admin access.' });
+    }
+
+    const { target_user_id } = req.body;
+    if (!target_user_id) return res.status(400).json({ error: 'target_user_id is required' });
+
+    const { data: targetProfile } = await adminClient
+      .from('profiles').select('email, full_name').eq('id', target_user_id).single();
+
+    if (!targetProfile) return res.status(404).json({ error: 'User not found' });
+    if (targetProfile.email === 'medibrhm07@gmail.com') {
+      return res.status(400).json({ error: 'Cannot revoke super admin access.' });
+    }
+
+    const { error: updateErr } = await adminClient.from('profiles')
+      .update({ role: 'customer', admin_level: null })
+      .eq('id', target_user_id);
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    console.log('Admin revoked from:', targetProfile.email, '| by:', adminProfile.email);
+    res.json({ success: true, message: (targetProfile.full_name || targetProfile.email) + ' admin access has been revoked.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/admin-list - get all admins
+app.get('/api/admin/admin-list', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: adminProfile } = await adminClient
+      .from('profiles').select('email, admin_level').eq('id', admin.id).single();
+
+    if (adminProfile?.email !== 'medibrhm07@gmail.com' && adminProfile?.admin_level !== 'super_admin') {
+      return res.status(403).json({ error: 'Super admin access required' });
+    }
+
+    const { data: admins } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, admin_level, created_at')
+      .eq('role', 'admin')
+      .order('admin_level', { ascending: false });
+
+    res.json(admins || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
