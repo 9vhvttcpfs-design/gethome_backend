@@ -5936,7 +5936,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           if (agentProfile?.gha_id) {
             const ghaCommission = Math.round(amount * 0.05);
             console.log('Commission calc:', amount, '* 5% =', ghaCommission);
-            const { error: ghaEarnErr } = await adminClient.from('gha_earnings').insert([{
+            const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
               gha_id: agentProfile.gha_id,
               agent_id: agentId,
               agent_email: agentProfile.email,
@@ -5945,8 +5945,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               commission_amount: ghaCommission,
               month_year: monthYear,
               is_paid: false,
-            }]);
-            if (ghaEarnErr) console.error('GHA earnings insert failed (non-blocking):', ghaEarnErr.message);
+            }], { onConflict: 'gha_id,agent_id,month_year', ignoreDuplicates: false });
+            if (ghaEarnErr) console.error('GHA earnings upsert failed (non-blocking):', ghaEarnErr.message);
             else console.log('GHA earnings created:', agentProfile.gha_id, 'commission:', ghaCommission);
 
             // Notify GHA
@@ -5965,7 +5965,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           if (agentProfile?.sa_id) {
             const saCommission = Math.round(amount * 0.05);
             console.log('Commission calc:', amount, '* 5% =', saCommission);
-            const { error: saEarnErr } = await adminClient.from('sa_earnings').insert([{
+            const { error: saEarnErr } = await adminClient.from('sa_earnings').upsert([{
               sa_id: agentProfile.sa_id,
               gha_id: agentProfile.gha_id || null,
               agent_id: agentId,
@@ -5974,8 +5974,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               commission_amount: saCommission,
               month_year: monthYear,
               is_paid: false,
-            }]);
-            if (saEarnErr) console.error('SA earnings insert failed (non-blocking):', saEarnErr.message);
+            }], { onConflict: 'sa_id,agent_id,month_year', ignoreDuplicates: false });
+            if (saEarnErr) console.error('SA earnings upsert failed (non-blocking):', saEarnErr.message);
             else console.log('SA earnings created:', agentProfile.sa_id, 'commission:', saCommission);
 
             // Notify SA
@@ -8307,7 +8307,7 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
     const commission = Math.round(subscriptionAmount * 0.05);
 
     if (profile.gha_id) {
-      const { error: ghaEarnErr } = await adminClient.from('gha_earnings').insert([{
+      const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
         gha_id: profile.gha_id,
         agent_id: profile.id,
         agent_email: agent_email,
@@ -8316,12 +8316,12 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         commission_amount: commission,
         month_year: monthYear,
         is_paid: false,
-      }]);
-      if (ghaEarnErr) console.error('GHA earnings insert failed:', ghaEarnErr.message);
+      }], { onConflict: 'gha_id,agent_id,month_year', ignoreDuplicates: false });
+      if (ghaEarnErr) console.error('GHA earnings upsert failed:', ghaEarnErr.message);
     }
 
     if (profile.sa_id) {
-      const { error: saEarnErr } = await adminClient.from('sa_earnings').insert([{
+      const { error: saEarnErr } = await adminClient.from('sa_earnings').upsert([{
         sa_id: profile.sa_id,
         gha_id: profile.gha_id || null,
         agent_id: profile.id,
@@ -8330,8 +8330,8 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         commission_amount: commission,
         month_year: monthYear,
         is_paid: false,
-      }]);
-      if (saEarnErr) console.error('SA earnings insert failed:', saEarnErr.message);
+      }], { onConflict: 'sa_id,agent_id,month_year', ignoreDuplicates: false });
+      if (saEarnErr) console.error('SA earnings upsert failed:', saEarnErr.message);
     }
 
     console.log('Manual upgrade:', agent_email, tier, '| by admin:', admin.id);
