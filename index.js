@@ -5759,22 +5759,28 @@ app.post('/api/agent/upgrade', async (req, res) => {
   }
 
   if (userId) {
-    const { error: profileSubErr } = await adminClient.from('profiles').update({
-      subscription_tier: tier,
-      subscription_start: new Date().toISOString(),
-      subscription_end: subscriptionEndIso,
-      subscription_status: 'active',
-    }).eq('id', userId);
-    if (profileSubErr) console.error('Profile subscription sync failed:', profileSubErr.message);
+    // Update agents table (primary source for subscription data)
+    const { error: agentSubErr } = await adminClient
+      .from('agents')
+      .update({
+        subscription_tier: tier,
+        subscription_status: 'active',
+        subscription_end: subscriptionEndIso,
+      })
+      .eq('id', userId);
+    if (agentSubErr) console.error('Agents subscription update failed:', agentSubErr.message);
 
-    const { error: agentSubErr } = await adminClient.from('agents').update({
-      subscription_tier: tier,
-      subscription_end: subscriptionEndIso,
-    }).eq('id', userId);
-    if (agentSubErr) {
-      console.error('Agent table subscription sync failed (non-blocking):', agentSubErr.message);
-      // non-blocking - do not throw, just log and continue, since this is typically a notification insert that should never crash the main action
-    }
+    // Also update profiles table for any reads that check there
+    const { error: profileSubErr } = await adminClient
+      .from('profiles')
+      .update({
+        subscription_tier: tier,
+        subscription_start: new Date().toISOString(),
+        subscription_end: subscriptionEndIso,
+        subscription_status: 'active',
+      })
+      .eq('id', userId);
+    if (profileSubErr) console.error('Profiles subscription update failed:', profileSubErr.message);
   } else {
     console.error('Agent upgrade: could not resolve user ID for email', agent_email, '— DB not updated');
   }
@@ -6084,26 +6090,35 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         const daysToAdd = tierDurations[tier] || 30;
         const subscriptionEnd = new Date(Date.now() + daysToAdd * 24 * 60 * 60 * 1000).toISOString();
 
-        // Update agent subscription in profiles
-        const { error: subErr } = await adminClient.from('profiles').update({
-          subscription_tier: tier,
-          subscription_start: new Date().toISOString(),
-          subscription_end: subscriptionEnd,
-          subscription_amount: amount,
-          subscription_status: 'active',
-        }).eq('id', agentId);
+        // Update agents table (primary source for subscription data)
+        const { error: agentSubErr } = await adminClient
+          .from('agents')
+          .update({
+            subscription_tier: tier,
+            subscription_status: 'active',
+            subscription_end: subscriptionEnd,
+            subscription_amount: amount,
+          })
+          .eq('id', agentId);
+        if (agentSubErr) console.error('Agents subscription update failed:', agentSubErr.message);
 
-        if (subErr) {
-          console.error('Subscription update failed (non-blocking):', subErr.message);
+        // Also update profiles table for any reads that check there
+        const { error: profileSubErr } = await adminClient
+          .from('profiles')
+          .update({
+            subscription_tier: tier,
+            subscription_start: new Date().toISOString(),
+            subscription_end: subscriptionEnd,
+            subscription_amount: amount,
+            subscription_status: 'active',
+          })
+          .eq('id', agentId);
+        if (profileSubErr) console.error('Profiles subscription update failed:', profileSubErr.message);
+
+        if (agentSubErr && profileSubErr) {
+          console.error('Subscription update failed on both tables (non-blocking):', agentSubErr.message, profileSubErr.message);
         } else {
           console.log('Agent subscription updated:', agentId, tier, subscriptionEnd);
-
-          // Also sync to agents table
-          const { error: agentSyncErr } = await adminClient.from('agents').update({
-            subscription_tier: tier,
-            subscription_end: subscriptionEnd,
-          }).eq('id', agentId);
-          if (agentSyncErr) console.error('Agents table sync failed (non-blocking):', agentSyncErr.message);
 
           // Get agent's GHA and SA for earnings calculation
           const { data: agentProfile } = await adminClient
@@ -8479,10 +8494,17 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
     if (profileErr) return res.status(500).json({ error: profileErr.message });
     if (!profile) return res.status(404).json({ error: 'Agent not found' });
 
-    // Update agents table
-    await adminClient.from('agents')
-      .update({ subscription_tier: tier })
-      .eq('email', agent_email);
+    // Update agents table (primary source for subscription data)
+    const { error: agentSubErr } = await adminClient
+      .from('agents')
+      .update({
+        subscription_tier: tier,
+        subscription_status: 'active',
+        subscription_end: subscriptionEnd,
+        subscription_amount: subscriptionAmount,
+      })
+      .eq('id', profile.id);
+    if (agentSubErr) console.error('Agents subscription update failed:', agentSubErr.message);
 
     // Create earnings rows for GHA and SA
     const monthYear = getBillingMonth();
