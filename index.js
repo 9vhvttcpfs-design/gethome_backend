@@ -8685,7 +8685,14 @@ app.post('/api/admin/make-admin', async (req, res) => {
       .eq('id', admin.id)
       .single();
 
-    if (adminProfile?.email !== 'medibrhm07@gmail.com' && adminProfile?.admin_level !== 'super_admin') {
+    // Get email from auth user directly as fallback
+    const { data: authUser } = await adminClient.auth.admin.getUserById(admin.id);
+    var adminEmail = adminProfile?.email || authUser?.user?.email || '';
+
+    var isSuperAdmin = adminEmail === 'medibrhm07@gmail.com' ||
+      adminProfile?.admin_level === 'super_admin';
+
+    if (!isSuperAdmin) {
       return res.status(403).json({ error: 'Only the super admin can grant admin access.' });
     }
 
@@ -8717,7 +8724,7 @@ app.post('/api/admin/make-admin', async (req, res) => {
 
     if (updateErr) return res.status(500).json({ error: updateErr.message });
 
-    console.log('Admin granted to:', targetProfile.email, '| by super admin:', adminProfile.email);
+    console.log('Admin granted to:', targetProfile.email, '| by super admin:', adminEmail);
     res.json({
       success: true,
       message: targetProfile.full_name || targetProfile.email + ' has been granted admin access.',
@@ -8741,7 +8748,14 @@ app.post('/api/admin/revoke-admin', async (req, res) => {
       .eq('id', admin.id)
       .single();
 
-    if (adminProfile?.email !== 'medibrhm07@gmail.com' && adminProfile?.admin_level !== 'super_admin') {
+    // Get email from auth user directly as fallback
+    const { data: authUser } = await adminClient.auth.admin.getUserById(admin.id);
+    var adminEmail = adminProfile?.email || authUser?.user?.email || '';
+
+    var isSuperAdmin = adminEmail === 'medibrhm07@gmail.com' ||
+      adminProfile?.admin_level === 'super_admin';
+
+    if (!isSuperAdmin) {
       return res.status(403).json({ error: 'Only the super admin can revoke admin access.' });
     }
 
@@ -8762,7 +8776,7 @@ app.post('/api/admin/revoke-admin', async (req, res) => {
 
     if (updateErr) return res.status(500).json({ error: updateErr.message });
 
-    console.log('Admin revoked from:', targetProfile.email, '| by:', adminProfile.email);
+    console.log('Admin revoked from:', targetProfile.email, '| by:', adminEmail);
     res.json({ success: true, message: (targetProfile.full_name || targetProfile.email) + ' admin access has been revoked.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -8778,7 +8792,14 @@ app.get('/api/admin/admin-list', async (req, res) => {
     const { data: adminProfile } = await adminClient
       .from('profiles').select('email, admin_level').eq('id', admin.id).single();
 
-    if (adminProfile?.email !== 'medibrhm07@gmail.com' && adminProfile?.admin_level !== 'super_admin') {
+    // Get email from auth user directly as fallback
+    const { data: authUser } = await adminClient.auth.admin.getUserById(admin.id);
+    var adminEmail = adminProfile?.email || authUser?.user?.email || '';
+
+    var isSuperAdmin = adminEmail === 'medibrhm07@gmail.com' ||
+      adminProfile?.admin_level === 'super_admin';
+
+    if (!isSuperAdmin) {
       return res.status(403).json({ error: 'Super admin access required' });
     }
 
