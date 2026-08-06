@@ -8710,15 +8710,38 @@ app.post('/api/admin/make-admin', async (req, res) => {
       targetProfile = data;
       if (!targetProfile) return res.status(404).json({ error: 'User not found. Make sure they have a GetHome account.' });
     } else {
-      // Step 1: Find user in auth.users by email
-      const { data: authUsers } = await adminClient.auth.admin.listUsers();
-      var targetAuthUser = (authUsers?.users || []).find(function(u) {
-        return u.email?.toLowerCase() === target_email.trim().toLowerCase();
-      });
+      // Look up user directly by email using service role admin API
+      const { data: userList } = await adminClient.auth.admin.listUsers({ perPage: 1000 });
+
+      var targetAuthUser = null;
+      if (userList?.users) {
+        targetAuthUser = userList.users.find(function(u) {
+          return (u.email || '').toLowerCase() === target_email.trim().toLowerCase();
+        });
+      }
+
+      // If not found via listUsers, fall back to matching by email in profiles
+      if (!targetAuthUser) {
+        console.log('User not found in listUsers, trying profiles lookup for:', target_email);
+        const { data: profileByEmail } = await adminClient
+          .from('profiles')
+          .select('id, email, full_name, role')
+          .ilike('email', target_email.trim())
+          .maybeSingle();
+
+        if (profileByEmail) {
+          targetAuthUser = { id: profileByEmail.id, email: profileByEmail.email };
+        }
+      }
 
       if (!targetAuthUser) {
-        return res.status(404).json({ error: 'User not found. Make sure they have a GetHome account with this email.' });
+        console.log('User not found:', target_email);
+        return res.status(404).json({
+          error: 'User not found with email: ' + target_email + '. Make sure they have logged into GetHome at least once.',
+        });
       }
+
+      console.log('Found target user:', targetAuthUser.id, targetAuthUser.email);
 
       // Step 2: Get or create their profile
       var { data: profileData } = await adminClient
