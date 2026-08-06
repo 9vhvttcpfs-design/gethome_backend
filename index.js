@@ -6340,6 +6340,17 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             }]);
             if (notifErr) console.error('Featured listing notification failed (non-blocking):', notifErr.message);
           }
+
+          // Notify the agent directly that their listing is now featured
+          const { error: agentNotifErr } = await adminClient.from('notifications').insert([{
+            recipient_type: 'AGENT',
+            recipient_id: featuredProperty.created_by,
+            type: 'listing_featured',
+            title: 'Listing Featured Successfully',
+            message: 'Your listing "' + (featuredProperty.title || 'Property') + '" is now featured and will appear at the top of search results.',
+            is_read: false,
+          }]);
+          if (agentNotifErr) console.error('Agent featured notification failed (non-blocking):', agentNotifErr.message);
         }
       }
     }
@@ -6347,6 +6358,62 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     res.status(200).json({ received: true });
   } catch (err) {
     console.error('Flutterwave webhook exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/agent/notifications
+app.get('/api/agent/notifications', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: notifs, error: notifErr } = await adminClient
+      .from('notifications')
+      .select('*')
+      .eq('recipient_type', 'AGENT')
+      .eq('recipient_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (notifErr) {
+      console.error('Agent notifications query error:', notifErr.message, notifErr.code);
+      return res.json({ notifications: [], unread_count: 0 });
+    }
+
+    const safeNotifs = notifs || [];
+    const unreadCount = safeNotifs.filter(function(n) { return n.is_read === false || n.is_read === null; }).length;
+
+    res.json({ notifications: safeNotifs, unread_count: unreadCount });
+  } catch (err) {
+    console.error('Agent notifications exception:', err.message);
+    res.json({ notifications: [], unread_count: 0 });
+  }
+});
+
+// POST /api/agent/mark-notifications-read
+app.post('/api/agent/mark-notifications-read', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { notification_id } = req.body;
+    if (notification_id) {
+      await adminClient.from('notifications').update({ is_read: true })
+        .eq('id', notification_id).eq('recipient_type', 'AGENT').eq('recipient_id', user.id);
+    } else {
+      await adminClient.from('notifications').update({ is_read: true })
+        .eq('recipient_type', 'AGENT').eq('recipient_id', user.id).eq('is_read', false);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Agent mark-notifications-read exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
