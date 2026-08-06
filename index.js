@@ -6031,6 +6031,80 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
   }
 });
 
+// POST /api/properties/:id/feature-payment - agent pays to feature their listing
+app.post('/api/properties/:id/feature-payment', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const propertyId = req.params.id;
+    const { data: property } = await adminClient
+      .from('properties')
+      .select('id, title, created_by')
+      .eq('id', propertyId)
+      .single();
+
+    if (!property) return res.status(404).json({ error: 'Property not found' });
+    if (property.created_by !== user.id) {
+      return res.status(403).json({ error: 'You can only feature your own listings' });
+    }
+
+    const { data: profile } = await adminClient
+      .from('profiles')
+      .select('full_name, email')
+      .eq('id', user.id)
+      .single();
+
+    // Get featured fee from settings
+    const { data: feeSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'featured_listing_fee')
+      .single();
+
+    var featuredFee = parseFloat(feeSetting?.setting_value || 5000);
+
+    const reference = 'GH-FEAT-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
+
+    const flwPayload = {
+      tx_ref: reference,
+      amount: featuredFee,
+      currency: 'NGN',
+      redirect_url: 'https://trygethome.online/?payment=success&type=featured_listing',
+      customer: { email: profile?.email || user.email, name: profile?.full_name || user.email },
+      customizations: { title: 'GetHome', description: 'Feature listing: ' + property.title },
+      meta: { payment_type: 'featured_listing', property_id: propertyId, agent_id: user.id },
+    };
+
+    const initRes = await fetch('https://api.flutterwave.com/v3/payments', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(flwPayload),
+    });
+    const initData = await initRes.json();
+    if (initData.status !== 'success') {
+      console.error('Flutterwave featured-listing init failed:', JSON.stringify(initData));
+      return res.status(500).json({ error: 'Failed to initialize payment' });
+    }
+
+    await adminClient.from('properties')
+      .update({ featured_payment_status: 'processing' })
+      .eq('id', propertyId)
+      .catch(e => console.error('Featured status update failed:', e.message));
+
+    console.log('Featured listing payment initialized:', reference, '| property:', propertyId, '| fee:', featuredFee);
+    res.json({ checkout_url: initData.data.link, reference: reference, fee: featuredFee });
+  } catch (err) {
+    console.error('Feature payment init exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/flutterwave/webhook', async (req, res) => {
   console.log('Flutterwave webhook received:', JSON.stringify(req.body).substring(0, 200));
   console.log('Webhook headers:', JSON.stringify(req.headers['verif-hash'] || req.headers['v-hash'] || 'no-hash'));
@@ -6227,6 +6301,44 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               is_read: false,
             }]);
             if (saNotifErr) console.error('SA notification failed (non-blocking):', saNotifErr.message);
+          }
+        }
+      }
+    }
+
+    // Handle featured-listing payments
+    if (status === 'successful' && event?.data?.meta?.payment_type === 'featured_listing') {
+      const featuredPropertyId = event?.data?.meta?.property_id;
+      if (featuredPropertyId) {
+        const { error: featureErr } = await adminClient.from('properties')
+          .update({
+            is_featured: true,
+            featured_payment_reference: event?.data?.tx_ref || null,
+            featured_payment_amount: parseFloat(event?.data?.amount || 0),
+            featured_paid_at: new Date().toISOString(),
+            featured_payment_status: 'paid',
+          })
+          .eq('id', featuredPropertyId);
+        if (featureErr) console.error('Featured listing update failed:', featureErr.message);
+        else console.log('Property featured via payment:', featuredPropertyId, '| ref:', reference);
+
+        const { data: featuredProperty } = await adminClient.from('properties')
+          .select('title, created_by').eq('id', featuredPropertyId).single();
+
+        if (featuredProperty?.created_by) {
+          const { data: agentProfile } = await adminClient.from('profiles')
+            .select('sa_id').eq('id', featuredProperty.created_by).single();
+
+          if (agentProfile?.sa_id) {
+            const { error: notifErr } = await adminClient.from('notifications').insert([{
+              recipient_type: 'SA',
+              recipient_id: agentProfile.sa_id,
+              type: 'featured_listing_payment',
+              title: 'Featured Listing Payment',
+              message: 'Listing "' + (featuredProperty.title || 'Property') + '" is now featured. Reference: ' + reference,
+              is_read: false,
+            }]);
+            if (notifErr) console.error('Featured listing notification failed (non-blocking):', notifErr.message);
           }
         }
       }
@@ -8866,6 +8978,113 @@ app.get('/api/admin/admin-list', async (req, res) => {
       .order('admin_level', { ascending: false });
 
     res.json(admins || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/update-listing-price - admin overrides a listing's price
+app.post('/api/admin/update-listing-price', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { property_id, new_price, reason } = req.body;
+    if (!property_id || !new_price) {
+      return res.status(400).json({ error: 'property_id and new_price are required' });
+    }
+    if (parseFloat(new_price) <= 0) {
+      return res.status(400).json({ error: 'Price must be greater than zero' });
+    }
+
+    // Get current property details
+    const { data: property } = await adminClient
+      .from('properties')
+      .select('id, title, rent, price, created_by')
+      .eq('id', property_id)
+      .single();
+
+    if (!property) return res.status(404).json({ error: 'Property not found' });
+
+    // Update the price
+    const { error: updateErr } = await adminClient
+      .from('properties')
+      .update({
+        rent: parseFloat(new_price),
+        price: parseFloat(new_price),
+        price_override: parseFloat(new_price),
+        price_override_by: admin.id,
+        price_override_at: new Date().toISOString(),
+        price_override_reason: reason || null,
+      })
+      .eq('id', property_id);
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    // Notify the agent's SA (or GHA if unassigned) about the price change
+    if (property.created_by) {
+      const { data: agentProfile } = await adminClient
+        .from('profiles')
+        .select('sa_id, gha_id')
+        .eq('id', property.created_by)
+        .single();
+
+      var notifySaId = agentProfile?.sa_id;
+      if (!notifySaId && agentProfile?.gha_id) {
+        const { data: ghaRecord } = await adminClient
+          .from('gha_agents')
+          .select('sa_id')
+          .eq('id', agentProfile.gha_id)
+          .single();
+        notifySaId = ghaRecord?.sa_id || null;
+      }
+
+      if (notifySaId) {
+        await adminClient.from('notifications').insert([{
+          recipient_type: 'SA',
+          recipient_id: notifySaId,
+          type: 'price_updated',
+          title: 'Listing Price Updated',
+          message: 'The price for listing "' + property.title + '" has been updated to NGN ' + parseFloat(new_price).toLocaleString() + (reason ? '. Reason: ' + reason : '.'),
+          is_read: false,
+        }]).catch(e => console.error('Price update notification failed:', e.message));
+      }
+    }
+
+    console.log('Price updated:', property_id, '| new price:', new_price, '| by admin:', admin.id);
+    res.json({ success: true, message: 'Price updated to NGN ' + parseFloat(new_price).toLocaleString() });
+  } catch (err) {
+    console.error('Price update error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/all-listings - admin views all listings with price override info
+app.get('/api/admin/all-listings', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: listings, error } = await adminClient
+      .from('properties')
+      .select('id, title, location, rent, price, property_type, image_urls, created_at, created_by, price_override, price_override_at, price_override_reason, gha_verified, is_deleted')
+      .or('is_deleted.eq.false,is_deleted.is.null')
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Enrich with agent name
+    const enriched = await Promise.all((listings || []).map(async function(listing) {
+      var agentName = null;
+      if (listing.created_by) {
+        const { data: agent } = await adminClient
+          .from('profiles').select('full_name, email').eq('id', listing.created_by).maybeSingle();
+        agentName = agent?.full_name || agent?.email || null;
+      }
+      return Object.assign({}, listing, { agent_name: agentName });
+    }));
+
+    res.json(enriched);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
