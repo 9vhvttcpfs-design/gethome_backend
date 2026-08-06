@@ -8702,15 +8702,48 @@ app.post('/api/admin/make-admin', async (req, res) => {
     }
 
     // Find the target user
-    var query = adminClient.from('profiles').select('id, email, full_name, role');
+    var targetProfile;
     if (target_user_id) {
-      query = query.eq('id', target_user_id);
+      const { data } = await adminClient
+        .from('profiles').select('id, email, full_name, role')
+        .eq('id', target_user_id).single();
+      targetProfile = data;
+      if (!targetProfile) return res.status(404).json({ error: 'User not found. Make sure they have a GetHome account.' });
     } else {
-      query = query.eq('email', target_email.trim().toLowerCase());
-    }
+      // Step 1: Find user in auth.users by email
+      const { data: authUsers } = await adminClient.auth.admin.listUsers();
+      var targetAuthUser = (authUsers?.users || []).find(function(u) {
+        return u.email?.toLowerCase() === target_email.trim().toLowerCase();
+      });
 
-    const { data: targetProfile } = await query.single();
-    if (!targetProfile) return res.status(404).json({ error: 'User not found. Make sure they have a GetHome account.' });
+      if (!targetAuthUser) {
+        return res.status(404).json({ error: 'User not found. Make sure they have a GetHome account with this email.' });
+      }
+
+      // Step 2: Get or create their profile
+      var { data: profileData } = await adminClient
+        .from('profiles')
+        .select('id, email, full_name, role')
+        .eq('id', targetAuthUser.id)
+        .single();
+      targetProfile = profileData;
+
+      // If no profile exists create one
+      if (!targetProfile) {
+        const { data: newProfile } = await adminClient
+          .from('profiles')
+          .upsert([{
+            id: targetAuthUser.id,
+            email: targetAuthUser.email,
+            role: 'admin',
+            admin_level: 'admin',
+          }], { onConflict: 'id' })
+          .select().single();
+        targetProfile = newProfile;
+      }
+
+      if (!targetProfile) return res.status(500).json({ error: 'Could not create admin profile.' });
+    }
 
     // Prevent super admin from being overwritten
     if (targetProfile.email === 'medibrhm07@gmail.com') {
