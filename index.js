@@ -6136,6 +6136,26 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
     console.log('Flutterwave webhook received - reference:', reference, '| status:', status);
 
+    // Fallback: match by tx_ref for featured payments where meta might be missing
+    if (status === 'successful' && event?.data?.tx_ref) {
+      var txRef = event?.data?.tx_ref;
+      const { data: pendingFeatured } = await adminClient
+        .from('properties')
+        .select('id, title, created_by')
+        .eq('featured_payment_reference', txRef)
+        .eq('featured_payment_status', 'processing')
+        .maybeSingle();
+
+      if (pendingFeatured && !event?.data?.meta?.payment_type) {
+        console.log('Fallback featured match found by tx_ref:', txRef, pendingFeatured.id);
+        await adminClient.from('properties').update({
+          is_featured: true,
+          featured_paid_at: new Date().toISOString(),
+          featured_payment_status: 'paid',
+        }).eq('id', pendingFeatured.id);
+      }
+    }
+
     if (status === 'successful') {
       const { error: updateErr } = await adminClient.from('properties').update({
         deposit_status: 'confirmed',
@@ -6321,52 +6341,74 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       }
     }
 
-    // Handle featured-listing payments
+    // Handle featured listing payments
     if (status === 'successful' && event?.data?.meta?.payment_type === 'featured_listing') {
-      const featuredPropertyId = event?.data?.meta?.property_id;
+      var featuredPropertyId = event?.data?.meta?.property_id;
+      var featuredTxRef = event?.data?.tx_ref || event?.data?.flw_ref || null;
+      var featuredAmount = parseFloat(event?.data?.amount || 0);
+
+      console.log('Featured listing payment received - property:', featuredPropertyId, '| ref:', featuredTxRef, '| amount:', featuredAmount);
+
       if (featuredPropertyId) {
-        const { error: featureErr } = await adminClient.from('properties')
+        const { data: updatedProp, error: featErr } = await adminClient
+          .from('properties')
           .update({
             is_featured: true,
-            featured_payment_reference: event?.data?.tx_ref || null,
-            featured_payment_amount: parseFloat(event?.data?.amount || 0),
+            featured_payment_reference: featuredTxRef,
+            featured_payment_amount: featuredAmount,
             featured_paid_at: new Date().toISOString(),
             featured_payment_status: 'paid',
           })
-          .eq('id', featuredPropertyId);
-        if (featureErr) console.error('Featured listing update failed:', featureErr.message);
-        else console.log('Property featured via payment:', featuredPropertyId, '| ref:', reference);
+          .eq('id', featuredPropertyId)
+          .select('id, title, created_by')
+          .single();
 
-        const { data: featuredProperty } = await adminClient.from('properties')
-          .select('title, created_by').eq('id', featuredPropertyId).single();
+        if (featErr) {
+          console.error('Featured listing DB update failed:', featErr.message, '| property:', featuredPropertyId);
+        } else {
+          console.log('Property featured successfully:', featuredPropertyId, updatedProp?.title);
 
-        if (featuredProperty?.created_by) {
-          const { data: agentProfile } = await adminClient.from('profiles')
-            .select('sa_id').eq('id', featuredProperty.created_by).single();
+          if (updatedProp?.created_by) {
+            // Notify the SA over the agent, if any
+            const { data: agentProfile } = await adminClient.from('profiles')
+              .select('sa_id').eq('id', updatedProp.created_by).single();
 
-          if (agentProfile?.sa_id) {
+            if (agentProfile?.sa_id) {
+              const { error: saNotifErr } = await adminClient.from('notifications').insert([{
+                recipient_type: 'SA',
+                recipient_id: agentProfile.sa_id,
+                type: 'featured_listing_payment',
+                title: 'Featured Listing Payment',
+                message: 'Listing "' + (updatedProp.title || 'Property') + '" is now featured. Reference: ' + featuredTxRef,
+                is_read: false,
+              }]);
+              if (saNotifErr) console.error('SA featured notification failed (non-blocking):', saNotifErr.message);
+            }
+
+            // Notify the agent
             const { error: notifErr } = await adminClient.from('notifications').insert([{
-              recipient_type: 'SA',
-              recipient_id: agentProfile.sa_id,
-              type: 'featured_listing_payment',
-              title: 'Featured Listing Payment',
-              message: 'Listing "' + (featuredProperty.title || 'Property') + '" is now featured. Reference: ' + reference,
+              recipient_type: 'AGENT',
+              recipient_id: updatedProp.created_by,
+              type: 'listing_featured',
+              title: 'Listing Featured Successfully',
+              message: 'Your listing "' + (updatedProp.title || 'Property') + '" is now featured and will appear at the top of search results.',
               is_read: false,
             }]);
-            if (notifErr) console.error('Featured listing notification failed (non-blocking):', notifErr.message);
+            if (notifErr) console.error('Featured notification failed:', notifErr.message);
           }
 
-          // Notify the agent directly that their listing is now featured
-          const { error: agentNotifErr } = await adminClient.from('notifications').insert([{
-            recipient_type: 'AGENT',
-            recipient_id: featuredProperty.created_by,
-            type: 'listing_featured',
-            title: 'Listing Featured Successfully',
-            message: 'Your listing "' + (featuredProperty.title || 'Property') + '" is now featured and will appear at the top of search results.',
+          // Also notify admin
+          await adminClient.from('notifications').insert([{
+            recipient_type: 'ADMIN',
+            recipient_id: 'admin',
+            type: 'featured_payment_received',
+            title: 'Featured Listing Payment Received',
+            message: 'Property "' + (updatedProp?.title || 'Property #' + featuredPropertyId) + '" has been featured. Amount: NGN ' + featuredAmount.toLocaleString(),
             is_read: false,
-          }]);
-          if (agentNotifErr) console.error('Agent featured notification failed (non-blocking):', agentNotifErr.message);
+          }]).catch(e => console.error('Admin featured notification failed:', e.message));
         }
+      } else {
+        console.error('Featured payment received but no property_id in meta:', JSON.stringify(event?.data?.meta));
       }
     }
 
@@ -8947,15 +8989,24 @@ app.post('/api/admin/mark-property-featured', async (req, res) => {
   try {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
     const { property_id } = req.body;
     if (!property_id) return res.status(400).json({ error: 'property_id is required' });
-    const { data, error } = await adminClient.from('properties')
-      .update({ is_featured: true, featured_payment_status: 'paid', featured_paid_at: new Date().toISOString() })
+
+    const { data, error } = await adminClient
+      .from('properties')
+      .update({
+        is_featured: true,
+        featured_paid_at: new Date().toISOString(),
+        featured_payment_status: 'paid',
+      })
       .eq('id', property_id)
-      .select();
+      .select('id, title')
+      .single();
+
     if (error) return res.status(500).json({ error: error.message });
-    if (!data || data.length === 0) return res.status(404).json({ error: 'Property not found' });
-    res.json({ success: true, message: 'Listing marked as featured successfully' });
+    console.log('Property manually featured by admin:', property_id);
+    res.json({ success: true, message: (data?.title || 'Property') + ' marked as featured.' });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
