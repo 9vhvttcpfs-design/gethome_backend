@@ -150,6 +150,47 @@ async function sendCustomerEmail(to, subject, text) {
     console.log('No email credentials configured - skipping email to:', to);
   }
 }
+// Notify all approved agents by email when super admin toggles the commission policy
+async function notifyAgentsAboutCommission(enabled) {
+  try {
+    // Get all approved agents with emails
+    const { data: agents } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, agent_type')
+      .eq('role', 'agent')
+      .eq('status', 'approved');
+
+    if (!agents || agents.length === 0) return;
+
+    var commissionRate = 2.5;
+    var subject = enabled
+      ? 'Important: Commission Policy Update — GetHome'
+      : 'Commission Policy Update — GetHome';
+
+    var emailBody = enabled
+      ? 'Hello,\n\nGetHome has activated a 2.5% commission policy on all agency accounts.\n\nThis means that for every successful property transaction completed through GetHome, a 2.5% commission of the transaction amount will apply.\n\nWhen you next publish a listing, you will be required to read and agree to the commission terms before your listing goes live.\n\nIf you have any questions, please contact your Service Agent.\n\nThank you for being part of GetHome.\n\nThe GetHome Team\nhttps://trygethome.online'
+      : 'Hello,\n\nGetHome has deactivated the 2.5% commission policy.\n\nNo commission will apply to your listings at this time.\n\nThank you for being part of GetHome.\n\nThe GetHome Team\nhttps://trygethome.online';
+
+    // Send email to each agent
+    var emailPromises = agents.map(async function(agent) {
+      if (!agent.email) return;
+      try {
+        await sendCustomerEmail(agent.email, subject, emailBody.replace('Hello,', 'Hello ' + (agent.full_name || 'Agent') + ','));
+        // Mark as notified
+        await adminClient.from('profiles')
+          .update({ commission_notified_at: new Date().toISOString() })
+          .eq('id', agent.id);
+      } catch(e) {
+        console.error('Commission notification failed for:', agent.email, e.message);
+      }
+    });
+
+    await Promise.allSettled(emailPromises);
+    console.log('Commission notification sent to', agents.length, 'agents');
+  } catch(err) {
+    console.error('notifyAgentsAboutCommission error:', err.message);
+  }
+}
 // Send SMS via Termii
 // Add TERMII_API_KEY and TERMII_SENDER_ID to Render env vars
 async function sendSMS(phone, message) {
@@ -6124,6 +6165,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
   console.log('Webhook headers:', JSON.stringify(req.headers['verif-hash'] || req.headers['v-hash'] || 'no-hash'));
   try {
     const signature = req.headers['verif-hash'];
+    console.log('Webhook hash check - received:', signature, '| expected:', process.env.FLW_WEBHOOK_HASH, '| match:', signature === process.env.FLW_WEBHOOK_HASH);
     if (!signature || signature !== process.env.FLW_WEBHOOK_HASH) {
       console.error('Flutterwave webhook signature mismatch - possible spoofed request');
       return res.status(401).json({ error: 'Invalid signature' });
@@ -8834,8 +8876,109 @@ app.post('/api/admin/settings', async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
     console.log('Setting updated:', setting_key, '| by admin:', admin.id);
+
+    // After saving setting successfully
+    if (setting_key === 'agency_commission_enabled') {
+      var commissionEnabled = setting_value === 'true';
+      // Send emails to all agents in background
+      setImmediate(function() {
+        notifyAgentsAboutCommission(commissionEnabled);
+      });
+      console.log('Commission toggled:', commissionEnabled, '— notifying agents');
+    }
+
     res.json({ success: true, setting: data });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/commission-listings - admin views all listings with commission tracking
+app.get('/api/admin/commission-listings', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: listings } = await adminClient
+      .from('properties')
+      .select('id, title, location, rent, price, commission_applicable, commission_rate, commission_amount, commission_agreed_at, commission_paid, commission_paid_at, created_by, deposit_status, deposit_confirmed, deposit_amount')
+      .eq('commission_applicable', true)
+      .or('is_deleted.eq.false,is_deleted.is.null')
+      .order('commission_agreed_at', { ascending: false });
+
+    // Enrich with agent details
+    const enriched = await Promise.all((listings || []).map(async function(l) {
+      var agentName = null;
+      var agentEmail = null;
+      if (l.created_by) {
+        const { data: agent } = await adminClient
+          .from('profiles')
+          .select('full_name, email, agent_type')
+          .eq('id', l.created_by)
+          .maybeSingle();
+        agentName = agent?.full_name || agent?.email || null;
+        agentEmail = agent?.email || null;
+      }
+      return Object.assign({}, l, {
+        agent_name: agentName,
+        agent_email: agentEmail,
+        display_price: parseFloat(l.rent || l.price || 0),
+        commission_due: parseFloat(l.commission_amount || 0),
+      });
+    }));
+
+    var totalCommissionDue = enriched.reduce(function(sum, l) {
+      return sum + (l.commission_paid ? 0 : parseFloat(l.commission_amount || 0));
+    }, 0);
+
+    var totalCommissionPaid = enriched.reduce(function(sum, l) {
+      return sum + (l.commission_paid ? parseFloat(l.commission_amount || 0) : 0);
+    }, 0);
+
+    res.json({
+      listings: enriched,
+      totals: {
+        total_listings: enriched.length,
+        commission_due: totalCommissionDue,
+        commission_paid: totalCommissionPaid,
+        unpaid_count: enriched.filter(function(l) { return !l.commission_paid; }).length,
+      }
+    });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/mark-listing-commission-paid - mark listing commission as paid
+app.post('/api/admin/mark-listing-commission-paid', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { property_id } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+
+    const { data: prop } = await adminClient
+      .from('properties')
+      .select('title, commission_amount, created_by')
+      .eq('id', property_id)
+      .single();
+
+    if (!prop) return res.status(404).json({ error: 'Property not found' });
+
+    const { error: updateErr } = await adminClient
+      .from('properties')
+      .update({
+        commission_paid: true,
+        commission_paid_at: new Date().toISOString(),
+      })
+      .eq('id', property_id);
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    console.log('Commission marked paid for property:', property_id);
+    res.json({ success: true, message: 'Commission marked as paid for: ' + prop.title });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
