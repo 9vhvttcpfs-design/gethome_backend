@@ -766,60 +766,19 @@ app.get('/api/admin/transactions', async (req, res) => {
 // ──────────────────────────────────────────────────────────
 app.post('/api/admin/mark-commission-paid', async (req, res) => {
   try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'No token provided' });
-    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
-    const user = userData?.user;
-    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
-    const { data: callerProfile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
-    if (callerProfile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
     const { property_id } = req.body;
     if (!property_id) return res.status(400).json({ error: 'property_id is required' });
-    const commission_reference = 'COMM-' + Date.now();
-    const { data: property, error: fetchErr } = await adminClient
-      .from('properties')
-      .select('title, location, created_by, commission_amount')
-      .eq('id', property_id)
-      .single();
-    if (fetchErr || !property) return res.status(404).json({ error: 'Property not found' });
-    const { error: updateErr } = await adminClient
-      .from('properties')
-      .update({ commission_paid: true, commission_reference })
+    const { error } = await adminClient.from('properties')
+      .update({
+        commission_paid: true,
+        commission_paid_at: new Date().toISOString(),
+      })
       .eq('id', property_id);
-    if (updateErr) throw updateErr;
-    if (property.created_by) {
-      const { data: agentProfile } = await adminClient
-        .from('profiles')
-        .select('email, full_name')
-        .eq('id', property.created_by)
-        .single();
-      if (agentProfile?.email) {
-        setImmediate(async function() {
-          try {
-            await sendCustomerEmail(
-              agentProfile.email,
-              'GetHome Commission Processed - ' + property.title,
-              `Hello ${agentProfile.full_name || 'Agent'},
-
-This is to confirm that your GetHome commission for the property "${property.title}" has been processed.
-
-COMMISSION DETAILS
-Property          : ${property.title}
-Location          : ${property.location}
-Commission Amount : ₦${Number(property.commission_amount || 0).toLocaleString('en-NG')}
-Reference         : ${commission_reference}
-
-Thank you for being a valued partner of GetHome.
-The GetHome Team
-https://trygethome.online`
-            );
-          } catch (e) { console.error('Commission paid email error:', e.message); }
-        });
-      }
-    }
-    res.json({ success: true, commission_reference });
-  } catch (err) {
-    console.error('Mark commission paid error:', err.message);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
