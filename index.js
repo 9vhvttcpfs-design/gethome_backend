@@ -5986,14 +5986,16 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
     if (!amount || !customer_email) return res.status(400).json({ error: 'amount and customer_email are required' });
 
     const reference = 'GH-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
-    const isSubscription = req.body.meta?.payment_type === 'subscription';
+    var paymentType = req.body.meta?.payment_type || '';
 
     const flwPayload = {
       tx_ref: reference,
       amount: parseFloat(amount),
       currency: 'NGN',
-      redirect_url: isSubscription
+      redirect_url: paymentType === 'subscription'
         ? 'https://trygethome.online/?payment=success&type=subscription'
+        : paymentType === 'featured_listing'
+        ? 'https://trygethome.online/?featured_return=true'
         : 'https://trygethome.online/?payment=complete',
       customer: { email: customer_email, name: customer_name || customer_email },
       customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
@@ -6015,12 +6017,24 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
     }
 
     if (property_id) {
-      const { error: updateErr } = await adminClient.from('properties').update({
-        deposit_reference: reference,
-        deposit_amount: amount,
-        deposit_status: 'pending',
-      }).eq('id', property_id);
-      if (updateErr) console.error('Property deposit update failed (non-blocking):', updateErr.message);
+      if (paymentType === 'featured_listing') {
+        // Featured listing payment - update featured fields not deposit fields
+        const { error: featErr } = await adminClient.from('properties').update({
+          featured_payment_reference: reference,
+          featured_payment_status: 'processing',
+          featured_payment_amount: parseFloat(amount),
+        }).eq('id', property_id);
+        if (featErr) console.error('Featured property update failed (non-blocking):', featErr.message);
+        else console.log('Property marked as featured processing:', property_id);
+      } else {
+        // Regular deposit payment
+        const { error: updateErr } = await adminClient.from('properties').update({
+          deposit_reference: reference,
+          deposit_amount: amount,
+          deposit_status: 'pending',
+        }).eq('id', property_id);
+        if (updateErr) console.error('Property deposit update failed (non-blocking):', updateErr.message);
+      }
     }
 
     console.log('Flutterwave transaction initialized:', reference);
