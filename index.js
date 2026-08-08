@@ -6294,34 +6294,53 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
           const monthYear = getBillingMonth();
 
-          // Get commission rates from settings
-          const { data: ghaRateSetting } = await adminClient
-            .from('app_settings')
-            .select('setting_value')
-            .eq('setting_key', 'gha_commission_rate')
-            .single();
+          // Fetch dynamic commission rates
+          var ghaId = agentProfile?.gha_id;
+          var saId = agentProfile?.sa_id;
 
-          const { data: saRateSetting } = await adminClient
-            .from('app_settings')
-            .select('setting_value')
-            .eq('setting_key', 'sa_commission_rate')
-            .single();
+          const [ghaRateData, saRateData] = await Promise.all([
+            adminClient.from('app_settings').select('setting_value').eq('setting_key', 'gha_commission_rate').single(),
+            adminClient.from('app_settings').select('setting_value').eq('setting_key', 'sa_commission_rate').single(),
+          ]);
 
-          var ghaRate = parseFloat(ghaRateSetting?.setting_value || 5) / 100;
-          var saRate = parseFloat(saRateSetting?.setting_value || 5) / 100;
+          var globalGhaRate = parseFloat(ghaRateData?.data?.setting_value || 5);
+          var globalSaRate = parseFloat(saRateData?.data?.setting_value || 5);
 
-          console.log('Commission rates - GHA:', ghaRate * 100 + '%', '| SA:', saRate * 100 + '%');
+          // Check if this specific GHA/SA has an individual rate override
+          var ghaCommissionRate = globalGhaRate;
+          var saCommissionRate = globalSaRate;
+
+          if (ghaId) {
+            const { data: ghaData } = await adminClient
+              .from('gha_agents')
+              .select('commission_rate')
+              .eq('id', ghaId)
+              .single();
+            if (ghaData?.commission_rate) ghaCommissionRate = parseFloat(ghaData.commission_rate);
+          }
+
+          if (saId) {
+            const { data: saData } = await adminClient
+              .from('service_agents')
+              .select('commission_rate')
+              .eq('id', saId)
+              .single();
+            if (saData?.commission_rate) saCommissionRate = parseFloat(saData.commission_rate);
+          }
+
+          var ghaCommission = Math.round(amount * (ghaCommissionRate / 100));
+          var saCommission = Math.round(amount * (saCommissionRate / 100));
+
+          console.log('Commission rates - GHA:', ghaCommissionRate + '%', '=₦' + ghaCommission, '| SA:', saCommissionRate + '%', '=₦' + saCommission);
 
           // Create GHA earnings row
           if (agentProfile?.gha_id) {
-            const ghaCommission = Math.round(amount * ghaRate);
-            console.log('Commission calc:', amount, '*', (ghaRate * 100) + '% =', ghaCommission);
             const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
               gha_id: agentProfile.gha_id,
               agent_id: agentId,
               agent_email: agentProfile.email,
               subscription_amount: amount,
-              commission_rate: ghaRate * 100,
+              commission_rate: ghaCommissionRate,
               commission_amount: ghaCommission,
               month_year: monthYear,
               is_paid: false,
@@ -6343,14 +6362,12 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
           // Create SA earnings row
           if (agentProfile?.sa_id) {
-            const saCommission = Math.round(amount * saRate);
-            console.log('Commission calc:', amount, '*', (saRate * 100) + '% =', saCommission);
             const { error: saEarnErr } = await adminClient.from('sa_earnings').upsert([{
               sa_id: agentProfile.sa_id,
               gha_id: agentProfile.gha_id || null,
               agent_id: agentId,
               subscription_amount: amount,
-              commission_rate: saRate * 100,
+              commission_rate: saCommissionRate,
               commission_amount: saCommission,
               month_year: monthYear,
               is_paid: false,
@@ -8916,6 +8933,8 @@ app.post('/api/admin/settings', async (req, res) => {
     const { setting_key, setting_value, setting_json } = req.body;
     if (!setting_key) return res.status(400).json({ error: 'setting_key is required' });
 
+    console.log('Saving setting:', setting_key, '| value:', setting_value, '| json:', setting_json);
+
     const { data, error } = await adminClient
       .from('app_settings')
       .upsert([{
@@ -8927,7 +8946,11 @@ app.post('/api/admin/settings', async (req, res) => {
       }], { onConflict: 'setting_key' })
       .select().single();
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+      console.error('Settings save error:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+    console.log('Setting saved successfully:', setting_key, '=', setting_value);
     console.log('Setting updated:', setting_key, '| by admin:', admin.id);
 
     // After saving setting successfully
@@ -9408,6 +9431,42 @@ app.get('/api/admin/all-listings', async (req, res) => {
 
     res.json(enriched);
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/update-staff-commission - super admin sets an individual GHA/SA commission rate override
+app.post('/api/admin/update-staff-commission', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Only super admin can change individual rates
+    const { data: adminProfile } = await adminClient
+      .from('profiles').select('email, admin_level').eq('id', admin.id).single();
+    var isSuperAdmin = adminProfile?.email === 'medibrhm07@gmail.com' ||
+      adminProfile?.admin_level === 'super_admin';
+    if (!isSuperAdmin) return res.status(403).json({ error: 'Super admin access required' });
+
+    const { staff_id, staff_type, commission_rate } = req.body;
+    if (!staff_id || !staff_type || commission_rate === undefined) {
+      return res.status(400).json({ error: 'staff_id, staff_type and commission_rate are required' });
+    }
+    if (parseFloat(commission_rate) < 0 || parseFloat(commission_rate) > 100) {
+      return res.status(400).json({ error: 'Commission rate must be between 0 and 100' });
+    }
+
+    var table = staff_type === 'GHA' ? 'gha_agents' : 'service_agents';
+    const { error: updateErr } = await adminClient
+      .from(table)
+      .update({ commission_rate: parseFloat(commission_rate) })
+      .eq('id', staff_id);
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    console.log('Staff commission updated:', staff_type, staff_id, commission_rate + '%', '| by:', adminProfile.email);
+    res.json({ success: true, message: staff_type + ' commission rate updated to ' + commission_rate + '%' });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
