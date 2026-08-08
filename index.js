@@ -191,6 +191,70 @@ async function notifyAgentsAboutCommission(enabled) {
     console.error('notifyAgentsAboutCommission error:', err.message);
   }
 }
+// Calculates GHA inspection payment based on dynamic tiers from app_settings,
+// falling back to the historical hardcoded tiers if no admin override exists.
+async function getInspectionFeeForCount(confirmedCount) {
+  try {
+    const { data: tierSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_json')
+      .eq('setting_key', 'inspection_fee_tiers')
+      .single();
+
+    var tiers = tierSetting?.setting_json || {
+      tier1: { min: 1, max: 10, fee: 1200 },
+      tier2: { min: 11, max: 20, fee: 1500 },
+      tier3: { min: 21, max: null, fee: 1700 },
+    };
+
+    var count = parseInt(confirmedCount) || 0;
+    if (count <= 0) return 0;
+
+    var fee = tiers.tier1.fee; // default
+    if (count >= tiers.tier3.min) fee = tiers.tier3.fee;
+    else if (count >= tiers.tier2.min) fee = tiers.tier2.fee;
+    else if (count >= tiers.tier1.min) fee = tiers.tier1.fee;
+
+    console.log('Inspection fee for count', count, ':', fee, 'per inspection');
+    return fee;
+  } catch(err) {
+    console.error('getInspectionFeeForCount error:', err.message);
+    return 1200; // safe fallback
+  }
+}
+// Gets the current commission rate for a staff member: checks their individual
+// override first (gha_agents/service_agents.commission_rate), then falls back
+// to the global rate in app_settings, then to a safe 5% default.
+async function getStaffCommissionRate(staffId, staffType) {
+  try {
+    // Check individual override first
+    var table = staffType === 'GHA' ? 'gha_agents' : 'service_agents';
+
+    const { data: staffData } = await adminClient
+      .from(table)
+      .select('commission_rate')
+      .eq('id', staffId)
+      .single();
+
+    // If individual rate exists and differs from default use it
+    if (staffData?.commission_rate && staffData.commission_rate !== 5) {
+      return parseFloat(staffData.commission_rate);
+    }
+
+    // Fall back to global setting
+    var settingKey = staffType === 'GHA' ? 'gha_commission_rate' : 'sa_commission_rate';
+    const { data: globalRate } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', settingKey)
+      .single();
+
+    return parseFloat(globalRate?.setting_value || 5);
+  } catch(err) {
+    console.error('getStaffCommissionRate error:', err.message);
+    return 5; // safe fallback
+  }
+}
 // Send SMS via Termii
 // Add TERMII_API_KEY and TERMII_SENDER_ID to Render env vars
 async function sendSMS(phone, message) {
@@ -2195,8 +2259,9 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
       return sum + parseFloat(a.subscription_amount || 0);
     }, 0);
 
-    // GHA commission (5% of total revenue)
-    var totalCommission = Math.round(totalRevenue * 0.05);
+    // GHA commission rate (individual override, else global setting)
+    var commissionRate = await getStaffCommissionRate(ghaId, 'GHA');
+    var totalCommission = Math.round(totalRevenue * (commissionRate / 100));
 
     // Current billing month, for this month's earnings from gha_earnings
     var billingMonth = (function() {
@@ -2267,6 +2332,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
       free_agents: freeAgents.length,
       total_revenue: totalRevenue,
       total_commission: totalCommission,
+      commission_rate: commissionRate,
       monthly_commission: monthlyCommission,
       commission_paid: isPaid,
       inspections_done: inspectionsResult.count || 0,
@@ -2704,6 +2770,10 @@ app.get('/api/sa/overview', async (req, res) => {
       return sum + parseFloat(a.subscription_amount || 0);
     }, 0);
 
+    // SA commission rate (individual override, else global setting)
+    var commissionRate = await getStaffCommissionRate(session.staff_id, 'SA');
+    var totalCommission = Math.round(totalRevenue * (commissionRate / 100));
+
     // SA commission this month from sa_earnings table
     var billingMonth = getBillingMonth();
 
@@ -2749,6 +2819,8 @@ app.get('/api/sa/overview', async (req, res) => {
       expired_subscriptions: expiredAgents.length,
       total_ghas: (saGhas || []).length,
       total_revenue: totalRevenue,
+      total_commission: totalCommission,
+      commission_rate: commissionRate,
       monthly_earnings: monthlyEarnings,
       earnings_paid: earningsPaid,
       pending_agents: pendingCount || 0,
@@ -2851,14 +2923,10 @@ app.get('/api/admin/all-sas', async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
 
-    const { data: saRateSetting } = await adminClient
-      .from('app_settings')
-      .select('setting_value')
-      .eq('setting_key', 'sa_commission_rate')
-      .single();
-    var saRate = parseFloat(saRateSetting?.setting_value || 5) / 100;
-
     const enriched = await Promise.all((sas || []).map(async function(sa) {
+      // Individual override (sa.commission_rate) first, else global sa_commission_rate setting
+      const saRate = (await getStaffCommissionRate(sa.id, 'SA')) / 100;
+
       const { data: ghas } = await serviceClient
         .from('gha_agents')
         .select('id')
@@ -2945,14 +3013,10 @@ app.get('/api/admin/all-ghas', async (req, res) => {
       (sas || []).forEach(function(s) { saMap[s.id] = s; });
     }
 
-    const { data: ghaRateSetting } = await adminClient
-      .from('app_settings')
-      .select('setting_value')
-      .eq('setting_key', 'gha_commission_rate')
-      .single();
-    var ghaRate = parseFloat(ghaRateSetting?.setting_value || 5) / 100;
-
     const enriched = await Promise.all((ghas || []).map(async function(gha) {
+      // Individual override (gha.commission_rate) first, else global gha_commission_rate setting
+      const ghaRate = (await getStaffCommissionRate(gha.id, 'GHA')) / 100;
+
       const { data: agentsUnderGha } = await serviceClient
         .from('profiles')
         .select('id, subscription_tier, subscription_end, subscription_amount')
@@ -5308,7 +5372,7 @@ app.post('/api/properties', async (req, res) => {
     // Fetch profile using the verified ID from token - never from request body
     const { data: profileData, error: profileErr } = await adminClient
       .from('profiles')
-      .select('id, role, status, verification_level, is_unlimited, full_name, agency_name, agent_type, nin_verified')
+      .select('id, role, status, verification_level, is_unlimited, unlimited_listings, full_name, agency_name, agent_type, nin_verified')
       .eq('id', agentId)
       .single();
 
@@ -5320,7 +5384,12 @@ app.post('/api/properties', async (req, res) => {
     }
 
     const isAdmin     = profileData.role === 'admin';
-    const isUnlimited = profileData.is_unlimited === true;
+    // is_unlimited (verification-tier override) and unlimited_listings (admin-granted
+    // bypass via /api/admin/set-unlimited-listings) both skip the listing limit check.
+    const isUnlimited = profileData.is_unlimited === true || profileData.unlimited_listings === true;
+    if (profileData.unlimited_listings === true) {
+      console.log('Agent has unlimited listings - bypassing limit check:', agentId);
+    }
     const level       = profileData.verification_level || 'basic';
     const limits      = { basic: 3, verified: 15, premium: 999 };
     const limit       = limits[level] || 3;
@@ -6294,39 +6363,14 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
           const monthYear = getBillingMonth();
 
-          // Fetch dynamic commission rates
+          // Fetch dynamic commission rates (individual override first, else global setting)
           var ghaId = agentProfile?.gha_id;
           var saId = agentProfile?.sa_id;
 
-          const [ghaRateData, saRateData] = await Promise.all([
-            adminClient.from('app_settings').select('setting_value').eq('setting_key', 'gha_commission_rate').single(),
-            adminClient.from('app_settings').select('setting_value').eq('setting_key', 'sa_commission_rate').single(),
+          var [ghaCommissionRate, saCommissionRate] = await Promise.all([
+            ghaId ? getStaffCommissionRate(ghaId, 'GHA') : Promise.resolve(0),
+            saId ? getStaffCommissionRate(saId, 'SA') : Promise.resolve(0),
           ]);
-
-          var globalGhaRate = parseFloat(ghaRateData?.data?.setting_value || 5);
-          var globalSaRate = parseFloat(saRateData?.data?.setting_value || 5);
-
-          // Check if this specific GHA/SA has an individual rate override
-          var ghaCommissionRate = globalGhaRate;
-          var saCommissionRate = globalSaRate;
-
-          if (ghaId) {
-            const { data: ghaData } = await adminClient
-              .from('gha_agents')
-              .select('commission_rate')
-              .eq('id', ghaId)
-              .single();
-            if (ghaData?.commission_rate) ghaCommissionRate = parseFloat(ghaData.commission_rate);
-          }
-
-          if (saId) {
-            const { data: saData } = await adminClient
-              .from('service_agents')
-              .select('commission_rate')
-              .eq('id', saId)
-              .single();
-            if (saData?.commission_rate) saCommissionRate = parseFloat(saData.commission_rate);
-          }
 
           var ghaCommission = Math.round(amount * (ghaCommissionRate / 100));
           var saCommission = Math.round(amount * (saCommissionRate / 100));
@@ -7266,24 +7310,11 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
 
       const count = enrichedInspections.length;
 
-      // Tiered payment calculation
-      var payment = 0;
-      var breakdown = [];
-      if (count >= 1) {
-        var tier1 = Math.min(count, 10);
-        payment += tier1 * 1200;
-        breakdown.push({ tier: '1-10', count: tier1, rate: 1200, subtotal: tier1 * 1200 });
-      }
-      if (count >= 11) {
-        var tier2 = Math.min(count - 10, 10);
-        payment += tier2 * 1500;
-        breakdown.push({ tier: '11-20', count: tier2, rate: 1500, subtotal: tier2 * 1500 });
-      }
-      if (count >= 21) {
-        var tier3 = count - 20;
-        payment += tier3 * 1700;
-        breakdown.push({ tier: '21+', count: tier3, rate: 1700, subtotal: tier3 * 1700 });
-      }
+      // Dynamic tiered payment calculation (tiers configurable via app_settings)
+      var inspFee = await getInspectionFeeForCount(count);
+      var payment = count * inspFee;
+      var breakdown = count > 0 ? [{ tier: 'current', count: count, rate: inspFee, subtotal: payment }] : [];
+      console.log('GHA', gha.gha_code, '| confirmed:', count, '| fee:', inspFee, '| total:', payment);
 
       return {
         gha_id: gha.id,
@@ -7374,24 +7405,11 @@ app.get('/api/admin/staff-payments', async (req, res) => {
 
       const count = enrichedInspections.length;
 
-      // Tiered inspection payment
-      var inspPayment = 0;
-      var breakdown = [];
-      if (count >= 1) {
-        var t1 = Math.min(count, 10);
-        inspPayment += t1 * 1200;
-        breakdown.push({ tier: '1-10', count: t1, rate: 1200, subtotal: t1 * 1200 });
-      }
-      if (count >= 11) {
-        var t2 = Math.min(count - 10, 10);
-        inspPayment += t2 * 1500;
-        breakdown.push({ tier: '11-20', count: t2, rate: 1500, subtotal: t2 * 1500 });
-      }
-      if (count >= 21) {
-        var t3 = count - 20;
-        inspPayment += t3 * 1700;
-        breakdown.push({ tier: '21+', count: t3, rate: 1700, subtotal: t3 * 1700 });
-      }
+      // Dynamic tiered inspection payment (tiers configurable via app_settings)
+      var inspFee = await getInspectionFeeForCount(count);
+      var inspPayment = count * inspFee;
+      var breakdown = count > 0 ? [{ tier: 'current', count: count, rate: inspFee, subtotal: inspPayment }] : [];
+      console.log('GHA', gha.gha_code, '| confirmed:', count, '| fee:', inspFee, '| total:', inspPayment);
 
       // Commission from subscriptions
       const { data: earnings } = await adminClient
@@ -7403,6 +7421,9 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       const commissionTotal = (earnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
       }, 0);
+
+      // Current commission rate (individual override, else global setting) — for display
+      const commissionRate = await getStaffCommissionRate(gha.id, 'GHA');
 
       const totalPayment = inspPayment + commissionTotal;
       console.log('GHA', gha.gha_code, '| inspections:', count, '| insp pay:', inspPayment, '| commission:', commissionTotal, '| total:', totalPayment);
@@ -7448,6 +7469,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         inspection_breakdown: breakdown,
         inspections: enrichedInspections,
         commission_amount: commissionTotal,
+        commission_rate: commissionRate,
         total_payment: totalPayment,
         payment_status: existingPayment?.payment_status || 'unpaid',
         paid_at: existingPayment?.paid_at || null,
@@ -7471,6 +7493,9 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       const commissionTotal = (saEarnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
       }, 0);
+
+      // Current commission rate (individual override, else global setting) — for display
+      const commissionRate = await getStaffCommissionRate(sa.id, 'SA');
 
       // SA inspection oversight bonus (optional: ₦500 per confirmed inspection under them)
       const { count: confirmedCount } = await adminClient
@@ -7517,6 +7542,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         bank_code: sa.bank_code || null,
         inspections_overseen: confirmedCount || 0,
         commission_amount: commissionTotal,
+        commission_rate: commissionRate,
         total_payment: totalPayment,
         payment_status: existingPayment?.payment_status || 'unpaid',
         paid_at: existingPayment?.paid_at || null,
@@ -9467,6 +9493,48 @@ app.post('/api/admin/update-staff-commission', async (req, res) => {
     console.log('Staff commission updated:', staff_type, staff_id, commission_rate + '%', '| by:', adminProfile.email);
     res.json({ success: true, message: staff_type + ' commission rate updated to ' + commission_rate + '%' });
   } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/set-unlimited-listings - grant/revoke unlimited listings bypass for an agent
+app.post('/api/admin/set-unlimited-listings', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: adminProfile } = await adminClient
+      .from('profiles').select('email, admin_level').eq('id', admin.id).single();
+    var isSuperAdmin = adminProfile?.email === 'medibrhm07@gmail.com' ||
+      adminProfile?.admin_level === 'super_admin';
+    if (!isSuperAdmin) return res.status(403).json({ error: 'Super admin access required' });
+
+    const { agent_id, unlimited } = req.body;
+    if (!agent_id || unlimited === undefined) {
+      return res.status(400).json({ error: 'agent_id and unlimited are required' });
+    }
+
+    const { error: profileErr } = await adminClient
+      .from('profiles')
+      .update({ unlimited_listings: unlimited })
+      .eq('id', agent_id);
+    if (profileErr) return res.status(500).json({ error: profileErr.message });
+
+    const { error: agentErr } = await adminClient
+      .from('agents')
+      .update({ unlimited_listings: unlimited })
+      .eq('id', agent_id);
+    if (agentErr) console.error('Agents table unlimited update failed:', agentErr.message);
+
+    console.log('Unlimited listings', unlimited ? 'granted' : 'revoked', 'for agent:', agent_id, '| by:', adminProfile.email);
+    res.json({
+      success: true,
+      message: unlimited
+        ? 'Unlimited listings granted successfully'
+        : 'Unlimited listings revoked — agent returns to plan limits',
+    });
+  } catch(err) {
+    console.error('Set unlimited listings error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
