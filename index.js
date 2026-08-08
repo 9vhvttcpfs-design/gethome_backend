@@ -2851,6 +2851,13 @@ app.get('/api/admin/all-sas', async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
 
+    const { data: saRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'sa_commission_rate')
+      .single();
+    var saRate = parseFloat(saRateSetting?.setting_value || 5) / 100;
+
     const enriched = await Promise.all((sas || []).map(async function(sa) {
       const { data: ghas } = await serviceClient
         .from('gha_agents')
@@ -2892,7 +2899,7 @@ app.get('/api/admin/all-sas', async (req, res) => {
         }).length;
 
         monthlyEarnings = (agentsUnderSa || []).reduce(function(sum, p) {
-          return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
+          return sum + (parseFloat(p.subscription_amount) || 0) * saRate;
         }, 0);
       }
 
@@ -2938,6 +2945,13 @@ app.get('/api/admin/all-ghas', async (req, res) => {
       (sas || []).forEach(function(s) { saMap[s.id] = s; });
     }
 
+    const { data: ghaRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'gha_commission_rate')
+      .single();
+    var ghaRate = parseFloat(ghaRateSetting?.setting_value || 5) / 100;
+
     const enriched = await Promise.all((ghas || []).map(async function(gha) {
       const { data: agentsUnderGha } = await serviceClient
         .from('profiles')
@@ -2964,7 +2978,7 @@ app.get('/api/admin/all-ghas', async (req, res) => {
         return a.subscription_end && new Date(a.subscription_end) < new Date();
       }).length;
       const monthlyEarnings = (agentsUnderGha || []).reduce(function(sum, p) {
-        return sum + (parseFloat(p.subscription_amount) || 0) * 0.05;
+        return sum + (parseFloat(p.subscription_amount) || 0) * ghaRate;
       }, 0);
 
       const result = Object.assign({}, gha, {
