@@ -6280,16 +6280,34 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
           const monthYear = getBillingMonth();
 
-          // Create GHA earnings row (5% commission)
+          // Get commission rates from settings
+          const { data: ghaRateSetting } = await adminClient
+            .from('app_settings')
+            .select('setting_value')
+            .eq('setting_key', 'gha_commission_rate')
+            .single();
+
+          const { data: saRateSetting } = await adminClient
+            .from('app_settings')
+            .select('setting_value')
+            .eq('setting_key', 'sa_commission_rate')
+            .single();
+
+          var ghaRate = parseFloat(ghaRateSetting?.setting_value || 5) / 100;
+          var saRate = parseFloat(saRateSetting?.setting_value || 5) / 100;
+
+          console.log('Commission rates - GHA:', ghaRate * 100 + '%', '| SA:', saRate * 100 + '%');
+
+          // Create GHA earnings row
           if (agentProfile?.gha_id) {
-            const ghaCommission = Math.round(amount * 0.05);
-            console.log('Commission calc:', amount, '* 5% =', ghaCommission);
+            const ghaCommission = Math.round(amount * ghaRate);
+            console.log('Commission calc:', amount, '*', (ghaRate * 100) + '% =', ghaCommission);
             const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
               gha_id: agentProfile.gha_id,
               agent_id: agentId,
               agent_email: agentProfile.email,
               subscription_amount: amount,
-              commission_rate: 5,
+              commission_rate: ghaRate * 100,
               commission_amount: ghaCommission,
               month_year: monthYear,
               is_paid: false,
@@ -6309,16 +6327,16 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             if (ghaNotifErr) console.error('GHA notification failed (non-blocking):', ghaNotifErr.message);
           }
 
-          // Create SA earnings row (5% commission)
+          // Create SA earnings row
           if (agentProfile?.sa_id) {
-            const saCommission = Math.round(amount * 0.05);
-            console.log('Commission calc:', amount, '* 5% =', saCommission);
+            const saCommission = Math.round(amount * saRate);
+            console.log('Commission calc:', amount, '*', (saRate * 100) + '% =', saCommission);
             const { error: saEarnErr } = await adminClient.from('sa_earnings').upsert([{
               sa_id: agentProfile.sa_id,
               gha_id: agentProfile.gha_id || null,
               agent_id: agentId,
               subscription_amount: amount,
-              commission_rate: 5,
+              commission_rate: saRate * 100,
               commission_amount: saCommission,
               month_year: monthYear,
               is_paid: false,
@@ -8786,7 +8804,27 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
 
     // Create earnings rows for GHA and SA
     const monthYear = getBillingMonth();
-    const commission = Math.round(subscriptionAmount * 0.05);
+
+    // Get commission rates from settings
+    const { data: ghaRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'gha_commission_rate')
+      .single();
+
+    const { data: saRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'sa_commission_rate')
+      .single();
+
+    var ghaRate = parseFloat(ghaRateSetting?.setting_value || 5) / 100;
+    var saRate = parseFloat(saRateSetting?.setting_value || 5) / 100;
+
+    console.log('Commission rates - GHA:', ghaRate * 100 + '%', '| SA:', saRate * 100 + '%');
+
+    var ghaCommission = Math.round(subscriptionAmount * ghaRate);
+    var saCommission = Math.round(subscriptionAmount * saRate);
 
     if (profile.gha_id) {
       const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
@@ -8794,8 +8832,8 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         agent_id: profile.id,
         agent_email: agent_email,
         subscription_amount: subscriptionAmount,
-        commission_rate: 5,
-        commission_amount: commission,
+        commission_rate: ghaRate * 100,
+        commission_amount: ghaCommission,
         month_year: monthYear,
         is_paid: false,
       }], { onConflict: 'gha_id,agent_id,month_year', ignoreDuplicates: false });
@@ -8808,8 +8846,8 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         gha_id: profile.gha_id || null,
         agent_id: profile.id,
         subscription_amount: subscriptionAmount,
-        commission_rate: 5,
-        commission_amount: commission,
+        commission_rate: saRate * 100,
+        commission_amount: saCommission,
         month_year: monthYear,
         is_paid: false,
       }], { onConflict: 'sa_id,agent_id,month_year', ignoreDuplicates: false });
