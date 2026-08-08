@@ -8942,6 +8942,42 @@ app.post('/api/admin/mark-listing-commission-paid', async (req, res) => {
   }
 });
 
+// POST /api/admin/mark-property-featured - admin marks a listing as featured
+app.post('/api/admin/mark-property-featured', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { property_id } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+    const { data, error } = await adminClient.from('properties')
+      .update({ is_featured: true, featured_payment_status: 'paid', featured_paid_at: new Date().toISOString() })
+      .eq('id', property_id)
+      .select();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data || data.length === 0) return res.status(404).json({ error: 'Property not found' });
+    res.json({ success: true, message: 'Listing marked as featured successfully' });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/unfeature-listing - admin removes featured status from a listing
+app.post('/api/admin/unfeature-listing', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { property_id } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+    const { error } = await adminClient.from('properties')
+      .update({ is_featured: false, featured_payment_status: 'unpaid', featured_paid_at: null })
+      .eq('id', property_id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, message: 'Listing unfeatured successfully' });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/admin/toggle-ads - toggle ads on/off
 app.post('/api/admin/toggle-ads', async (req, res) => {
   try {
