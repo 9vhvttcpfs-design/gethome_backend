@@ -255,6 +255,32 @@ async function getStaffCommissionRate(staffId, staffType) {
     return 5; // safe fallback
   }
 }
+// Revokes unlimited_listings for any agent whose unlimited_expires_at has passed.
+// Called on server startup, on an hourly interval, and defensively at the top
+// of the endpoints that read/report unlimited-plan status.
+async function checkAndExpireUnlimitedPlans() {
+  try {
+    const { data: expiredAgents } = await adminClient
+      .from('profiles')
+      .select('id')
+      .eq('unlimited_listings', true)
+      .lt('unlimited_expires_at', new Date().toISOString())
+      .not('unlimited_expires_at', 'is', null);
+
+    if (expiredAgents && expiredAgents.length > 0) {
+      var ids = expiredAgents.map(function(a) { return a.id; });
+      await adminClient.from('profiles')
+        .update({ unlimited_listings: false })
+        .in('id', ids);
+      await adminClient.from('agents')
+        .update({ unlimited_listings: false })
+        .in('id', ids);
+      console.log('Expired unlimited plans revoked for', ids.length, 'agents');
+    }
+  } catch(err) {
+    console.error('checkAndExpireUnlimitedPlans error:', err.message);
+  }
+}
 // Send SMS via Termii
 // Add TERMII_API_KEY and TERMII_SENDER_ID to Render env vars
 async function sendSMS(phone, message) {
@@ -2212,6 +2238,8 @@ app.post('/api/gha/confirm-agent', async (req, res) => {
 app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
   try {
     if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    // Revoke any lapsed unlimited-listing plans before reporting agent status
+    await checkAndExpireUnlimitedPlans();
     // staff_code holds the 'GHA0001' string; profiles are linked via gha_code and/or gha_id
     // depending on which assignment path claimed the agent, so match on either.
     const ghaCode = req.staffSession.staff_code;
@@ -2718,6 +2746,9 @@ app.get('/api/sa/overview', async (req, res) => {
       .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
+    // Revoke any lapsed unlimited-listing plans before reporting agent status
+    await checkAndExpireUnlimitedPlans();
+
     // Get ALL agents under this SA (via direct sa_id OR via GHA under this SA)
     const { data: directAgents } = await adminClient
       .from('profiles')
@@ -2923,9 +2954,18 @@ app.get('/api/admin/all-sas', async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
 
+    // Global fallback rate, kept only to label each row's rate source below
+    const { data: saRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'sa_commission_rate')
+      .single();
+    var globalSaRate = parseFloat(saRateSetting?.setting_value || 5);
+
     const enriched = await Promise.all((sas || []).map(async function(sa) {
       // Individual override (sa.commission_rate) first, else global sa_commission_rate setting
-      const saRate = (await getStaffCommissionRate(sa.id, 'SA')) / 100;
+      var saRatePct = await getStaffCommissionRate(sa.id, 'SA');
+      const saRate = saRatePct / 100;
 
       const { data: ghas } = await serviceClient
         .from('gha_agents')
@@ -2978,6 +3018,8 @@ app.get('/api/admin/all-sas', async (req, res) => {
         total_listings: totalListings,
         active_subscriptions: activeSubscriptions,
         expired_subscriptions: expiredSubscriptions,
+        commission_rate: saRatePct,
+        commission_rate_source: (sa.commission_rate && parseFloat(sa.commission_rate) !== globalSaRate) ? 'individual' : 'global',
       });
       delete result.password_hash;
       delete result.gh_staff_token;
@@ -3013,9 +3055,18 @@ app.get('/api/admin/all-ghas', async (req, res) => {
       (sas || []).forEach(function(s) { saMap[s.id] = s; });
     }
 
+    // Global fallback rate, kept only to label each row's rate source below
+    const { data: ghaRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'gha_commission_rate')
+      .single();
+    var globalGhaRate = parseFloat(ghaRateSetting?.setting_value || 5);
+
     const enriched = await Promise.all((ghas || []).map(async function(gha) {
       // Individual override (gha.commission_rate) first, else global gha_commission_rate setting
-      const ghaRate = (await getStaffCommissionRate(gha.id, 'GHA')) / 100;
+      var ghaRatePct = await getStaffCommissionRate(gha.id, 'GHA');
+      const ghaRate = ghaRatePct / 100;
 
       const { data: agentsUnderGha } = await serviceClient
         .from('profiles')
@@ -3051,6 +3102,8 @@ app.get('/api/admin/all-ghas', async (req, res) => {
         active_subscriptions: activeSubscriptions,
         expired_subscriptions: expiredSubscriptions,
         monthly_earnings: monthlyEarnings,
+        commission_rate: ghaRatePct,
+        commission_rate_source: (gha.commission_rate && parseFloat(gha.commission_rate) !== globalGhaRate) ? 'individual' : 'global',
         sa: gha.sa_id ? (saMap[gha.sa_id] || null) : null,
       });
       delete result.password_hash;
@@ -5369,6 +5422,9 @@ app.post('/api/properties', async (req, res) => {
       global: { headers: { Authorization: 'Bearer ' + token } },
     });
 
+    // Revoke any lapsed unlimited-listing plans before checking this agent's limit
+    await checkAndExpireUnlimitedPlans();
+
     // Fetch profile using the verified ID from token - never from request body
     const { data: profileData, error: profileErr } = await adminClient
       .from('profiles')
@@ -6505,6 +6561,100 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       }
     }
 
+    // Handle unlimited plan payment
+    if (status === 'successful' && event?.data?.meta?.payment_type === 'unlimited_plan') {
+      var unlimitedAgentId = event?.data?.meta?.agent_id;
+      var unlimitedAmount = parseFloat(event?.data?.amount || 0);
+      var txRef = event?.data?.tx_ref || null;
+
+      console.log('Unlimited plan payment received - agent:', unlimitedAgentId, '| amount:', unlimitedAmount);
+
+      if (unlimitedAgentId) {
+        // Set expiry to 6 months from now
+        var expiryDate = new Date();
+        expiryDate.setMonth(expiryDate.getMonth() + 6);
+        var expiryISO = expiryDate.toISOString();
+
+        // Update profiles
+        const { error: profileErr } = await adminClient
+          .from('profiles')
+          .update({
+            unlimited_listings: true,
+            unlimited_expires_at: expiryISO,
+            subscription_tier: 'unlimited',
+            subscription_status: 'active',
+            subscription_start: new Date().toISOString(),
+            subscription_end: expiryISO,
+            subscription_amount: unlimitedAmount,
+          })
+          .eq('id', unlimitedAgentId);
+        if (profileErr) console.error('Unlimited plan profiles update failed:', profileErr.message);
+
+        // Update agents table
+        await adminClient.from('agents').update({
+          unlimited_listings: true,
+          unlimited_expires_at: expiryISO,
+        }).eq('id', unlimitedAgentId).catch(e => console.error('Agents unlimited update:', e.message));
+
+        // Get agent's GHA and SA for commission
+        const { data: agentProfile } = await adminClient
+          .from('profiles')
+          .select('gha_id, sa_id, email, full_name')
+          .eq('id', unlimitedAgentId)
+          .single();
+
+        var monthYear = getBillingMonth();
+
+        // GHA commission
+        if (agentProfile?.gha_id) {
+          var ghaRate = await getStaffCommissionRate(agentProfile.gha_id, 'GHA');
+          var ghaCommission = Math.round(unlimitedAmount * (ghaRate / 100));
+          const { error: ghaErr } = await adminClient.from('gha_earnings').upsert([{
+            gha_id: agentProfile.gha_id,
+            agent_id: unlimitedAgentId,
+            agent_email: agentProfile.email,
+            subscription_amount: unlimitedAmount,
+            commission_rate: ghaRate,
+            commission_amount: ghaCommission,
+            month_year: monthYear,
+            is_paid: false,
+          }], { onConflict: 'gha_id,agent_id,month_year' });
+          if (ghaErr) console.error('GHA unlimited earnings failed:', ghaErr.message);
+          else console.log('GHA commission for unlimited plan:', ghaRate + '%', '=₦' + ghaCommission);
+        }
+
+        // SA commission
+        if (agentProfile?.sa_id) {
+          var saRate = await getStaffCommissionRate(agentProfile.sa_id, 'SA');
+          var saCommission = Math.round(unlimitedAmount * (saRate / 100));
+          const { error: saErr } = await adminClient.from('sa_earnings').upsert([{
+            sa_id: agentProfile.sa_id,
+            gha_id: agentProfile.gha_id || null,
+            agent_id: unlimitedAgentId,
+            subscription_amount: unlimitedAmount,
+            commission_rate: saRate,
+            commission_amount: saCommission,
+            month_year: monthYear,
+            is_paid: false,
+          }], { onConflict: 'sa_id,agent_id,month_year' });
+          if (saErr) console.error('SA unlimited earnings failed:', saErr.message);
+          else console.log('SA commission for unlimited plan:', saRate + '%', '=₦' + saCommission);
+        }
+
+        // Notify agent
+        await adminClient.from('notifications').insert([{
+          recipient_type: 'ADMIN',
+          recipient_id: unlimitedAgentId,
+          type: 'unlimited_plan_activated',
+          title: '∞ Unlimited Plan Activated',
+          message: 'Your Unlimited Plan is now active! You can upload unlimited listings until ' + expiryDate.toLocaleDateString('en-NG') + '. Enjoy!',
+          is_read: false,
+        }]).catch(e => console.error('Unlimited notification failed:', e.message));
+
+        console.log('Unlimited plan activated for agent:', unlimitedAgentId, '| expires:', expiryISO);
+      }
+    }
+
     res.status(200).json({ received: true });
   } catch (err) {
     console.error('Flutterwave webhook exception:', err.message);
@@ -7360,7 +7510,15 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     // ── GHA PAYMENTS ────────────────────────────────
     const { data: ghas } = await adminClient
       .from('gha_agents')
-      .select('id, gha_code, full_name, email, sa_id, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
+      .select('id, gha_code, full_name, email, sa_id, commission_rate, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
+
+    // Global fallback rate, kept only to label each GHA's rate source below
+    const { data: ghaRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'gha_commission_rate')
+      .single();
+    var globalGhaRate = parseFloat(ghaRateSetting?.setting_value || 5);
 
     const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
       // Only count confirmed inspections - GHA payment is earned when SA confirms
@@ -7424,6 +7582,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
 
       // Current commission rate (individual override, else global setting) — for display
       const commissionRate = await getStaffCommissionRate(gha.id, 'GHA');
+      const commissionRateSource = (gha.commission_rate && parseFloat(gha.commission_rate) !== globalGhaRate) ? 'individual' : 'global';
 
       const totalPayment = inspPayment + commissionTotal;
       console.log('GHA', gha.gha_code, '| inspections:', count, '| insp pay:', inspPayment, '| commission:', commissionTotal, '| total:', totalPayment);
@@ -7470,6 +7629,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         inspections: enrichedInspections,
         commission_amount: commissionTotal,
         commission_rate: commissionRate,
+        commission_rate_source: commissionRateSource,
         total_payment: totalPayment,
         payment_status: existingPayment?.payment_status || 'unpaid',
         paid_at: existingPayment?.paid_at || null,
@@ -7480,7 +7640,15 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     // ── SA PAYMENTS ─────────────────────────────────
     const { data: sas } = await adminClient
       .from('service_agents')
-      .select('id, sa_code, full_name, email, bank_name, account_number, account_name, bank_code');
+      .select('id, sa_code, full_name, email, commission_rate, bank_name, account_number, account_name, bank_code');
+
+    // Global fallback rate, kept only to label each SA's rate source below
+    const { data: saRateSetting } = await adminClient
+      .from('app_settings')
+      .select('setting_value')
+      .eq('setting_key', 'sa_commission_rate')
+      .single();
+    var globalSaRate = parseFloat(saRateSetting?.setting_value || 5);
 
     const saPayments = await Promise.all((sas || []).map(async function(sa) {
       // SA commission from subscriptions
@@ -7496,6 +7664,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
 
       // Current commission rate (individual override, else global setting) — for display
       const commissionRate = await getStaffCommissionRate(sa.id, 'SA');
+      const commissionRateSource = (sa.commission_rate && parseFloat(sa.commission_rate) !== globalSaRate) ? 'individual' : 'global';
 
       // SA inspection oversight bonus (optional: ₦500 per confirmed inspection under them)
       const { count: confirmedCount } = await adminClient
@@ -7543,6 +7712,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         inspections_overseen: confirmedCount || 0,
         commission_amount: commissionTotal,
         commission_rate: commissionRate,
+        commission_rate_source: commissionRateSource,
         total_payment: totalPayment,
         payment_status: existingPayment?.payment_status || 'unpaid',
         paid_at: existingPayment?.paid_at || null,
@@ -8862,23 +9032,13 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
     // Create earnings rows for GHA and SA
     const monthYear = getBillingMonth();
 
-    // Get commission rates from settings
-    const { data: ghaRateSetting } = await adminClient
-      .from('app_settings')
-      .select('setting_value')
-      .eq('setting_key', 'gha_commission_rate')
-      .single();
+    // Get commission rates (individual override first, else global setting)
+    var ghaRatePct = profile.gha_id ? await getStaffCommissionRate(profile.gha_id, 'GHA') : 0;
+    var saRatePct  = profile.sa_id  ? await getStaffCommissionRate(profile.sa_id, 'SA')   : 0;
+    var ghaRate = ghaRatePct / 100;
+    var saRate  = saRatePct / 100;
 
-    const { data: saRateSetting } = await adminClient
-      .from('app_settings')
-      .select('setting_value')
-      .eq('setting_key', 'sa_commission_rate')
-      .single();
-
-    var ghaRate = parseFloat(ghaRateSetting?.setting_value || 5) / 100;
-    var saRate = parseFloat(saRateSetting?.setting_value || 5) / 100;
-
-    console.log('Commission rates - GHA:', ghaRate * 100 + '%', '| SA:', saRate * 100 + '%');
+    console.log('Commission rates - GHA:', ghaRatePct + '%', '| SA:', saRatePct + '%');
 
     var ghaCommission = Math.round(subscriptionAmount * ghaRate);
     var saCommission = Math.round(subscriptionAmount * saRate);
@@ -9555,3 +9715,7 @@ app.use(function(req, res) {
   res.status(404).json({ error: 'Route not found: ' + req.method + ' ' + req.path });
 });
 app.listen(PORT, () => console.log(` GetHome backend running on port ${PORT}`));
+
+// Sweep for expired unlimited-listing plans on startup, then every hour
+checkAndExpireUnlimitedPlans();
+setInterval(checkAndExpireUnlimitedPlans, 60 * 60 * 1000);
