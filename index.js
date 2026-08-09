@@ -6370,17 +6370,189 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     }
 
     const event = req.body;
-    const reference = event?.data?.tx_ref;
-    const status = event?.data?.status;
 
     console.log('Webhook received - status:', event?.data?.status, '| payment_type:', event?.data?.meta?.payment_type, '| amount:', event?.data?.amount);
     console.log('Webhook meta full:', JSON.stringify(event?.data?.meta));
 
-    console.log('Flutterwave webhook received - reference:', reference, '| status:', status);
+    // Extra diagnostics: Flutterwave puts meta at different paths depending on payment type
+    console.log('Full webhook event keys:', Object.keys(event || {}));
+    console.log('Full webhook data keys:', Object.keys(event?.data || {}));
+    console.log('event.meta:', JSON.stringify(event?.meta));
+    console.log('event.data.meta:', JSON.stringify(event?.data?.meta));
+    console.log('event.data.tx_ref:', event?.data?.tx_ref);
+    console.log('event.data.payment_type:', event?.data?.payment_type);
+    console.log('Full event.data:', JSON.stringify(event?.data).substring(0, 500));
+
+    // Flutterwave does NOT send meta in webhooks - must verify transaction to get it
+    var txId = event?.data?.id;
+    var verifiedMeta = {};
+    var verifiedData = event?.data || {};
+
+    if (txId) {
+      try {
+        var verifyRes = await fetch('https://api.flutterwave.com/v3/transactions/' + txId + '/verify', {
+          method: 'GET',
+          headers: {
+            'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY,
+            'Content-Type': 'application/json',
+          },
+        });
+        var verifyData = await verifyRes.json();
+        console.log('Transaction verify response status:', verifyData.status);
+
+        if (verifyData.status === 'success' && verifyData.data) {
+          verifiedData = verifyData.data;
+          verifiedMeta = verifyData.data.meta || {};
+          console.log('Verified transaction meta:', JSON.stringify(verifiedMeta));
+          console.log('Verified tx_ref:', verifyData.data.tx_ref);
+          console.log('Verified amount:', verifyData.data.amount);
+          console.log('Verified status:', verifyData.data.status);
+        }
+      } catch(verifyErr) {
+        console.error('Transaction verify failed:', verifyErr.message);
+      }
+    }
+
+    // Now use verifiedMeta and verifiedData for all payment type checks
+    var status = verifiedData.status || event?.data?.status;
+    var txRef = verifiedData.tx_ref || event?.data?.tx_ref;
+    var amount = parseFloat(verifiedData.amount || event?.data?.amount || 0);
+    var customerEmail = verifiedData.customer?.email || event?.data?.customer?.email;
+
+    var paymentType = verifiedMeta?.payment_type || null;
+    var metaAgentId = verifiedMeta?.agent_id || null;
+    var metaPropertyId = verifiedMeta?.property_id || null;
+    var metaTier = verifiedMeta?.tier || null;
+
+    console.log('Payment resolved - type:', paymentType, '| agentId:', metaAgentId, '| propertyId:', metaPropertyId, '| status:', status, '| amount:', amount);
+
+    console.log('Flutterwave webhook received - reference:', txRef, '| status:', status);
+
+    // Identify by tx_ref prefix first (most reliable)
+    if (!paymentType && txRef) {
+      // All our transactions start with 'GH-'
+      // Check what the tx_ref matches in our DB tables
+
+      // Check featured listing
+      const { data: featProp } = await adminClient
+        .from('properties')
+        .select('id, title, created_by')
+        .eq('featured_payment_reference', txRef)
+        .maybeSingle();
+      if (featProp) {
+        paymentType = 'featured_listing';
+        metaPropertyId = featProp.id;
+        console.log('Fallback: featured_listing via tx_ref match');
+      }
+
+      // Check deposit
+      if (!paymentType) {
+        const { data: depProp } = await adminClient
+          .from('properties')
+          .select('id, title, created_by')
+          .eq('deposit_reference', txRef)
+          .maybeSingle();
+        if (depProp) {
+          paymentType = 'deposit';
+          metaPropertyId = depProp.id;
+          console.log('Fallback: deposit via tx_ref match');
+        }
+      }
+    }
+
+    // If still no type, use customer email + amount to determine subscription vs unlimited
+    if (!paymentType && customerEmail) {
+      const { data: agentProf } = await adminClient
+        .from('profiles')
+        .select('id, subscription_tier')
+        .eq('email', customerEmail)
+        .eq('role', 'agent')
+        .maybeSingle();
+
+      if (agentProf) {
+        // Fetch all configurable prices
+        const { data: allSettings } = await adminClient
+          .from('app_settings')
+          .select('setting_key, setting_value, setting_json')
+          .in('setting_key', [
+            'premium_plan_price', 'agency_plan_price',
+            'unlimited_plan_price', 'featured_listing_fee',
+            'promo_enabled', 'promo_details'
+          ]);
+
+        var settingsMap = {};
+        (allSettings || []).forEach(function(s) {
+          settingsMap[s.setting_key] = s.setting_json || s.setting_value;
+        });
+
+        var premiumPrice = parseFloat(settingsMap.premium_plan_price || 8500);
+        var agencyPrice = parseFloat(settingsMap.agency_plan_price || 35000);
+        var unlimitedPrice = parseFloat(settingsMap.unlimited_plan_price || 100000);
+        var featuredPrice = parseFloat(settingsMap.featured_listing_fee || 5000);
+
+        // Also calculate promo prices if promo is active
+        var promoEnabled = settingsMap.promo_enabled === 'true';
+        var promoDetails = settingsMap.promo_details || {};
+        var promoDiscount = promoEnabled && promoDetails.discount_percent
+          ? parseFloat(promoDetails.discount_percent) / 100
+          : 0;
+
+        var premiumPromoPrice = promoDiscount > 0 &&
+          (promoDetails.applies_to === 'all' || promoDetails.applies_to === 'premium')
+          ? Math.round(premiumPrice * (1 - promoDiscount)) : null;
+
+        var agencyPromoPrice = promoDiscount > 0 &&
+          (promoDetails.applies_to === 'all' || promoDetails.applies_to === 'agency')
+          ? Math.round(agencyPrice * (1 - promoDiscount)) : null;
+
+        console.log('Price matching - paid:', amount,
+          '| premium:', premiumPrice, premiumPromoPrice ? '(promo: ' + premiumPromoPrice + ')' : '',
+          '| agency:', agencyPrice, agencyPromoPrice ? '(promo: ' + agencyPromoPrice + ')' : '',
+          '| unlimited:', unlimitedPrice,
+          '| featured:', featuredPrice);
+
+        // Use 5% tolerance for rounding differences
+        var tol = 0.05;
+        var within = function(paid, expected) {
+          return Math.abs(paid - expected) <= Math.max(expected * tol, 50);
+        };
+
+        if (within(amount, unlimitedPrice)) {
+          paymentType = 'unlimited_plan';
+          metaAgentId = agentProf.id;
+          console.log('Fallback: unlimited_plan match');
+        } else if (within(amount, premiumPrice) || (premiumPromoPrice && within(amount, premiumPromoPrice))) {
+          paymentType = 'subscription';
+          metaAgentId = agentProf.id;
+          metaTier = 'premium';
+          console.log('Fallback: premium subscription match');
+        } else if (within(amount, agencyPrice) || (agencyPromoPrice && within(amount, agencyPromoPrice))) {
+          paymentType = 'subscription';
+          metaAgentId = agentProf.id;
+          metaTier = 'agency';
+          console.log('Fallback: agency subscription match');
+        } else if (within(amount, featuredPrice)) {
+          paymentType = 'featured_listing';
+          // For featured, still need property_id — look up by tx_ref
+          const { data: featByRef } = await adminClient
+            .from('properties')
+            .select('id')
+            .eq('featured_payment_reference', txRef)
+            .maybeSingle();
+          if (featByRef) metaPropertyId = featByRef.id;
+          console.log('Fallback: featured_listing match');
+        } else {
+          console.error('UNMATCHED PAYMENT - amount:', amount,
+            '| email:', customerEmail, '| txRef:', txRef,
+            '| none of the configured prices matched');
+        }
+      }
+    }
+
+    console.log('Final resolved - type:', paymentType, '| agentId:', metaAgentId, '| status:', status);
 
     // Fallback: match by tx_ref for featured payments where meta might be missing
-    if (status === 'successful' && event?.data?.tx_ref) {
-      var txRef = event?.data?.tx_ref;
+    if (status === 'successful' && txRef) {
       const { data: pendingFeatured } = await adminClient
         .from('properties')
         .select('id, title, created_by')
@@ -6388,7 +6560,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         .eq('featured_payment_status', 'processing')
         .maybeSingle();
 
-      if (pendingFeatured && !event?.data?.meta?.payment_type) {
+      if (pendingFeatured && !paymentType) {
         console.log('Fallback featured match found by tx_ref:', txRef, pendingFeatured.id);
         await adminClient.from('properties').update({
           is_featured: true,
@@ -6402,11 +6574,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       const { error: updateErr } = await adminClient.from('properties').update({
         deposit_status: 'confirmed',
         deposit_confirmed: true,
-      }).eq('deposit_reference', reference);
+      }).eq('deposit_reference', txRef);
       if (updateErr) console.error('Deposit confirm update failed (non-blocking):', updateErr.message);
 
       const { data: property } = await adminClient.from('properties')
-        .select('id, title, location, created_by').eq('deposit_reference', reference).single();
+        .select('id, title, location, created_by').eq('deposit_reference', txRef).single();
 
       if (property) {
         const { data: agentProfile } = await adminClient.from('profiles')
@@ -6418,7 +6590,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             recipient_id: agentProfile.sa_id,
             type: 'proxy_payment',
             title: 'Payment Confirmed via Flutterwave',
-            message: 'Payment confirmed for property: ' + property.title + '. Reference: ' + reference,
+            message: 'Payment confirmed for property: ' + property.title + '. Reference: ' + txRef,
             is_read: false,
           }]);
           if (notifErr) console.error('Notification insert failed (non-blocking):', notifErr.message);
@@ -6429,11 +6601,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       if (property) {
         var propertyId = property.id;
         var updatedProperty = property;
-        var paymentAmount = parseFloat(event?.data?.amount || 0).toLocaleString();
+        var paymentAmount = parseFloat(amount || 0).toLocaleString();
         var currency = event?.data?.currency || 'NGN';
-        var customerEmail = event?.data?.customer?.email || 'Unknown';
+        var customerEmail = customerEmail || 'Unknown';
         var customerName = event?.data?.customer?.name || 'Unknown';
-        var txRef = event?.data?.tx_ref || 'N/A';
+        var txRef = txRef || 'N/A';
 
         // WhatsApp number is admin-configurable via app_settings (payment_whatsapp),
         // falling back to the env var, falling back to a hardcoded default
@@ -6469,14 +6641,13 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     }
 
     // Handle agent subscription payments
-    console.log('Webhook payment type:', event?.data?.meta?.payment_type);
-    console.log('Webhook meta:', JSON.stringify(event?.data?.meta));
-    if (status === 'successful' && event?.data?.meta?.payment_type === 'subscription') {
-      console.log('Webhook payment type:', event?.data?.meta?.payment_type);
-      console.log('Webhook meta:', JSON.stringify(event?.data?.meta));
-      const agentId = event?.data?.meta?.agent_id;
-      const tier = event?.data?.meta?.tier;
-      const amount = parseFloat(event?.data?.amount || 0);
+    console.log('Webhook payment type:', paymentType);
+    console.log('Webhook meta:', JSON.stringify(verifiedMeta));
+    if (status === 'successful' && paymentType === 'subscription') {
+      console.log('Webhook payment type:', paymentType);
+      console.log('Webhook meta:', JSON.stringify(verifiedMeta));
+      const agentId = metaAgentId;
+      const tier = metaTier;
 
       if (agentId && tier) {
         const tierDurations = { premium: 30, agency: 30 };
@@ -6594,10 +6765,10 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     }
 
     // Handle featured listing payments
-    if (status === 'successful' && event?.data?.meta?.payment_type === 'featured_listing') {
-      var featuredPropertyId = event?.data?.meta?.property_id;
-      var featuredTxRef = event?.data?.tx_ref || event?.data?.flw_ref || null;
-      var featuredAmount = parseFloat(event?.data?.amount || 0);
+    if (status === 'successful' && paymentType === 'featured_listing') {
+      var featuredPropertyId = metaPropertyId;
+      var featuredTxRef = txRef || event?.data?.flw_ref || null;
+      var featuredAmount = parseFloat(amount || 0);
 
       console.log('Featured listing payment received - property:', featuredPropertyId, '| ref:', featuredTxRef, '| amount:', featuredAmount);
 
@@ -6660,15 +6831,15 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           }]).catch(e => console.error('Admin featured notification failed:', e.message));
         }
       } else {
-        console.error('Featured payment received but no property_id in meta:', JSON.stringify(event?.data?.meta));
+        console.error('Featured payment received but no property_id in meta:', JSON.stringify(verifiedMeta));
       }
     }
 
     // Handle unlimited plan payment
-    if (status === 'successful' && event?.data?.meta?.payment_type === 'unlimited_plan') {
-      var unlimitedAgentId = event?.data?.meta?.agent_id;
-      var unlimitedAmount = parseFloat(event?.data?.amount || 0);
-      var txRef = event?.data?.tx_ref || null;
+    if (status === 'successful' && paymentType === 'unlimited_plan') {
+      var unlimitedAgentId = metaAgentId;
+      var unlimitedAmount = parseFloat(amount || 0);
+      var txRef = txRef || null;
 
       console.log('Unlimited plan payment received - agent:', unlimitedAgentId, '| amount:', unlimitedAmount);
 
@@ -9921,6 +10092,27 @@ app.get('/api/admin/agent-details/:id', async (req, res) => {
     res.json(Object.assign({}, agent || {}, profile));
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
+
+// Seed default app_settings rows for prices/promo config used by the Flutterwave
+// webhook's amount-matching fallback, so they show up in the admin settings UI and
+// can be edited there. ignoreDuplicates means this never overwrites a value an
+// admin has already set.
+async function seedPlanPriceSettings() {
+  try {
+    const { error } = await adminClient.from('app_settings').upsert([
+      { setting_key: 'premium_plan_price', setting_value: '8500' },
+      { setting_key: 'agency_plan_price', setting_value: '35000' },
+      { setting_key: 'featured_listing_fee', setting_value: '5000' },
+      { setting_key: 'promo_enabled', setting_value: 'false' },
+      { setting_key: 'promo_details', setting_json: { discount_percent: 0, applies_to: 'all' } },
+    ], { onConflict: 'setting_key', ignoreDuplicates: true });
+    if (error) console.error('Seed plan price settings failed:', error.message);
+    else console.log('Plan price settings seeded (premium_plan_price, agency_plan_price, featured_listing_fee, promo_enabled, promo_details)');
+  } catch (err) {
+    console.error('Seed plan price settings exception:', err.message);
+  }
+}
+seedPlanPriceSettings();
 
 // ──────────────────────────────────────────────────────────
 // START SERVER
