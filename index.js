@@ -1470,7 +1470,7 @@ app.get('/api/sa/pending-agents', async (req, res) => {
     // PART 1: Unclaimed agents (sa_id IS NULL) matching this SA's city - these are NEW pending agents
     const { data: unclaimedAgents } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, is_unlimited, created_at')
       .eq('role', 'agent')
       .is('sa_id', null)
       .order('created_at', { ascending: false });
@@ -1489,7 +1489,7 @@ app.get('/api/sa/pending-agents', async (req, res) => {
     // PART 2: Agents ALREADY assigned to this SA (after SA claimed them) - these are in later stages
     const { data: claimedAgents } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, is_unlimited, created_at')
       .eq('role', 'agent')
       .eq('sa_id', session.staff_id)
       .order('created_at', { ascending: false });
@@ -1513,10 +1513,18 @@ app.get('/api/sa/pending-agents', async (req, res) => {
       return a.status === 'approved';
     });
 
+    // Flag agents who have paid (unlimited plan or any non-free subscription tier)
+    // so the SA can see a payment badge and prioritize approving them.
+    const withPaidBadge = function(agent) {
+      return Object.assign({}, agent, {
+        has_paid: !!(agent.subscription_tier && agent.subscription_tier !== 'free') || agent.is_unlimited === true,
+      });
+    };
+
     res.json({
-      pending: pending,
-      pending_gha_inspection: ghaInspection,
-      approved: approved,
+      pending: pending.map(withPaidBadge),
+      pending_gha_inspection: ghaInspection.map(withPaidBadge),
+      approved: approved.map(withPaidBadge),
     });
   } catch (err) {
     console.error('Pending agents exception:', err.message);
@@ -5548,7 +5556,7 @@ app.post('/api/properties', async (req, res) => {
       console.log('Agent not approved - status:', profileData.status, '| agent:', agentId);
       const statusMsg = profileData.status === 'disapproved'
         ? 'Your agent account has been suspended. Please contact admin.'
-        : 'Your agent account is not yet approved. Please wait for admin approval.';
+        : 'Your agent account is pending approval. Please contact your Service Agent (SA) to approve your account before uploading listings.';
       return res.status(403).json({ error: statusMsg, status: profileData.status });
     }
 
