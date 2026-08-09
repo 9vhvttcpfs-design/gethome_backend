@@ -2004,7 +2004,7 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
 
     const { data: agents, error } = await serviceClient
       .from('profiles')
-      .select('id, full_name, email, gha_id, subscription_tier, subscription_amount, subscription_start, subscription_end, subscription_status')
+      .select('id, full_name, email, gha_id, subscription_tier, subscription_amount, subscription_start, subscription_end, subscription_status, is_unlimited, unlimited_listings, unlimited_expires_at')
       .eq('sa_id', saId)
       .eq('role', 'agent')
       .eq('subscription_status', 'active');
@@ -2249,7 +2249,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     // Get all agents under this GHA
     const { data: myAgents, error: agentErr } = await adminClient
       .from('profiles')
-      .select('id, email, subscription_tier, subscription_status, subscription_end, subscription_amount, full_name')
+      .select('id, email, subscription_tier, subscription_status, subscription_end, subscription_amount, full_name, is_unlimited, unlimited_listings, unlimited_expires_at')
       .or('gha_code.eq.' + ghaCode + ',gha_id.eq.' + ghaId)
       .eq('role', 'agent');
 
@@ -9767,24 +9767,39 @@ app.post('/api/admin/set-unlimited-listings', async (req, res) => {
       return res.status(400).json({ error: 'agent_id and unlimited are required' });
     }
 
+    // Calculate expiry — 6 months if granting, null if revoking
+    var expiryDate = null;
+    if (unlimited) {
+      var expiry = new Date();
+      expiry.setMonth(expiry.getMonth() + 6);
+      expiryDate = expiry.toISOString();
+    }
+
+    // Update profiles using is_unlimited (what agent portal reads)
     const { error: profileErr } = await adminClient
       .from('profiles')
-      .update({ unlimited_listings: unlimited })
+      .update({
+        is_unlimited: unlimited,
+        unlimited_listings: unlimited, // keep in sync
+        unlimited_expires_at: expiryDate,
+      })
       .eq('id', agent_id);
-    if (profileErr) return res.status(500).json({ error: profileErr.message });
+    if (profileErr) return res.status(500).json({ error: 'Profiles update failed: ' + profileErr.message });
 
+    // Update agents table for backward compatibility
     const { error: agentErr } = await adminClient
       .from('agents')
       .update({ unlimited_listings: unlimited })
       .eq('id', agent_id);
-    if (agentErr) console.error('Agents table unlimited update failed:', agentErr.message);
+    if (agentErr) console.error('Agents table unlimited update failed (non-blocking):', agentErr.message);
 
-    console.log('Unlimited listings', unlimited ? 'granted' : 'revoked', 'for agent:', agent_id, '| by:', adminProfile.email);
+    console.log('Unlimited listings', unlimited ? 'granted until ' + expiryDate : 'revoked', 'for agent:', agent_id, '| by:', adminProfile.email);
     res.json({
       success: true,
       message: unlimited
-        ? 'Unlimited listings granted successfully'
+        ? 'Unlimited listings granted — expires ' + new Date(expiryDate).toLocaleDateString('en-NG')
         : 'Unlimited listings revoked — agent returns to plan limits',
+      expires_at: expiryDate,
     });
   } catch(err) {
     console.error('Set unlimited listings error:', err.message);
