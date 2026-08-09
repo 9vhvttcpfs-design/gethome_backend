@@ -4002,15 +4002,42 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
     const { inspection_id } = req.body;
     if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
 
+    // Fetch by id only - assigned_by_sa may not match this SA's staff_id even
+    // when the inspection's GHA reports to this SA, so ownership is checked below.
     const { data: inspection } = await serviceClient
-      .from('inspections').select('*').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
-    if (!inspection) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
+      .from('inspections').select('*').eq('id', inspection_id).single();
+    if (!inspection) return res.status(404).json({ error: 'Inspection not found' });
+
+    // Check SA ownership - either directly assigned OR GHA belongs to this SA
+    var isAuthorized = inspection.assigned_by_sa === saId;
+
+    if (!isAuthorized && inspection.gha_id) {
+      const { data: gha } = await serviceClient
+        .from('gha_agents')
+        .select('sa_id')
+        .eq('id', inspection.gha_id)
+        .single();
+      isAuthorized = gha?.sa_id === saId;
+    }
+
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'You are not authorized to confirm this inspection' });
+    }
+
+    if (inspection.status !== 'done') {
+      return res.status(400).json({
+        error: 'Inspection status is ' + inspection.status + '. Must be done before SA can confirm.',
+        current_status: inspection.status,
+      });
+    }
 
     const { error } = await serviceClient
       .from('inspections')
       .update({ status: 'confirmed', sa_confirmed: true, sa_confirmed_at: new Date().toISOString() })
       .eq('id', inspection_id);
     if (error) throw error;
+
+    console.log('Inspection confirmed:', inspection_id, '| SA:', saId, '| GHA:', inspection.gha_id);
 
     try {
       const { error: notifErr } = await adminClient.from('notifications').insert([{
@@ -7871,6 +7898,28 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
   }
 });
 
+// gha_earnings/sa_earnings rows carry no plan-type column, so there is no way to
+// tell from an earnings row alone whether it came from a premium, agency, or
+// unlimited plan payment. This derives an approximate unlimited-plan share of a
+// commission total by joining each earning's agent_id to profiles.is_unlimited —
+// it reflects the agent's CURRENT unlimited status, not necessarily their plan
+// at the time the earning was recorded.
+async function sumCommissionForUnlimitedAgents(earnings) {
+  var agentIds = [...new Set((earnings || []).map(function(e) { return e.agent_id; }).filter(Boolean))];
+  if (agentIds.length === 0) return 0;
+
+  const { data: agentFlags } = await adminClient
+    .from('profiles')
+    .select('id, is_unlimited')
+    .in('id', agentIds);
+
+  var unlimitedAgentIds = new Set((agentFlags || []).filter(function(a) { return a.is_unlimited; }).map(function(a) { return a.id; }));
+
+  return (earnings || []).reduce(function(sum, e) {
+    return sum + (unlimitedAgentIds.has(e.agent_id) ? (parseFloat(e.commission_amount) || 0) : 0);
+  }, 0);
+}
+
 // GET /api/admin/staff-payments - calculate and return all staff payment totals
 app.get('/api/admin/staff-payments', async (req, res) => {
   try {
@@ -7943,16 +7992,26 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       var breakdown = count > 0 ? [{ tier: 'current', count: count, rate: inspFee, subtotal: inspPayment }] : [];
       console.log('GHA', gha.gha_code, '| confirmed:', count, '| fee:', inspFee, '| total:', inspPayment);
 
-      // Commission from subscriptions
+      // Commission from subscriptions — sums ALL earnings rows for the month
+      // regardless of whether they came from premium, agency, or unlimited plan payments.
       const { data: earnings } = await adminClient
         .from('gha_earnings')
-        .select('commission_amount, is_paid')
+        .select('commission_amount, subscription_amount, is_paid, agent_id')
         .eq('gha_id', gha.id)
         .eq('month_year', month);
 
       const commissionTotal = (earnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
       }, 0);
+      const totalRevenue = (earnings || []).reduce(function(sum, e) {
+        return sum + (parseFloat(e.subscription_amount) || 0);
+      }, 0);
+
+      // gha_earnings has no plan-type column, so the unlimited-plan share of this
+      // commission is derived by checking which earning agents are currently on
+      // the unlimited plan (profiles.is_unlimited) — reflects current status, not
+      // necessarily the agent's plan at the time the earning was recorded.
+      const unlimitedCommission = await sumCommissionForUnlimitedAgents(earnings);
 
       // Current commission rate (individual override, else global setting) — for display
       const commissionRate = await getStaffCommissionRate(gha.id, 'GHA');
@@ -8002,6 +8061,9 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         inspection_breakdown: breakdown,
         inspections: enrichedInspections,
         commission_amount: commissionTotal,
+        unlimited_commission: unlimitedCommission,
+        total_revenue: totalRevenue,
+        earnings_count: (earnings || []).length,
         commission_rate: commissionRate,
         commission_rate_source: commissionRateSource,
         total_payment: totalPayment,
@@ -8025,16 +8087,26 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     var globalSaRate = parseFloat(saRateSetting?.setting_value || 5);
 
     const saPayments = await Promise.all((sas || []).map(async function(sa) {
-      // SA commission from subscriptions
+      // SA commission from subscriptions — sums ALL earnings rows for the month
+      // regardless of whether they came from premium, agency, or unlimited plan payments.
       const { data: saEarnings } = await adminClient
         .from('sa_earnings')
-        .select('commission_amount, is_paid')
+        .select('commission_amount, subscription_amount, is_paid, agent_id')
         .eq('sa_id', sa.id)
         .eq('month_year', month);
 
       const commissionTotal = (saEarnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
       }, 0);
+      const totalRevenue = (saEarnings || []).reduce(function(sum, e) {
+        return sum + (parseFloat(e.subscription_amount) || 0);
+      }, 0);
+
+      // sa_earnings has no plan-type column, so the unlimited-plan share of this
+      // commission is derived by checking which earning agents are currently on
+      // the unlimited plan (profiles.is_unlimited) — reflects current status, not
+      // necessarily the agent's plan at the time the earning was recorded.
+      const unlimitedCommission = await sumCommissionForUnlimitedAgents(saEarnings);
 
       // Current commission rate (individual override, else global setting) — for display
       const commissionRate = await getStaffCommissionRate(sa.id, 'SA');
@@ -8085,6 +8157,9 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         bank_code: sa.bank_code || null,
         inspections_overseen: confirmedCount || 0,
         commission_amount: commissionTotal,
+        unlimited_commission: unlimitedCommission,
+        total_revenue: totalRevenue,
+        earnings_count: (saEarnings || []).length,
         commission_rate: commissionRate,
         commission_rate_source: commissionRateSource,
         total_payment: totalPayment,
@@ -10202,6 +10277,74 @@ async function seedPlanPriceSettings() {
   }
 }
 seedPlanPriceSettings();
+
+// POST /api/admin/fix-unlimited-earnings - one-time manual fix to create GHA/SA
+// earnings rows for an unlimited-plan agent whose payment didn't trigger them.
+app.post('/api/admin/fix-unlimited-earnings', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { agent_email } = req.body;
+    if (!agent_email) return res.status(400).json({ error: 'agent_email required' });
+
+    const { data: agentProf } = await adminClient
+      .from('profiles')
+      .select('id, email, gha_id, sa_id, subscription_amount, is_unlimited')
+      .eq('email', agent_email)
+      .single();
+
+    if (!agentProf) return res.status(404).json({ error: 'Agent not found' });
+    if (!agentProf.is_unlimited) return res.status(400).json({ error: 'Agent is not on unlimited plan' });
+
+    var unlimitedAmount = parseFloat(agentProf.subscription_amount || 0);
+    var monthYear = getBillingMonth();
+    var results = [];
+
+    if (agentProf.gha_id) {
+      var ghaRate = await getStaffCommissionRate(agentProf.gha_id, 'GHA');
+      var ghaCommission = Math.round(unlimitedAmount * (ghaRate / 100));
+      const { error: ghaErr } = await adminClient.from('gha_earnings').upsert([{
+        gha_id: agentProf.gha_id,
+        agent_id: agentProf.id,
+        agent_email: agent_email,
+        subscription_amount: unlimitedAmount,
+        commission_rate: ghaRate,
+        commission_amount: ghaCommission,
+        month_year: monthYear,
+        is_paid: false,
+      }], { onConflict: 'gha_id,agent_id,month_year' });
+      if (ghaErr) results.push('GHA earnings failed: ' + ghaErr.message);
+      else results.push('GHA earnings created: ₦' + ghaCommission + ' (' + ghaRate + '%)');
+    } else {
+      results.push('No GHA linked to agent');
+    }
+
+    if (agentProf.sa_id) {
+      var saRate = await getStaffCommissionRate(agentProf.sa_id, 'SA');
+      var saCommission = Math.round(unlimitedAmount * (saRate / 100));
+      const { error: saErr } = await adminClient.from('sa_earnings').upsert([{
+        sa_id: agentProf.sa_id,
+        gha_id: agentProf.gha_id || null,
+        agent_id: agentProf.id,
+        subscription_amount: unlimitedAmount,
+        commission_rate: saRate,
+        commission_amount: saCommission,
+        month_year: monthYear,
+        is_paid: false,
+      }], { onConflict: 'sa_id,agent_id,month_year' });
+      if (saErr) results.push('SA earnings failed: ' + saErr.message);
+      else results.push('SA earnings created: ₦' + saCommission + ' (' + saRate + '%)');
+    } else {
+      results.push('No SA linked to agent');
+    }
+
+    console.log('Manual unlimited earnings fix for:', agent_email, results);
+    res.json({ success: true, results });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ──────────────────────────────────────────────────────────
 // START SERVER
