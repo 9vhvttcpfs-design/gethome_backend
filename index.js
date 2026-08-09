@@ -1737,7 +1737,7 @@ app.post('/api/sa/send-to-gha', verifyStaffToken, async (req, res) => {
       const { error: notifErr } = await serviceClient.from('notifications').insert({
         recipient_type: 'GHA',
         recipient_id: resolvedGhaId,
-        type: 'inspection_request',
+        type: 'agent_verification_request',
         title: 'New Agent to Verify',
         message: `Please verify agent ${agent.full_name || agent_id} registration details and confirm to SA.`,
         is_read: false,
@@ -4403,6 +4403,63 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
     console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
     console.log('Agent auto-approved on GHA assignment:', agent_id);
 
+    // After successful assignment, create earnings for any existing subscription
+    try {
+      const { data: agentProfile } = await adminClient
+        .from('profiles')
+        .select('subscription_tier, subscription_status, subscription_amount, is_unlimited, email')
+        .eq('id', agent_id)
+        .single();
+
+      var hasPaidSubscription = agentProfile && (
+        agentProfile.is_unlimited ||
+        (agentProfile.subscription_tier && agentProfile.subscription_tier !== 'free' && agentProfile.subscription_status === 'active')
+      );
+
+      if (hasPaidSubscription && agentProfile.subscription_amount > 0) {
+        var monthYear = getBillingMonth();
+        var subAmount = parseFloat(agentProfile.subscription_amount || 0);
+
+        // Create GHA earnings
+        if (gha.id) {
+          var ghaRate = await getStaffCommissionRate(gha.id, 'GHA');
+          var ghaCommission = Math.round(subAmount * (ghaRate / 100));
+          const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
+            gha_id: gha.id,
+            agent_id: agent_id,
+            agent_email: agentProfile.email,
+            subscription_amount: subAmount,
+            commission_rate: ghaRate,
+            commission_amount: ghaCommission,
+            month_year: monthYear,
+            is_paid: false,
+          }], { onConflict: 'gha_id,agent_id,month_year' });
+          if (ghaEarnErr) console.error('GHA earnings on assign failed:', ghaEarnErr.message);
+          else console.log('GHA earnings created on assign:', gha.gha_code, '₦' + ghaCommission);
+        }
+
+        // Create SA earnings
+        if (gha.sa_id) {
+          var saRate = await getStaffCommissionRate(gha.sa_id, 'SA');
+          var saCommission = Math.round(subAmount * (saRate / 100));
+          const { error: saEarnErr } = await adminClient.from('sa_earnings').upsert([{
+            sa_id: gha.sa_id,
+            gha_id: gha.id,
+            agent_id: agent_id,
+            subscription_amount: subAmount,
+            commission_rate: saRate,
+            commission_amount: saCommission,
+            month_year: monthYear,
+            is_paid: false,
+          }], { onConflict: 'sa_id,agent_id,month_year' });
+          if (saEarnErr) console.error('SA earnings on assign failed:', saEarnErr.message);
+          else console.log('SA earnings created on assign:', '₦' + saCommission);
+        }
+      }
+    } catch(earnErr) {
+      console.error('Earnings creation on assign failed (non-blocking):', earnErr.message);
+    }
+
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code, updated_agent: updated[0] });
   } catch (err) {
     console.error('Admin assign exception:', err.message, err.stack);
@@ -7053,6 +7110,66 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         }]).catch(e => console.error('Unlimited notification failed:', e.message));
 
         console.log('Unlimited plan activated for agent:', unlimitedAgentId, '| expires:', expiryISO);
+      }
+    }
+
+    // Handle inspection fee payment
+    if (status === 'successful' && paymentType === 'inspection_fee') {
+      var inspPropertyId = metaPropertyId || verifiedMeta?.property_id;
+      var inspCustomerEmail = verifiedMeta?.customer_email || customerEmail;
+      var inspCustomerName = verifiedMeta?.customer_name || '';
+      var inspCustomerPhone = verifiedMeta?.customer_phone || '';
+      var inspSaWhatsapp = verifiedMeta?.sa_whatsapp || process.env.GETHOME_WHATSAPP;
+      var inspFeeAmount = amount;
+
+      console.log('Inspection fee paid - property:', inspPropertyId, '| customer:', inspCustomerEmail, '| amount:', inspFeeAmount);
+
+      // Get property details
+      const { data: inspProp } = await adminClient
+        .from('properties')
+        .select('id, title, location, rent, price, agent_id, created_by')
+        .eq('id', inspPropertyId)
+        .single();
+
+      if (inspProp) {
+        // Mark fee as paid on property
+        await adminClient.from('properties').update({
+          fee_payment_status: 'paid',
+          fee_paid_at: new Date().toISOString(),
+          fee_payment_amount: inspFeeAmount,
+        }).eq('id', inspPropertyId);
+
+        // NOW send WhatsApp message to SA since payment confirmed
+        var saWhatsapp = inspSaWhatsapp || process.env.GETHOME_WHATSAPP;
+        var propPrice = parseFloat(inspProp.rent || inspProp.price || 0);
+        var waMsg = encodeURIComponent(
+          'New Inspection Request — GetHome 🏠\n\n' +
+          'Property: ' + (inspProp.title || 'Property #' + inspPropertyId) + '\n' +
+          'Location: ' + (inspProp.location || 'N/A') + '\n' +
+          'Price: ₦' + propPrice.toLocaleString() + '\n\n' +
+          'Customer Details:\n' +
+          'Name: ' + inspCustomerName + '\n' +
+          'Email: ' + inspCustomerEmail + '\n' +
+          'Phone: ' + inspCustomerPhone + '\n\n' +
+          'Inspection Fee Paid: ₦' + inspFeeAmount.toLocaleString() + '\n' +
+          'Reference: ' + txRef + '\n\n' +
+          'Please assign a GHA to conduct this inspection.'
+        );
+
+        var waLink = 'https://wa.me/' + saWhatsapp.replace(/\D/g, '') + '?text=' + waMsg;
+
+        // Store WhatsApp link in notification for SA to click
+        await adminClient.from('notifications').insert([{
+          recipient_type: 'ADMIN',
+          recipient_id: 'admin',
+          type: 'inspection_fee_paid',
+          title: 'Inspection Fee Paid — ' + (inspCustomerName || inspCustomerEmail),
+          message: inspCustomerName + ' paid ₦' + inspFeeAmount.toLocaleString() + ' inspection fee for ' + (inspProp.title || 'property'),
+          is_read: false,
+          meta: JSON.stringify({ whatsapp_link: waLink, property_id: inspPropertyId, customer_email: inspCustomerEmail }),
+        }]).catch(e => console.error('Inspection fee notification failed:', e.message));
+
+        console.log('Inspection fee payment processed - WhatsApp notification created for SA');
       }
     }
 
@@ -10342,6 +10459,82 @@ app.post('/api/admin/fix-unlimited-earnings', async (req, res) => {
     console.log('Manual unlimited earnings fix for:', agent_email, results);
     res.json({ success: true, results });
   } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/inspections/initialize-payment', async (req, res) => {
+  try {
+    const { property_id, customer_email, customer_name, customer_phone, sa_whatsapp } = req.body;
+    if (!property_id || !customer_email) {
+      return res.status(400).json({ error: 'property_id and customer_email required' });
+    }
+
+    // Get property and inspection fee
+    const { data: property } = await adminClient
+      .from('properties')
+      .select('id, title, location, inspection_fee, rent, price')
+      .eq('id', property_id)
+      .single();
+
+    if (!property) return res.status(404).json({ error: 'Property not found' });
+
+    var inspectionFee = parseFloat(property.inspection_fee || 0);
+    if (inspectionFee <= 0) {
+      // No fee set - return flag to proceed directly to WhatsApp
+      return res.json({ requires_payment: false, property });
+    }
+
+    // Initialize Flutterwave payment for inspection fee
+    var reference = 'GH-INSP-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
+
+    var flwPayload = {
+      tx_ref: reference,
+      amount: inspectionFee,
+      currency: 'NGN',
+      redirect_url: 'https://trygethome.online/?inspection_payment=success&property_id=' + property_id + '&ref=' + reference,
+      customer: { email: customer_email, name: customer_name || customer_email, phonenumber: customer_phone || '' },
+      customizations: {
+        title: 'GetHome Inspection Fee',
+        description: 'Inspection fee for ' + property.title,
+      },
+      meta: {
+        payment_type: 'inspection_fee',
+        property_id: property_id,
+        customer_email: customer_email,
+        customer_name: customer_name,
+        customer_phone: customer_phone,
+        sa_whatsapp: sa_whatsapp,
+      },
+    };
+
+    var initRes = await fetch('https://api.flutterwave.com/v3/payments', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + process.env.FLW_SECRET_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(flwPayload),
+    });
+    var initData = await initRes.json();
+
+    if (initData.status !== 'success') {
+      console.error('Inspection fee payment init failed:', JSON.stringify(initData));
+      return res.status(500).json({ error: 'Payment initialization failed' });
+    }
+
+    // Store pending inspection payment on property
+    await adminClient.from('properties').update({
+      fee_payment_reference: reference,
+    }).eq('id', property_id).catch(e => console.error('Property fee ref update failed:', e.message));
+
+    console.log('Inspection fee payment initialized:', reference, '| fee:', inspectionFee, '| property:', property_id);
+    res.json({
+      requires_payment: true,
+      checkout_url: initData.data.link,
+      reference,
+      fee: inspectionFee,
+      property,
+    });
+  } catch(err) {
+    console.error('Inspection payment init error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
