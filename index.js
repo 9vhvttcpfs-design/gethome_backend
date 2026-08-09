@@ -729,7 +729,7 @@ app.post('/api/agent/bank-details', async (req, res) => {
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
     const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
     if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
-    const { bank_name, account_number, account_name } = req.body;
+    const { bank_name, bank_code, account_number, account_name } = req.body;
     if (!bank_name || !account_number || !account_name) {
       return res.status(400).json({ error: 'bank_name, account_number, and account_name are required' });
     }
@@ -738,7 +738,7 @@ app.post('/api/agent/bank-details', async (req, res) => {
     }
     const { error } = await serviceClient
       .from('profiles')
-      .update({ bank_name, account_number, account_name })
+      .update({ bank_name, bank_code: bank_code || null, account_number, account_name })
       .eq('id', user.id);
     if (error) throw error;
     res.json({ success: true, message: 'Bank details saved successfully' });
@@ -6663,9 +6663,18 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       console.log('Unlimited plan payment received - agent:', unlimitedAgentId, '| amount:', unlimitedAmount);
 
       if (unlimitedAgentId) {
-        // Set expiry to 6 months from now
+        // Duration is admin-configurable via app_settings (unlimited_plan_duration_months),
+        // falling back to 6 months if unset/invalid.
+        const { data: durationSetting } = await adminClient
+          .from('app_settings')
+          .select('setting_value')
+          .eq('setting_key', 'unlimited_plan_duration_months')
+          .maybeSingle();
+        var durationMonths = parseInt(durationSetting?.setting_value, 10);
+        if (!durationMonths || durationMonths < 1) durationMonths = 6;
+
         var expiryDate = new Date();
-        expiryDate.setMonth(expiryDate.getMonth() + 6);
+        expiryDate.setMonth(expiryDate.getMonth() + durationMonths);
         var expiryISO = expiryDate.toISOString();
 
         // Update profiles
@@ -9767,11 +9776,21 @@ app.post('/api/admin/set-unlimited-listings', async (req, res) => {
       return res.status(400).json({ error: 'agent_id and unlimited are required' });
     }
 
-    // Calculate expiry — 6 months if granting, null if revoking
+    // Calculate expiry — admin-configurable duration (unlimited_plan_duration_months,
+    // default 6) if granting, null if revoking. Keeps manual grants in sync with
+    // the duration agents get from paying for the plan directly.
     var expiryDate = null;
     if (unlimited) {
+      const { data: durationSetting } = await adminClient
+        .from('app_settings')
+        .select('setting_value')
+        .eq('setting_key', 'unlimited_plan_duration_months')
+        .maybeSingle();
+      var grantDurationMonths = parseInt(durationSetting?.setting_value, 10);
+      if (!grantDurationMonths || grantDurationMonths < 1) grantDurationMonths = 6;
+
       var expiry = new Date();
-      expiry.setMonth(expiry.getMonth() + 6);
+      expiry.setMonth(expiry.getMonth() + grantDurationMonths);
       expiryDate = expiry.toISOString();
     }
 
