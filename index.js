@@ -4015,15 +4015,22 @@ app.post('/api/sa/reschedule-inspection', verifyStaffToken, async (req, res) => 
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
-    const { inspection_id, rescheduled_date, new_gha_id } = req.body;
+    const { inspection_id, rescheduled_date, new_gha_id, reason } = req.body;
     if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
-    if (!rescheduled_date) return res.status(400).json({ error: 'rescheduled_date is required' });
+    if (!rescheduled_date && !new_gha_id) {
+      return res.status(400).json({ error: 'rescheduled_date or new_gha_id is required' });
+    }
 
     const { data: inspection } = await serviceClient
       .from('inspections').select('*').eq('id', inspection_id).eq('assigned_by_sa', saId).single();
     if (!inspection) return res.status(403).json({ error: 'Inspection not found or not assigned by you' });
 
-    var updateData = { rescheduled_date: rescheduled_date };
+    var updateData = {
+      status: 'assigned',
+      cancellation_reason: null,
+      cancelled_at: null,
+    };
+    if (rescheduled_date) updateData.rescheduled_date = rescheduled_date;
     if (new_gha_id) updateData.gha_id = new_gha_id;
 
     const { error } = await serviceClient
@@ -4032,12 +4039,37 @@ app.post('/api/sa/reschedule-inspection', verifyStaffToken, async (req, res) => 
       .eq('id', inspection_id);
     if (error) throw error;
 
-    // Notify GHA of rescheduled inspection
-    const targetGhaId = new_gha_id || inspection.gha_id;
-    if (targetGhaId) {
+    // Notify old GHA if reassigned
+    if (new_gha_id && new_gha_id !== inspection.gha_id) {
+      if (inspection.gha_id) {
+        const { error: oldNotifErr } = await serviceClient.from('notifications').insert([{
+          recipient_type: 'GHA',
+          recipient_id: inspection.gha_id,
+          type: 'inspection_reassigned',
+          title: 'Inspection Reassigned',
+          message: 'An inspection has been reassigned to another GHA.' + (reason ? ' Reason: ' + reason : ''),
+          is_read: false,
+        }]);
+        if (oldNotifErr) console.error('Old GHA notification failed:', oldNotifErr.message);
+      }
+
+      // Notify new GHA
+      const { error: newNotifErr } = await serviceClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: new_gha_id,
+        type: 'inspection_assigned',
+        title: 'New Inspection Assigned',
+        message: 'An inspection has been assigned to you' +
+          (rescheduled_date ? ' for ' + new Date(rescheduled_date).toLocaleDateString() : '') +
+          '. Please confirm availability.',
+        is_read: false,
+      }]);
+      if (newNotifErr) console.error('New GHA notification failed:', newNotifErr.message);
+    } else if (rescheduled_date && inspection.gha_id) {
+      // Same GHA, just notify of the reschedule
       const { error: notifErr } = await serviceClient.from('notifications').insert([{
         recipient_type: 'GHA',
-        recipient_id: targetGhaId,
+        recipient_id: inspection.gha_id,
         type: 'inspection_rescheduled',
         title: 'Inspection Rescheduled',
         message: 'An inspection has been rescheduled to ' + new Date(rescheduled_date).toLocaleDateString() + '. Please confirm availability.',
@@ -4046,7 +4078,7 @@ app.post('/api/sa/reschedule-inspection', verifyStaffToken, async (req, res) => 
       if (notifErr) console.error('Reschedule notification failed:', notifErr.message);
     }
 
-    res.json({ success: true });
+    res.json({ success: true, message: new_gha_id ? 'Inspection reassigned to new GHA successfully' : 'Inspection rescheduled successfully' });
   } catch (err) {
     console.error('SA reschedule-inspection error:', err.message);
     res.status(500).json({ error: err.message });
@@ -4428,22 +4460,79 @@ app.post('/api/admin/cancel-inspection', async (req, res) => {
 });
 
 // POST /api/admin/reschedule-inspection
+// SOFT reassignment - changes date and/or GHA without resetting inspection data.
+// Use for scheduling conflicts, GHA unavailability, or date changes.
+// Does NOT clear notes or gha_done_at. Status stays 'assigned'.
+// For full reset (redo from scratch) use /api/admin/reassign-inspection instead.
 app.post('/api/admin/reschedule-inspection', async (req, res) => {
   try {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { inspection_id, rescheduled_date } = req.body;
+    const { inspection_id, rescheduled_date, new_gha_id, reason } = req.body;
     if (!inspection_id) return res.status(400).json({ error: 'inspection_id is required' });
-    if (!rescheduled_date) return res.status(400).json({ error: 'rescheduled_date is required' });
+    if (!rescheduled_date && !new_gha_id) {
+      return res.status(400).json({ error: 'rescheduled_date or new_gha_id is required' });
+    }
+
+    const { data: inspection } = await serviceClient
+      .from('inspections').select('*').eq('id', inspection_id).single();
+    if (!inspection) return res.status(404).json({ error: 'Inspection not found' });
+
+    var updateData = {
+      status: 'assigned',
+      cancelled_at: null,
+      cancellation_reason: null,
+    };
+    if (rescheduled_date) updateData.rescheduled_date = rescheduled_date;
+    if (new_gha_id) updateData.gha_id = new_gha_id;
 
     const { error } = await serviceClient
-      .from('inspections')
-      .update({ rescheduled_date: rescheduled_date })
-      .eq('id', inspection_id);
+      .from('inspections').update(updateData).eq('id', inspection_id);
     if (error) throw error;
 
-    res.json({ success: true });
+    // Notifications
+    if (new_gha_id && new_gha_id !== inspection.gha_id) {
+      // Notify old GHA
+      if (inspection.gha_id) {
+        const { error: oldNotifErr } = await serviceClient.from('notifications').insert([{
+          recipient_type: 'GHA',
+          recipient_id: inspection.gha_id,
+          type: 'inspection_reassigned',
+          title: 'Inspection Reassigned by Admin',
+          message: 'An inspection has been reassigned to another GHA.' + (reason ? ' Reason: ' + reason : ''),
+          is_read: false,
+        }]);
+        if (oldNotifErr) console.error('Old GHA notify failed:', oldNotifErr.message);
+      }
+      // Notify new GHA
+      const { error: newNotifErr } = await serviceClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: new_gha_id,
+        type: 'inspection_assigned',
+        title: 'New Inspection Assigned',
+        message: 'Admin has assigned you a new inspection' + (rescheduled_date ? ' for ' + new Date(rescheduled_date).toLocaleDateString() : '') + '.',
+        is_read: false,
+      }]);
+      if (newNotifErr) console.error('New GHA notify failed:', newNotifErr.message);
+    } else if (rescheduled_date && inspection.gha_id) {
+      const { error: notifErr } = await serviceClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: inspection.gha_id,
+        type: 'inspection_rescheduled',
+        title: 'Inspection Rescheduled by Admin',
+        message: 'Your inspection has been rescheduled to ' + new Date(rescheduled_date).toLocaleDateString(),
+        is_read: false,
+      }]);
+      if (notifErr) console.error('GHA reschedule notify failed:', notifErr.message);
+    }
+
+    res.json({
+      success: true,
+      message: new_gha_id && new_gha_id !== inspection.gha_id
+        ? 'Inspection reassigned to new GHA successfully'
+        : 'Inspection rescheduled successfully'
+    });
   } catch (err) {
     console.error('Admin reschedule-inspection error:', err.message);
     res.status(500).json({ error: err.message });
@@ -4451,6 +4540,10 @@ app.post('/api/admin/reschedule-inspection', async (req, res) => {
 });
 
 // POST /api/admin/reassign-inspection
+// FULL RESET reassignment - use when GHA marked inspection done but work needs to be redone.
+// Clears gha_done_at, notes, resets status to 'pending', sends email notification.
+// Different from /api/admin/reschedule-inspection which keeps data intact and
+// is used for date changes or simple GHA swaps without resetting work.
 app.post('/api/admin/reassign-inspection', async (req, res) => {
   try {
     const admin = await verifyAdminToken(req);
