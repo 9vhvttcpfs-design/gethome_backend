@@ -4773,7 +4773,7 @@ app.post('/api/sa/assign-inspection', verifyStaffToken, async (req, res) => {
         customer_phone: customer_phone || null,
         notes: notes || null,
         assigned_by_sa: saId,
-        status: 'pending',
+        status: 'assigned',
       }])
       .select()
       .single();
@@ -6677,10 +6677,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         expiryDate.setMonth(expiryDate.getMonth() + durationMonths);
         var expiryISO = expiryDate.toISOString();
 
-        // Update profiles
+        // Update profiles with ALL fields the agent portal reads
         const { error: profileErr } = await adminClient
           .from('profiles')
           .update({
+            is_unlimited: true,
             unlimited_listings: true,
             unlimited_expires_at: expiryISO,
             subscription_tier: 'unlimited',
@@ -9822,6 +9823,43 @@ app.post('/api/admin/set-unlimited-listings', async (req, res) => {
     });
   } catch(err) {
     console.error('Set unlimited listings error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/agent/update-bank-details
+app.post('/api/agent/update-bank-details', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: { user }, error: authErr } = await adminClient.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { bank_name, account_number, account_name, bank_code } = req.body;
+    if (!bank_name || !account_number || !account_name) {
+      return res.status(400).json({ error: 'Bank name, account number and account name are required' });
+    }
+
+    const { error: profileErr } = await adminClient
+      .from('profiles')
+      .update({
+        bank_name,
+        account_number,
+        account_name,
+        bank_code: bank_code || null,
+        bank_updated_at: new Date().toISOString(),
+      })
+      .eq('id', user.id);
+    if (profileErr) return res.status(500).json({ error: profileErr.message });
+
+    const { error: agentErr } = await adminClient
+      .from('agents')
+      .update({ bank_name, account_number, account_name, bank_code: bank_code || null })
+      .eq('id', user.id);
+    if (agentErr) console.error('Agents bank update failed:', agentErr.message);
+
+    console.log('Bank details updated for agent:', user.id);
+    res.json({ success: true, message: 'Bank details updated successfully' });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
