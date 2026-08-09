@@ -510,7 +510,7 @@ app.get('/api/admin/agents', async (req, res) => {
     // Fetch pending agents only - use adminClient to bypass RLS
     const { data: agents, error } = await adminClient
       .from('profiles')
-      .select('id, role, status, is_unlimited, created_at, email, full_name, phone, city, office_address, experience, specialty, nin_number, cac_number, agent_type, agency_name, nin_verified, cac_verified, gha_id, sa_id, gha_code, requested_gha_code, about, verification_level, kyc_documents, bank_name, account_number, account_name, subscription_tier, subscription_start, subscription_end, subscription_status')
+      .select('id, role, status, is_unlimited, unlimited_listings, unlimited_expires_at, created_at, email, full_name, phone, city, office_address, experience, specialty, nin_number, cac_number, agent_type, agency_name, nin_verified, cac_verified, gha_id, sa_id, gha_code, requested_gha_code, about, verification_level, kyc_documents, bank_name, account_number, account_name, bank_code, bank_updated_at, subscription_tier, subscription_start, subscription_end, subscription_status')
       .eq('role', 'agent')
       .not('status', 'in', '(approved,rejected)')
       .order('created_at', { ascending: false });
@@ -3804,7 +3804,7 @@ app.post('/api/sa/create-inspection', async (req, res) => {
       customer_phone: (customer_phone || '').trim(),
       property_address: (property_address || '').trim(),
       inspection_date: inspection_date || null,
-      inspection_type: inspection_type || 'physical',
+      inspection_type: inspection_type || 'customer',
       notes: notes || null,
       status: 'pending',
     }]).select().single();
@@ -6220,6 +6220,11 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
     const reference = 'GH-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
     var paymentType = req.body.meta?.payment_type || '';
 
+    if (paymentType === 'unlimited_plan' && !req.body.meta?.agent_id) {
+      console.error('Unlimited plan initialize-transaction missing agent_id in meta:', JSON.stringify(req.body.meta));
+      return res.status(400).json({ error: 'agent_id is required in meta for unlimited_plan payments' });
+    }
+
     const flwPayload = {
       tx_ref: reference,
       amount: parseFloat(amount),
@@ -6233,6 +6238,8 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
       customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
     };
     flwPayload.meta = req.body.meta || {};
+
+    console.log('Initializing transaction - type:', req.body.meta?.payment_type, '| agent:', req.body.meta?.agent_id, '| amount:', amount);
 
     const initRes = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
@@ -6365,6 +6372,9 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     const event = req.body;
     const reference = event?.data?.tx_ref;
     const status = event?.data?.status;
+
+    console.log('Webhook received - status:', event?.data?.status, '| payment_type:', event?.data?.meta?.payment_type, '| amount:', event?.data?.amount);
+    console.log('Webhook meta full:', JSON.stringify(event?.data?.meta));
 
     console.log('Flutterwave webhook received - reference:', reference, '| status:', status);
 
@@ -6746,11 +6756,12 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
         // Notify agent
         await adminClient.from('notifications').insert([{
-          recipient_type: 'ADMIN',
+          recipient_type: 'AGENT',
           recipient_id: unlimitedAgentId,
           type: 'unlimited_plan_activated',
-          title: '∞ Unlimited Plan Activated',
-          message: 'Your Unlimited Plan is now active! You can upload unlimited listings until ' + expiryDate.toLocaleDateString('en-NG') + '. Enjoy!',
+          title: '∞ Unlimited Plan Activated!',
+          message: 'Your Unlimited Plan is now active! Upload unlimited listings until ' +
+            expiryDate.toLocaleDateString('en-NG', { day: 'numeric', month: 'long', year: 'numeric' }) + '.',
           is_read: false,
         }]).catch(e => console.error('Unlimited notification failed:', e.message));
 
