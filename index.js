@@ -9875,6 +9875,53 @@ app.post('/api/agent/update-bank-details', async (req, res) => {
   }
 });
 
+// POST /api/admin/activate-unlimited — manually activate unlimited listings for an agent
+app.post('/api/admin/activate-unlimited', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { agent_email, months } = req.body;
+    if (!agent_email) return res.status(400).json({ error: 'agent_email required' });
+    var durationMonths = parseInt(months) || 6;
+    var expiry = new Date();
+    expiry.setMonth(expiry.getMonth() + durationMonths);
+    var expiryISO = expiry.toISOString();
+    const { data: prof } = await adminClient
+      .from('profiles').select('id').eq('email', agent_email).single();
+    if (!prof) return res.status(404).json({ error: 'Agent not found' });
+    await adminClient.from('profiles').update({
+      is_unlimited: true, unlimited_listings: true,
+      unlimited_expires_at: expiryISO,
+      subscription_tier: 'unlimited', subscription_status: 'active',
+      subscription_end: expiryISO,
+    }).eq('id', prof.id);
+    await adminClient.from('agents').update({
+      unlimited_listings: true, unlimited_expires_at: expiryISO,
+    }).eq('id', prof.id);
+    console.log('Manual unlimited activated for:', agent_email, '| expires:', expiryISO);
+    res.json({ success: true, message: agent_email + ' unlimited activated until ' + expiry.toLocaleDateString() });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/admin/agent-details/:id
+app.get('/api/admin/agent-details/:id', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const agentId = req.params.id;
+    const { data: profile } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, phone, role, status, agent_type, agency_name, city, office_address, experience, specialty, subscription_tier, subscription_status, subscription_end, subscription_amount, is_unlimited, unlimited_listings, unlimited_expires_at, bank_name, account_number, account_name, bank_code, bank_updated_at, gha_id, sa_id, created_at, commission_notified_at')
+      .eq('id', agentId).single();
+    const { data: agent } = await adminClient
+      .from('agents')
+      .select('nin_number, cac_number, nin_verified, cac_verified, agent_type, agency_name, bank_name, account_number, account_name')
+      .eq('id', agentId).single();
+    if (!profile) return res.status(404).json({ error: 'Agent not found' });
+    res.json(Object.assign({}, agent || {}, profile));
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
