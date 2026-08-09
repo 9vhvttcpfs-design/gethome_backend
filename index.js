@@ -1374,6 +1374,64 @@ app.get('/api/sa/my-ghas', async (req, res) => {
   }
 });
 
+// GET /api/sa/gha-agents?gha_id=...
+// Returns agents under a specific GHA for the SA "View Agents" panel.
+// Filters by gha_id ONLY - admin can assign agents to a GHA without setting
+// sa_id on the agent's profile, so an sa_id filter here would hide them.
+app.get('/api/sa/gha-agents', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+
+    const { data: session, error: sessionErr } = await adminClient
+      .from('staff_sessions')
+      .select('*')
+      .eq('token', token)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (sessionErr || !session) {
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    }
+    if (session.staff_role !== 'SA') {
+      return res.status(403).json({ error: 'SA access required' });
+    }
+
+    const gha_id = req.query.gha_id;
+    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+
+    // Confirm this GHA belongs to the requesting SA before returning its agents
+    const { data: gha } = await adminClient
+      .from('gha_agents')
+      .select('id, sa_id')
+      .eq('id', gha_id)
+      .single();
+    if (!gha || gha.sa_id !== session.staff_id) {
+      return res.status(403).json({ error: 'This GHA does not belong to your team' });
+    }
+
+    // Get all agents under this GHA - no sa_id filter needed
+    const { data: agents, error: agentsErr } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, phone, status, subscription_tier, subscription_status, subscription_end, is_unlimited, unlimited_expires_at, city, agent_type, agency_name, created_at')
+      .eq('gha_id', gha_id)
+      .eq('role', 'agent')
+      .order('created_at', { ascending: false });
+
+    if (agentsErr) {
+      console.error('SA gha-agents query error:', agentsErr.message);
+      return res.status(500).json({ error: agentsErr.message });
+    }
+
+    res.json(agents || []);
+  } catch (err) {
+    console.error('SA gha-agents exception:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/sa/my-agents
 app.get('/api/sa/my-agents', async (req, res) => {
   try {
@@ -4114,6 +4172,7 @@ app.post('/api/gha/mark-inspection-done', verifyStaffToken, async (req, res) => 
       .update({ status: 'done', notes: notes.trim(), gha_done_at: new Date().toISOString() })
       .eq('id', inspection_id);
     if (error) throw error;
+    console.log('Inspection marked done:', inspection_id);
 
     // After successfully updating the inspection send detailed message to SA
     const { data: inspDetails } = await adminClient.from('inspections')
@@ -5563,6 +5622,22 @@ app.post('/api/properties', async (req, res) => {
     // Override created_by with the authenticated user ID so agents can't post as other agents
     req.body.created_by = agentId;
 
+    // Check for duplicate submission within last 30 seconds
+    var thirtySecondsAgo = new Date(Date.now() - 30000).toISOString();
+    const { data: recentDuplicate } = await adminClient
+      .from('properties')
+      .select('id, title, created_at')
+      .eq('created_by', agentId)
+      .eq('title', title)
+      .eq('location', location)
+      .gt('created_at', thirtySecondsAgo)
+      .maybeSingle();
+
+    if (recentDuplicate) {
+      console.log('Duplicate listing submission blocked for agent:', agentId, '| title:', title);
+      return res.json({ success: true, property: recentDuplicate, deduplicated: true });
+    }
+
     // Check listing limit for free tier agents
     if (!isAdmin && !isUnlimited) {
       const { count } = await supabase
@@ -6901,6 +6976,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         if (agentProfile?.gha_id) {
           var ghaRate = await getStaffCommissionRate(agentProfile.gha_id, 'GHA');
           var ghaCommission = Math.round(unlimitedAmount * (ghaRate / 100));
+          console.log('Creating GHA earnings - gha_id:', agentProfile.gha_id, '| rate:', ghaRate, '| commission:', ghaCommission);
           const { error: ghaErr } = await adminClient.from('gha_earnings').upsert([{
             gha_id: agentProfile.gha_id,
             agent_id: unlimitedAgentId,
@@ -6911,14 +6987,17 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             month_year: monthYear,
             is_paid: false,
           }], { onConflict: 'gha_id,agent_id,month_year' });
-          if (ghaErr) console.error('GHA unlimited earnings failed:', ghaErr.message);
-          else console.log('GHA commission for unlimited plan:', ghaRate + '%', '=₦' + ghaCommission);
+          if (ghaErr) console.error('GHA unlimited earnings FAILED:', ghaErr.message);
+          else console.log('GHA unlimited earnings saved successfully');
+        } else {
+          console.error('No gha_id found for agent:', unlimitedAgentId, '- no GHA commission created');
         }
 
         // SA commission
         if (agentProfile?.sa_id) {
           var saRate = await getStaffCommissionRate(agentProfile.sa_id, 'SA');
           var saCommission = Math.round(unlimitedAmount * (saRate / 100));
+          console.log('Creating SA earnings - sa_id:', agentProfile.sa_id, '| rate:', saRate, '| commission:', saCommission);
           const { error: saErr } = await adminClient.from('sa_earnings').upsert([{
             sa_id: agentProfile.sa_id,
             gha_id: agentProfile.gha_id || null,
@@ -6929,8 +7008,10 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             month_year: monthYear,
             is_paid: false,
           }], { onConflict: 'sa_id,agent_id,month_year' });
-          if (saErr) console.error('SA unlimited earnings failed:', saErr.message);
-          else console.log('SA commission for unlimited plan:', saRate + '%', '=₦' + saCommission);
+          if (saErr) console.error('SA unlimited earnings FAILED:', saErr.message);
+          else console.log('SA unlimited earnings saved successfully');
+        } else {
+          console.error('No sa_id found for agent:', unlimitedAgentId, '- no SA commission created');
         }
 
         // Notify agent
