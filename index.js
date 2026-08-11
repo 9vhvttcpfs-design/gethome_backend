@@ -4403,42 +4403,42 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
     console.log('VERIFIED SUCCESS - agent profile actually updated:', JSON.stringify(updated[0]));
     console.log('Agent auto-approved on GHA assignment:', agent_id);
 
-    // After successful assignment, create earnings for any existing subscription
-    try {
-      const { data: agentProfile } = await adminClient
-        .from('profiles')
-        .select('subscription_tier, subscription_status, subscription_amount, is_unlimited, email')
-        .eq('id', agent_id)
-        .single();
+    // Step 1: Update agents table too (not just profiles)
+    await adminClient.from('agents').update({
+      status: 'approved',
+      gha_id: gha_id,
+    }).eq('id', agent_id).catch(e => console.error('Agents table update failed:', e.message));
 
-      var hasPaidSubscription = agentProfile && (
-        agentProfile.is_unlimited ||
-        (agentProfile.subscription_tier && agentProfile.subscription_tier !== 'free' && agentProfile.subscription_status === 'active')
+    // Step 2: Create earnings for any existing paid subscription
+    try {
+      var agentSubscription = updated[0]; // already fetched from profiles update
+      var subAmount = parseFloat(agentSubscription?.subscription_amount || 0);
+      var hasPaid = subAmount > 0 && (
+        agentSubscription?.is_unlimited === true ||
+        (agentSubscription?.subscription_tier && agentSubscription.subscription_tier !== 'free')
       );
 
-      if (hasPaidSubscription && agentProfile.subscription_amount > 0) {
+      if (hasPaid) {
         var monthYear = getBillingMonth();
-        var subAmount = parseFloat(agentProfile.subscription_amount || 0);
+        var agentEmail = agentSubscription?.email || '';
 
-        // Create GHA earnings
-        if (gha.id) {
-          var ghaRate = await getStaffCommissionRate(gha.id, 'GHA');
-          var ghaCommission = Math.round(subAmount * (ghaRate / 100));
-          const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
-            gha_id: gha.id,
-            agent_id: agent_id,
-            agent_email: agentProfile.email,
-            subscription_amount: subAmount,
-            commission_rate: ghaRate,
-            commission_amount: ghaCommission,
-            month_year: monthYear,
-            is_paid: false,
-          }], { onConflict: 'gha_id,agent_id,month_year' });
-          if (ghaEarnErr) console.error('GHA earnings on assign failed:', ghaEarnErr.message);
-          else console.log('GHA earnings created on assign:', gha.gha_code, '₦' + ghaCommission);
-        }
+        // GHA earnings
+        var ghaRate = await getStaffCommissionRate(gha.id, 'GHA');
+        var ghaCommission = Math.round(subAmount * (ghaRate / 100));
+        const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
+          gha_id: gha.id,
+          agent_id: agent_id,
+          agent_email: agentEmail,
+          subscription_amount: subAmount,
+          commission_rate: ghaRate,
+          commission_amount: ghaCommission,
+          month_year: monthYear,
+          is_paid: false,
+        }], { onConflict: 'gha_id,agent_id,month_year' });
+        if (ghaEarnErr) console.error('GHA earnings on assign failed:', ghaEarnErr.message);
+        else console.log('GHA earnings created:', gha.gha_code, '₦' + ghaCommission + ' (' + ghaRate + '%)');
 
-        // Create SA earnings
+        // SA earnings
         if (gha.sa_id) {
           var saRate = await getStaffCommissionRate(gha.sa_id, 'SA');
           var saCommission = Math.round(subAmount * (saRate / 100));
@@ -4453,11 +4453,25 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
             is_paid: false,
           }], { onConflict: 'sa_id,agent_id,month_year' });
           if (saEarnErr) console.error('SA earnings on assign failed:', saEarnErr.message);
-          else console.log('SA earnings created on assign:', '₦' + saCommission);
+          else console.log('SA earnings created: ₦' + saCommission + ' (' + saRate + '%)');
         }
+      } else {
+        console.log('Agent has no paid subscription - no earnings created. Tier:', agentSubscription?.subscription_tier, '| Amount:', subAmount);
       }
     } catch(earnErr) {
-      console.error('Earnings creation on assign failed (non-blocking):', earnErr.message);
+      console.error('Earnings creation on assign failed:', earnErr.message);
+    }
+
+    // Step 3: Notify SA of the new agent assignment
+    if (gha.sa_id) {
+      await adminClient.from('notifications').insert([{
+        recipient_type: 'SA',
+        recipient_id: gha.sa_id,
+        type: 'agent_assigned',
+        title: 'Agent Assigned to Your GHA',
+        message: 'Admin has assigned a new agent to ' + gha.gha_code + '. The agent is now approved and under your supervision.',
+        is_read: false,
+      }]).catch(e => console.error('SA notification failed:', e.message));
     }
 
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code, updated_agent: updated[0] });
@@ -5660,6 +5674,22 @@ app.post('/api/properties', async (req, res) => {
     const agentId = authData.user.id;
     console.log('Authenticated agent ID:', agentId);
 
+    // Strict deduplication — block identical submission within 60 seconds
+    var dedupWindow = new Date(Date.now() - 60000).toISOString();
+    const { data: recentDup } = await adminClient
+      .from('properties')
+      .select('id, title, created_at')
+      .eq('created_by', agentId)
+      .eq('title', (req.body.title || '').trim())
+      .gt('created_at', dedupWindow)
+      .limit(1)
+      .maybeSingle();
+
+    if (recentDup) {
+      console.log('DUPLICATE BLOCKED - agent:', agentId, '| title:', req.body.title, '| existing id:', recentDup.id);
+      return res.json({ success: true, property: recentDup, deduplicated: true, message: 'Listing already submitted' });
+    }
+
     // Authenticated client: passes the user's JWT so Supabase RLS evaluates
     // auth.uid() correctly for this request.
     const userSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
@@ -5705,22 +5735,6 @@ app.post('/api/properties', async (req, res) => {
 
     // Override created_by with the authenticated user ID so agents can't post as other agents
     req.body.created_by = agentId;
-
-    // Check for duplicate submission within last 30 seconds
-    var thirtySecondsAgo = new Date(Date.now() - 30000).toISOString();
-    const { data: recentDuplicate } = await adminClient
-      .from('properties')
-      .select('id, title, created_at')
-      .eq('created_by', agentId)
-      .eq('title', title)
-      .eq('location', location)
-      .gt('created_at', thirtySecondsAgo)
-      .maybeSingle();
-
-    if (recentDuplicate) {
-      console.log('Duplicate listing submission blocked for agent:', agentId, '| title:', title);
-      return res.json({ success: true, property: recentDuplicate, deduplicated: true });
-    }
 
     // Check listing limit for free tier agents
     if (!isAdmin && !isUnlimited) {
@@ -5891,7 +5905,7 @@ app.put('/api/properties/:id', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-// DELETE /api/properties/:id  — permanently remove a listing
+// DELETE /api/properties/:id  — soft delete a listing (clears inspections.property_id first)
 app.delete('/api/properties/:id', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
@@ -5913,6 +5927,13 @@ app.delete('/api/properties/:id', async (req, res) => {
     if (prop.created_by !== authData.user.id && profile?.role !== 'admin') {
       return res.status(403).json({ error: 'You can only delete your own listings' });
     }
+
+    // Null out property_id on related inspections (preserve inspection records)
+    const { error: inspErr } = await adminClient
+      .from('inspections')
+      .update({ property_id: null })
+      .eq('property_id', propertyId);
+    if (inspErr) console.error('Inspection property_id clear failed:', inspErr.message);
 
     // Soft delete - mark as deleted but keep in database for history
     const { error: deleteErr } = await adminClient.from('properties')
