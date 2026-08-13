@@ -1452,42 +1452,30 @@ app.get('/api/sa/my-agents', async (req, res) => {
     const saLocation = saRecord?.location || '';
     console.log('SA location for filtering:', saLocation);
 
+    // PRIMARY: RPC by location (existing - keep as is)
     const { data: agents, error } = await adminClient
       .rpc('get_sa_localized_agents', { sa_uuid: session.staff_id });
 
-    if (error || !agents || agents.length === 0) {
-      console.log('RPC returned empty or failed, using relaxed fallback for location:', saLocation);
+    // SECONDARY: Direct sa_id lookup - catches admin-assigned agents regardless of location
+    const { data: directAgents } = await adminClient
+      .from('profiles')
+      .select('*')
+      .eq('role', 'agent')
+      .eq('sa_id', session.staff_id)
+      .in('status', ['pending', 'pending_gha_inspection', 'pending_sa_review', 'approved']);
 
-      var locationWords = (saLocation || '').split(/[\s,]+/).filter(function(w) {
-        return w.length > 2;
-      });
+    // Merge and deduplicate by id
+    var agentMap = {};
+    (agents || []).forEach(function(a) { agentMap[a.id] = a; });
+    (directAgents || []).forEach(function(a) {
+      if (!agentMap[a.id]) agentMap[a.id] = a; // add if not already present
+    });
+    var mergedAgents = Object.values(agentMap);
 
-      // Fetch both pending and approved agents so the full dashboard is populated
-      var fallbackQuery = adminClient
-        .from('profiles')
-        .select('*')
-        .eq('role', 'agent')
-        .in('status', ['pending', 'pending_gha_inspection', 'pending_sa_review', 'approved']);
+    console.log('SA agents - RPC:', (agents || []).length, '| direct sa_id:', (directAgents || []).length, '| merged:', mergedAgents.length);
 
-      if (locationWords.length > 0) {
-        var orConditions = locationWords.map(function(word) {
-          return 'office_address.ilike.%' + word + '%,city.ilike.%' + word + '%';
-        }).join(',');
-        fallbackQuery = fallbackQuery.or(orConditions + ',office_address.is.null,office_address.eq.,city.is.null,city.eq.');
-      }
-
-      var { data: fallbackAgents } = await fallbackQuery.order('created_at', { ascending: false });
-      // Normalise city and requested_gha_code for UI safety even in fallback path
-      var normFallback = (fallbackAgents || []).map(function(a) {
-        return Object.assign({}, a, {
-          city:               (a.city || '').trim() || null,
-          requested_gha_code: (a.requested_gha_code || '').trim() || null,
-        });
-      });
-      return res.json(normFallback);
-    }
-
-    const enriched = (agents || []).map(function(a) {
+    // Use mergedAgents instead of agents for enrichment
+    const enriched = mergedAgents.map(function(a) {
       var ghaId = a.assigned_gha_id || a.gha_id || null;
       var saId  = a.assigned_sa_id  || a.sa_id  || null;
       return Object.assign({}, a, {
@@ -7179,16 +7167,46 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
         var waLink = 'https://wa.me/' + saWhatsapp.replace(/\D/g, '') + '?text=' + waMsg;
 
-        // Store WhatsApp link in notification for SA to click
+        // Get the SA for this property
+        var inspSaId = null;
+        if (inspProp.created_by) {
+          const { data: agentProf } = await adminClient
+            .from('profiles')
+            .select('sa_id')
+            .eq('id', inspProp.created_by)
+            .single();
+          inspSaId = agentProf?.sa_id || null;
+        }
+
+        // Notify SA with WhatsApp link
+        if (inspSaId) {
+          await adminClient.from('notifications').insert([{
+            recipient_type: 'SA',
+            recipient_id: inspSaId,
+            type: 'inspection_fee_paid',
+            title: 'New Inspection Request — Fee Paid',
+            message: (inspCustomerName || inspCustomerEmail) + ' paid ₦' + inspFeeAmount.toLocaleString() + ' inspection fee for ' + (inspProp.title || 'property') + '. Assign a GHA to conduct this inspection.',
+            is_read: false,
+            meta: JSON.stringify({
+              whatsapp_link: waLink,
+              property_id: inspPropertyId,
+              customer_email: inspCustomerEmail,
+              customer_name: inspCustomerName,
+              customer_phone: inspCustomerPhone,
+            }),
+          }]).catch(e => console.error('SA inspection fee notification failed:', e.message));
+        }
+
+        // Also notify admin
         await adminClient.from('notifications').insert([{
           recipient_type: 'ADMIN',
           recipient_id: 'admin',
           type: 'inspection_fee_paid',
-          title: 'Inspection Fee Paid — ' + (inspCustomerName || inspCustomerEmail),
-          message: inspCustomerName + ' paid ₦' + inspFeeAmount.toLocaleString() + ' inspection fee for ' + (inspProp.title || 'property'),
+          title: 'Inspection Fee Paid: ₦' + inspFeeAmount.toLocaleString(),
+          message: (inspCustomerName || inspCustomerEmail) + ' paid inspection fee for ' + (inspProp.title || 'property'),
           is_read: false,
-          meta: JSON.stringify({ whatsapp_link: waLink, property_id: inspPropertyId, customer_email: inspCustomerEmail }),
-        }]).catch(e => console.error('Inspection fee notification failed:', e.message));
+          meta: JSON.stringify({ whatsapp_link: waLink, property_id: inspPropertyId }),
+        }]).catch(e => console.error('Admin inspection fee notification failed:', e.message));
 
         console.log('Inspection fee payment processed - WhatsApp notification created for SA');
       }
@@ -10513,7 +10531,13 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
       tx_ref: reference,
       amount: inspectionFee,
       currency: 'NGN',
-      redirect_url: 'https://trygethome.online/?inspection_payment=success&property_id=' + property_id + '&ref=' + reference,
+      redirect_url: 'https://trygethome.online/?inspection_payment=success' +
+        '&property_id=' + property_id +
+        '&ref=' + reference +
+        '&cname=' + encodeURIComponent(customer_name || '') +
+        '&cemail=' + encodeURIComponent(customer_email || '') +
+        '&cphone=' + encodeURIComponent(customer_phone || '') +
+        '&saw=' + encodeURIComponent(sa_whatsapp || ''),
       customer: { email: customer_email, name: customer_name || customer_email, phonenumber: customer_phone || '' },
       customizations: {
         title: 'GetHome Inspection Fee',
