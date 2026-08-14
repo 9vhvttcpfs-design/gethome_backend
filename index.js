@@ -2076,7 +2076,11 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
     const totalRevenue = (agents || []).reduce(function(sum, a) {
       return sum + (parseFloat(a.subscription_amount) || 0);
     }, 0);
-    const saCommission = totalRevenue * 0.05;
+
+    // Get SA's actual commission rate
+    var saRate = await getStaffCommissionRate(saId, 'SA');
+    var saCommission = Math.round(totalRevenue * (saRate / 100));
+    console.log('SA subscriptions commission rate:', saRate + '%', '| total:', saCommission);
 
     const byMonth = {};
     (agents || []).forEach(function(a) {
@@ -2085,7 +2089,7 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
       if (!byMonth[key]) byMonth[key] = { month: key, revenue: 0, agent_count: 0, sa_commission: 0, is_paid: earningsMap[key]?.is_paid || false };
       byMonth[key].revenue += parseFloat(a.subscription_amount) || 0;
       byMonth[key].agent_count += 1;
-      byMonth[key].sa_commission = byMonth[key].revenue * 0.05;
+      byMonth[key].sa_commission = Math.round(byMonth[key].revenue * (saRate / 100));
     });
 
     res.json({
@@ -7014,8 +7018,23 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     // Handle unlimited plan payment
     if (status === 'successful' && paymentType === 'unlimited_plan') {
       var unlimitedAgentId = metaAgentId;
-      var unlimitedAmount = parseFloat(amount || 0);
       var txRef = txRef || null;
+
+      // Use verified amount from Flutterwave - never use a cached/stale value
+      var unlimitedAmount = parseFloat(verifiedData?.amount || event?.data?.amount || 0);
+      console.log('Unlimited plan amount from Flutterwave:', unlimitedAmount);
+
+      if (unlimitedAmount <= 0) {
+        console.error('CRITICAL: Unlimited plan amount is 0 - using settings price as fallback');
+        const { data: priceSetting } = await adminClient
+          .from('app_settings')
+          .select('setting_value')
+          .eq('setting_key', 'unlimited_plan_price')
+          .single();
+        unlimitedAmount = parseFloat(priceSetting?.setting_value || 100000);
+      }
+
+      console.log('Final unlimited amount for earnings:', unlimitedAmount);
 
       console.log('Unlimited plan payment received - agent:', unlimitedAgentId, '| amount:', unlimitedAmount);
 
@@ -9600,7 +9619,20 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
     const { agent_email, tier, amount } = req.body;
     if (!agent_email || !tier) return res.status(400).json({ error: 'agent_email and tier are required' });
 
-    const tierAmounts = { premium: 8500, agency: 35000 };
+    // Fetch plan prices from settings dynamically
+    const [premiumSetting, agencySetting, unlimitedSetting] = await Promise.all([
+      adminClient.from('app_settings').select('setting_value').eq('setting_key', 'premium_plan_price').single(),
+      adminClient.from('app_settings').select('setting_value').eq('setting_key', 'agency_plan_price').single(),
+      adminClient.from('app_settings').select('setting_value').eq('setting_key', 'unlimited_plan_price').single(),
+    ]);
+
+    const tierAmounts = {
+      premium: parseFloat(premiumSetting?.data?.setting_value || 8500),
+      agency: parseFloat(agencySetting?.data?.setting_value || 35000),
+      unlimited: parseFloat(unlimitedSetting?.data?.setting_value || 100000),
+    };
+    console.log('Manual upgrade tier amounts:', tierAmounts);
+
     const subscriptionAmount = amount || tierAmounts[tier] || 0;
     const subscriptionEnd = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
@@ -10564,11 +10596,6 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
       console.error('Inspection fee payment init failed:', JSON.stringify(initData));
       return res.status(500).json({ error: 'Payment initialization failed' });
     }
-
-    // Store pending inspection payment on property
-    await adminClient.from('properties').update({
-      fee_payment_reference: reference,
-    }).eq('id', property_id).catch(e => console.error('Property fee ref update failed:', e.message));
 
     console.log('Inspection fee payment initialized:', reference, '| fee:', inspectionFee, '| property:', property_id);
     res.json({
