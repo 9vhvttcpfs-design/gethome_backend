@@ -2570,7 +2570,7 @@ app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
       .from('inspections')
       .select('*')
       .eq('gha_id', ghaId)
-      .order('inspection_date', { ascending: false });
+      .order('created_at', { ascending: false }); // newest first
     if (error) throw error;
 
     const propertyIds = [...new Set((inspections || []).map(function(i) { return i.property_id; }).filter(Boolean))];
@@ -7149,6 +7149,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       var inspCustomerPhone = verifiedMeta?.customer_phone || '';
       var inspSaWhatsapp = verifiedMeta?.sa_whatsapp || process.env.GETHOME_WHATSAPP;
       var inspFeeAmount = amount;
+      var inspCustomerId = verifiedMeta?.customer_id || null;
 
       console.log('Inspection fee paid - property:', inspPropertyId, '| customer:', inspCustomerEmail, '| amount:', inspFeeAmount);
 
@@ -7195,6 +7196,34 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             .eq('id', inspProp.created_by)
             .single();
           inspSaId = agentProf?.sa_id || null;
+        }
+
+        // Create inspection record so customer can track it
+        const { data: newInspection } = await adminClient.from('inspections').insert([{
+          property_id: inspPropertyId,
+          customer_email: inspCustomerEmail,
+          customer_name: inspCustomerName,
+          customer_phone: inspCustomerPhone,
+          property_address: inspProp.title + ' — ' + (inspProp.location || ''),
+          status: 'pending',
+          inspection_type: 'customer',
+          fee_payment_amount: inspFeeAmount,
+          fee_paid_at: new Date().toISOString(),
+          fee_payment_status: 'paid',
+          assigned_by_sa: inspSaId || null,
+          customer_id: inspCustomerId || null,
+        }]).select().single().catch(e => { console.error('Inspection record creation failed:', e.message); return { data: null }; });
+
+        if (newInspection?.id) {
+          console.log('Inspection record created:', newInspection.id);
+          // Link to customer account if they have one and it wasn't already known
+          if (!inspCustomerId) {
+            const { data: authUserList } = await adminClient.auth.admin.listUsers({ perPage: 1000 });
+            var custUser = (authUserList?.users || []).find(function(u) { return u.email?.toLowerCase() === inspCustomerEmail?.toLowerCase(); });
+            if (custUser) {
+              await adminClient.from('inspections').update({ customer_id: custUser.id }).eq('id', newInspection.id);
+            }
+          }
         }
 
         // Notify SA with WhatsApp link
@@ -7388,9 +7417,73 @@ app.get('/api/admin/monthly-history', async (req, res) => {
 
     const months = [...new Set((availableMonths || []).map(r => r.month_year))];
 
+    // Get ALL earnings for this month - premium, agency AND unlimited. gha_earnings/
+    // sa_earnings carry no plan-type column and nothing here filters by one, so
+    // unlimited-plan earnings are included right alongside premium/agency earnings.
+    const { data: allGhaEarnings } = await adminClient
+      .from('gha_earnings')
+      .select('gha_id, commission_amount, subscription_amount, is_paid, commission_rate')
+      .eq('month_year', month);
+
+    const { data: allSaEarnings } = await adminClient
+      .from('sa_earnings')
+      .select('sa_id, commission_amount, subscription_amount, is_paid, commission_rate')
+      .eq('month_year', month);
+
+    // Group by GHA
+    var ghaEarningsMap = {};
+    (allGhaEarnings || []).forEach(function(e) {
+      if (!ghaEarningsMap[e.gha_id]) ghaEarningsMap[e.gha_id] = { total_commission: 0, total_revenue: 0 };
+      ghaEarningsMap[e.gha_id].total_commission += parseFloat(e.commission_amount || 0);
+      ghaEarningsMap[e.gha_id].total_revenue += parseFloat(e.subscription_amount || 0);
+    });
+
+    // Group by SA
+    var saEarningsMap = {};
+    (allSaEarnings || []).forEach(function(e) {
+      if (!saEarningsMap[e.sa_id]) saEarningsMap[e.sa_id] = { total_commission: 0, total_revenue: 0 };
+      saEarningsMap[e.sa_id].total_commission += parseFloat(e.commission_amount || 0);
+      saEarningsMap[e.sa_id].total_revenue += parseFloat(e.subscription_amount || 0);
+    });
+
+    // Overlay the live (unfiltered) earnings totals onto the stored snapshot rows so
+    // unlimited-plan subscriptions show up even if the snapshot itself was taken
+    // without accounting for them.
+    const ghaSummaries = (ghaSum || []).map(function(row) {
+      var live = ghaEarningsMap[row.gha_id];
+      if (!live) return row;
+      return Object.assign({}, row, {
+        total_commission: live.total_commission,
+        total_subscription_revenue: live.total_revenue,
+      });
+    });
+
+    // SA-level totals have no dedicated snapshot table, so build them directly
+    // from sa_earnings.
+    const saIds = Object.keys(saEarningsMap);
+    let saSummaries = [];
+    if (saIds.length > 0) {
+      const { data: saDetails } = await adminClient
+        .from('service_agents')
+        .select('id, sa_code, full_name')
+        .in('id', saIds);
+      saSummaries = (saDetails || []).map(function(sa) {
+        var live = saEarningsMap[sa.id] || { total_commission: 0, total_revenue: 0 };
+        return {
+          sa_id: sa.id,
+          sa_code: sa.sa_code,
+          full_name: sa.full_name,
+          month_year: month,
+          total_commission: live.total_commission,
+          total_subscription_revenue: live.total_revenue,
+        };
+      }).sort(function(a, b) { return b.total_subscription_revenue - a.total_subscription_revenue; });
+    }
+
     res.json({
       month,
-      gha_summaries: ghaSum || [],
+      gha_summaries: ghaSummaries,
+      sa_summaries: saSummaries,
       agent_snapshots: agentSnaps || [],
       available_months: months,
     });
@@ -7994,16 +8087,16 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
       .select('id, gha_code, full_name, sa_id, service_agents(sa_code, full_name)');
 
     const results = await Promise.all((ghas || []).map(async function(gha) {
-      // Only count confirmed inspections - GHA payment is earned when SA confirms
+      // Only count confirmed inspections - GHA payment is earned when SA confirms,
+      // so the month attribution is based on sa_confirmed_at (not gha_done_at).
       const { data: inspections } = await adminClient
         .from('inspections')
-        .select('id, status, gha_done_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
+        .select('id, status, gha_done_at, sa_confirmed_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
         .eq('inspection_type', 'customer')
         .eq('status', 'confirmed')  // CONFIRMED only - not done
-        .not('gha_done_at', 'is', null)
-        .gte('gha_done_at', monthStart)
-        .lt('gha_done_at', monthEnd);
+        .gte('sa_confirmed_at', monthStart)
+        .lt('sa_confirmed_at', monthEnd);
 
       // For each inspection, get the property title if property_id exists
       const enrichedInspections = await Promise.all((inspections || []).map(async function(insp) {
@@ -8119,16 +8212,16 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     var globalGhaRate = parseFloat(ghaRateSetting?.setting_value || 5);
 
     const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
-      // Only count confirmed inspections - GHA payment is earned when SA confirms
+      // Only count confirmed inspections - GHA payment is earned when SA confirms,
+      // so the month attribution is based on sa_confirmed_at (not gha_done_at).
       const { data: inspections } = await adminClient
         .from('inspections')
-        .select('id, status, gha_done_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
+        .select('id, status, gha_done_at, sa_confirmed_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
         .eq('inspection_type', 'customer')
         .eq('status', 'confirmed')  // CONFIRMED only - not done
-        .not('gha_done_at', 'is', null)
-        .gte('gha_done_at', monthStart)
-        .lt('gha_done_at', monthEnd);
+        .gte('sa_confirmed_at', monthStart)
+        .lt('sa_confirmed_at', monthEnd);
 
       // For each inspection, get the property title if property_id exists
       const enrichedInspections = await Promise.all((inspections || []).map(async function(insp) {
@@ -10541,6 +10634,15 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
       return res.status(400).json({ error: 'property_id and customer_email required' });
     }
 
+    // Capture the logged-in customer's ID (if any) so the webhook can link the
+    // inspection record straight to their account once payment is confirmed.
+    var customerId = null;
+    var authToken = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (authToken) {
+      const { data: { user: authedCustomer } } = await adminClient.auth.getUser(authToken).catch(function() { return { data: { user: null } }; });
+      customerId = authedCustomer?.id || null;
+    }
+
     // Get property and inspection fee
     const { data: property } = await adminClient
       .from('properties')
@@ -10582,6 +10684,7 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
         customer_name: customer_name,
         customer_phone: customer_phone,
         sa_whatsapp: sa_whatsapp,
+        customer_id: customerId,
       },
     };
 
@@ -10607,6 +10710,63 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
     });
   } catch(err) {
     console.error('Inspection payment init error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/customer/inspections - logged-in customer views their own inspection requests
+app.get('/api/customer/inspections', async (req, res) => {
+  try {
+    const { data: { user }, error: authErr } = await adminClient.auth.getUser(
+      (req.headers.authorization || '').replace('Bearer ', '').trim()
+    );
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Find inspections by customer email OR customer_id
+    const { data: inspections, error } = await adminClient
+      .from('inspections')
+      .select('id, status, customer_name, customer_email, customer_phone, property_address, property_id, inspection_date, notes, gha_done_at, sa_confirmed, sa_confirmed_at, fee_payment_amount, fee_paid_at, created_at, assigned_by_sa')
+      .or('customer_id.eq.' + user.id + ',customer_email.eq.' + user.email)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Enrich with SA whatsapp for messaging
+    var enriched = await Promise.all((inspections || []).map(async function(insp) {
+      var saWhatsapp = null;
+      if (insp.assigned_by_sa) {
+        const { data: sa } = await adminClient
+          .from('service_agents')
+          .select('whatsapp')
+          .eq('id', insp.assigned_by_sa)
+          .single();
+        saWhatsapp = sa?.whatsapp || null;
+      }
+
+      // Get property details
+      var propertyDetails = null;
+      if (insp.property_id) {
+        const { data: prop } = await adminClient
+          .from('properties')
+          .select('title, location, image_urls, rent, price')
+          .eq('id', insp.property_id)
+          .single();
+        propertyDetails = prop;
+      }
+
+      return Object.assign({}, insp, {
+        sa_whatsapp: saWhatsapp,
+        property_title: propertyDetails?.title || insp.property_address,
+        property_location: propertyDetails?.location || null,
+        property_image: propertyDetails?.image_urls?.[0] || null,
+        property_price: parseFloat(propertyDetails?.rent || propertyDetails?.price || 0),
+      });
+    }));
+
+    console.log('Customer inspections fetched:', user.email, '| count:', enriched.length);
+    res.json(enriched);
+  } catch(err) {
+    console.error('Customer inspections error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
