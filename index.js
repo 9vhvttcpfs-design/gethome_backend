@@ -7417,6 +7417,26 @@ app.get('/api/admin/monthly-history', async (req, res) => {
 
     const months = [...new Set((availableMonths || []).map(r => r.month_year))];
 
+    // Sum ALL agent subscription payments currently active - premium, agency AND
+    // unlimited (no subscription_tier filter, so nothing is excluded).
+    const { data: allSubscriptions } = await adminClient
+      .from('profiles')
+      .select('email, subscription_tier, subscription_amount, subscription_status, is_unlimited')
+      .eq('role', 'agent')
+      .in('subscription_status', ['active'])
+      .not('subscription_amount', 'is', null)
+      .gt('subscription_amount', 0);
+
+    var totalSubscriptionRevenue = (allSubscriptions || []).reduce(function(sum, p) {
+      return sum + parseFloat(p.subscription_amount || 0);
+    }, 0);
+
+    var unlimitedCount = (allSubscriptions || []).filter(function(p) { return p.is_unlimited; }).length;
+    var premiumCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'premium'; }).length;
+    var agencyCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'agency'; }).length;
+
+    console.log('Monthly revenue - premium:', premiumCount, '| agency:', agencyCount, '| unlimited:', unlimitedCount, '| total:', totalSubscriptionRevenue);
+
     // Get ALL earnings for this month - premium, agency AND unlimited. gha_earnings/
     // sa_earnings carry no plan-type column and nothing here filters by one, so
     // unlimited-plan earnings are included right alongside premium/agency earnings.
@@ -7486,6 +7506,12 @@ app.get('/api/admin/monthly-history', async (req, res) => {
       sa_summaries: saSummaries,
       agent_snapshots: agentSnaps || [],
       available_months: months,
+      active_subscriptions_summary: {
+        total_subscription_revenue: totalSubscriptionRevenue,
+        premium_count: premiumCount,
+        agency_count: agencyCount,
+        unlimited_count: unlimitedCount,
+      },
     });
   } catch (err) {
     console.error('Monthly history error:', err.message);
@@ -7525,11 +7551,31 @@ app.get('/api/sa/monthly-history', async (req, res) => {
 
     const months = [...new Set((availableMonths || []).map(r => r.month_year))];
 
+    // SA monthly history - all earnings this month, no subscription-type filter,
+    // so unlimited-plan earnings are included alongside premium/agency ones.
+    const { data: saMonthlyEarnings } = await adminClient
+      .from('sa_earnings')
+      .select('commission_amount, subscription_amount, commission_rate, agent_id, month_year, is_paid, created_at')
+      .eq('sa_id', session.staff_id)
+      .eq('month_year', month);
+
+    var totalCommission = (saMonthlyEarnings || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+    var totalRevenue = (saMonthlyEarnings || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.subscription_amount || 0);
+    }, 0);
+
+    console.log('SA monthly history', month, '| earnings rows:', (saMonthlyEarnings || []).length, '| total commission:', totalCommission);
+
     res.json({
       month,
       gha_summaries: ghaSum || [],
       agent_snapshots: agentSnaps || [],
       available_months: months,
+      earnings: saMonthlyEarnings || [],
+      total_commission: totalCommission,
+      total_revenue: totalRevenue,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -7562,13 +7608,28 @@ app.get('/api/gha/monthly-history', async (req, res) => {
 
     const months = [...new Set((availableMonths || []).map(r => r.month_year))];
 
-    const totalRevenue = (agentSnaps || []).reduce((sum, a) => sum + (parseFloat(a.subscription_amount) || 0), 0);
-    const totalCommission = (agentSnaps || []).reduce((sum, a) => sum + (parseFloat(a.gha_commission) || 0), 0);
+    // GHA monthly history - all earnings this month, no subscription-type filter,
+    // so unlimited-plan earnings are included alongside premium/agency ones.
+    const { data: ghaMonthlyEarnings } = await adminClient
+      .from('gha_earnings')
+      .select('commission_amount, subscription_amount, commission_rate, agent_id, month_year, is_paid, created_at')
+      .eq('gha_id', session.staff_id)
+      .eq('month_year', month);
+
+    const totalRevenue = (ghaMonthlyEarnings || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.subscription_amount || 0);
+    }, 0);
+    const totalCommission = (ghaMonthlyEarnings || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+
+    console.log('GHA monthly history', month, '| earnings rows:', (ghaMonthlyEarnings || []).length, '| total commission:', totalCommission);
 
     res.json({
       month,
       agent_snapshots: agentSnaps || [],
       available_months: months,
+      earnings: ghaMonthlyEarnings || [],
       total_revenue: totalRevenue,
       total_commission: totalCommission,
     });
@@ -8214,6 +8275,19 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
       // Only count confirmed inspections - GHA payment is earned when SA confirms,
       // so the month attribution is based on sa_confirmed_at (not gha_done_at).
+      // Authoritative count comes from a dedicated head-count query (mirrors the SA
+      // section below); monthEnd is the exclusive start of next month rather than a
+      // hardcoded "-31", since that literal is an invalid date for shorter months
+      // (Feb, Apr, Jun, Sep, Nov) and Postgres would reject the filter outright.
+      const { count: confirmedCount } = await adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .eq('status', 'confirmed')
+        .eq('inspection_type', 'customer')
+        .gte('sa_confirmed_at', monthStart)
+        .lt('sa_confirmed_at', monthEnd);
+
       const { data: inspections } = await adminClient
         .from('inspections')
         .select('id, status, gha_done_at, sa_confirmed_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
@@ -8252,7 +8326,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         });
       }));
 
-      const count = enrichedInspections.length;
+      const count = confirmedCount || 0;
 
       // Dynamic tiered inspection payment (tiers configurable via app_settings)
       var inspFee = await getInspectionFeeForCount(count);
