@@ -2573,7 +2573,14 @@ app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
       .order('created_at', { ascending: false }); // newest first
     if (error) throw error;
 
-    const propertyIds = [...new Set((inspections || []).map(function(i) { return i.property_id; }).filter(Boolean))];
+    // Exclude done inspections GHA has cleared
+    var visibleInspections = (inspections || []).filter(function(i) {
+      if (i.status === 'done' && i.cleared_by_gha === true) return false;
+      if (i.status === 'confirmed') return false; // confirmed clears automatically
+      return true;
+    });
+
+    const propertyIds = [...new Set(visibleInspections.map(function(i) { return i.property_id; }).filter(Boolean))];
     let propertyMap = {};
     if (propertyIds.length > 0) {
       const { data: props } = await serviceClient
@@ -2583,7 +2590,7 @@ app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
       (props || []).forEach(function(p) { propertyMap[p.id] = p; });
     }
 
-    const enriched = (inspections || []).map(function(i) {
+    const enriched = visibleInspections.map(function(i) {
       const prop = propertyMap[i.property_id] || {};
       return Object.assign({}, i, {
         property_title: prop.title || null,
@@ -2628,6 +2635,32 @@ app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
     });
   } catch (err) {
     console.error('GHA inspections error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/clear-inspection - GHA dismisses a done inspection from their list
+app.post('/api/gha/clear-inspection', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { inspection_id } = req.body;
+    if (!inspection_id) return res.status(400).json({ error: 'inspection_id required' });
+
+    const { error } = await adminClient
+      .from('inspections')
+      .update({ cleared_by_gha: true })
+      .eq('id', inspection_id)
+      .eq('gha_id', session.staff_id)
+      .eq('status', 'done');
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -3915,7 +3948,7 @@ app.get('/api/sa/inspections', verifyStaffToken, async (req, res) => {
       .from('inspections')
       .select('*')
       .eq('assigned_by_sa', saId)
-      .order('inspection_date', { ascending: false });
+      .order('created_at', { ascending: false }); // newest first
     if (error) throw error;
 
     const ghaIds = [...new Set((inspections || []).map(function(i) { return i.gha_id; }).filter(Boolean))];
@@ -8401,6 +8434,12 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         inspection_count: count,
         inspection_payment: inspPayment,
         inspection_breakdown: breakdown,
+        inspection_summary: {
+          confirmed_inspections: count,
+          fee_per_inspection: inspFee,
+          total_inspection_payment: inspPayment,
+          breakdown: breakdown,
+        },
         inspections: enrichedInspections,
         commission_amount: commissionTotal,
         unlimited_commission: unlimitedCommission,
@@ -8527,6 +8566,62 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     });
   } catch (err) {
     console.error('Staff payments error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/inspection-payments - inspection fee breakdown per GHA for a month
+app.get('/api/admin/inspection-payments', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    var month = req.query.month || getBillingMonth();
+    var monthStart = month + '-01T00:00:00.000Z';
+    var nextMonth = new Date(month + '-01');
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    var monthEnd = nextMonth.toISOString();
+
+    const { data: ghas } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, bank_name, account_number, account_name');
+
+    var result = await Promise.all((ghas || []).map(async function(gha) {
+      // Count confirmed inspections this month
+      const { data: confirmedInspections } = await adminClient
+        .from('inspections')
+        .select('id, sa_confirmed_at, property_address, customer_name')
+        .eq('gha_id', gha.id)
+        .eq('status', 'confirmed')
+        .eq('inspection_type', 'customer')
+        .gte('sa_confirmed_at', monthStart)
+        .lt('sa_confirmed_at', monthEnd);
+
+      var count = (confirmedInspections || []).length;
+      var fee = await getInspectionFeeForCount(count);
+      var totalPayment = count * fee;
+
+      return {
+        gha_id: gha.id,
+        gha_code: gha.gha_code,
+        full_name: gha.full_name,
+        bank_name: gha.bank_name,
+        account_number: gha.account_number,
+        account_name: gha.account_name,
+        confirmed_inspections: count,
+        fee_per_inspection: fee,
+        total_inspection_payment: totalPayment,
+        inspections: confirmedInspections || [],
+      };
+    }));
+
+    // Only return GHAs with confirmed inspections
+    var activeGhas = result.filter(function(g) { return g.confirmed_inspections > 0; });
+    var grandTotal = activeGhas.reduce(function(sum, g) { return sum + g.total_inspection_payment; }, 0);
+
+    res.json({ ghas: activeGhas, grand_total: grandTotal, month });
+  } catch(err) {
+    console.error('Inspection payments error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
