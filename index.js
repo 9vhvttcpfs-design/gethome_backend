@@ -10917,13 +10917,24 @@ app.get('/api/customer/inspections', async (req, res) => {
     // Enrich with SA whatsapp for messaging
     var enriched = await Promise.all((inspections || []).map(async function(insp) {
       var saWhatsapp = null;
+      var saName = null;
       if (insp.assigned_by_sa) {
         const { data: sa } = await adminClient
           .from('service_agents')
-          .select('whatsapp')
+          .select('id, full_name, whatsapp, phone, sa_code')
           .eq('id', insp.assigned_by_sa)
           .single();
-        saWhatsapp = sa?.whatsapp || null;
+
+        // Use SA WhatsApp first, then phone, then GetHome default
+        saWhatsapp = sa?.whatsapp || sa?.phone || process.env.GETHOME_WHATSAPP || '2349139649368';
+        saName = sa?.full_name || sa?.sa_code || 'GetHome Team';
+
+        console.log('SA for inspection:', insp.id, '| SA:', saName, '| whatsapp:', saWhatsapp);
+      } else {
+        // No SA assigned yet - use GetHome number
+        saWhatsapp = process.env.GETHOME_WHATSAPP || '2349139649368';
+        saName = 'GetHome Team';
+        console.log('No SA assigned for inspection:', insp.id, '- using GetHome WhatsApp');
       }
 
       // Get property details
@@ -10937,8 +10948,11 @@ app.get('/api/customer/inspections', async (req, res) => {
         propertyDetails = prop;
       }
 
+      console.log('Customer inspection enriched - id:', insp.id, '| sa_whatsapp:', saWhatsapp, '| sa_name:', saName);
+
       return Object.assign({}, insp, {
         sa_whatsapp: saWhatsapp,
+        sa_name: saName,
         property_title: propertyDetails?.title || insp.property_address,
         property_location: propertyDetails?.location || null,
         property_image: propertyDetails?.image_urls?.[0] || null,
