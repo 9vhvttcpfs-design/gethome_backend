@@ -8857,13 +8857,16 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     const { data: payment } = await paymentQuery.single();
     if (!payment) return res.status(404).json({ error: 'Payment record not found' });
 
-    const { error: updateErr } = await adminClient.from('staff_payments').update({
+    const now = new Date().toISOString();
+    const { error: updateErr } = await adminClient.from('staff_payments').upsert([{
+      staff_id: staff_id,
+      staff_type: staff_type || payment.staff_type,
+      month_year: month_year,
       payment_status: 'paid',
-      paid_at: new Date().toISOString(),
+      paid_at: now,
       paid_by: admin.id,
-      payment_notes: payment_notes || null,
-      updated_at: new Date().toISOString(),
-    }).eq('staff_id', staff_id).eq('month_year', month_year);
+      updated_at: now,
+    }], { onConflict: 'staff_id,month_year' });
 
     if (updateErr) return res.status(500).json({ error: updateErr.message });
 
