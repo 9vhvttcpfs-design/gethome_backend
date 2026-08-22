@@ -4880,6 +4880,7 @@ app.get('/api/sa/notifications', async (req, res) => {
       .eq('recipient_type', 'SA')
       .eq('recipient_id', saId)
       .eq('dismissed_by_sa', false)
+      .eq('is_read', false) // Only return unread notifications
       .order('created_at', { ascending: false })
       .limit(50);
 
@@ -4931,6 +4932,7 @@ app.get('/api/gha/notifications', async (req, res) => {
       .select('*')
       .eq('recipient_type', 'GHA')
       .eq('recipient_id', ghaId)
+      .eq('is_read', false) // Only return unread notifications
       .order('created_at', { ascending: false })
       .limit(50);
 
@@ -7243,26 +7245,51 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           inspSaId = agentProf?.sa_id || null;
         }
 
-        // Create inspection record so customer can track it
-        const { data: newInspection } = await adminClient.from('inspections').insert([{
-          property_id: inspPropertyId,
-          customer_email: inspCustomerEmail,
-          customer_name: inspCustomerName,
-          customer_phone: inspCustomerPhone,
-          property_address: inspProp.title + ' — ' + (inspProp.location || ''),
-          status: 'pending',
-          inspection_type: 'customer',
-          fee_payment_amount: inspFeeAmount,
-          fee_paid_at: new Date().toISOString(),
-          fee_payment_status: 'paid',
-          assigned_by_sa: inspSaId || null,
-          customer_id: inspCustomerId || null,
-        }]).select().single().catch(e => { console.error('Inspection record creation failed:', e.message); return { data: null }; });
+        // Find the pending inspection record pre-created at payment initialization
+        // (matched by fee_payment_reference) so we update it instead of creating a duplicate.
+        const { data: existingInsp } = await adminClient
+          .from('inspections')
+          .select('id, customer_id')
+          .eq('fee_payment_reference', txRef)
+          .maybeSingle()
+          .catch(e => { console.error('Existing inspection lookup failed:', e.message); return { data: null }; });
+
+        var newInspection = null;
+        if (existingInsp?.id) {
+          const { data: updatedInsp } = await adminClient.from('inspections').update({
+            status: 'pending',
+            fee_payment_amount: inspFeeAmount,
+            fee_paid_at: new Date().toISOString(),
+            fee_payment_status: 'paid',
+            assigned_by_sa: inspSaId || null,
+            customer_id: inspCustomerId || existingInsp.customer_id || null,
+          }).eq('id', existingInsp.id).select().single()
+            .catch(e => { console.error('Inspection record update failed:', e.message); return { data: null }; });
+          newInspection = updatedInsp;
+          if (newInspection?.id) console.log('Pending inspection record updated to paid:', newInspection.id);
+        } else {
+          const { data: insertedInsp } = await adminClient.from('inspections').insert([{
+            property_id: inspPropertyId,
+            customer_email: inspCustomerEmail,
+            customer_name: inspCustomerName,
+            customer_phone: inspCustomerPhone,
+            property_address: inspProp.title + ' — ' + (inspProp.location || ''),
+            status: 'pending',
+            inspection_type: 'customer',
+            fee_payment_amount: inspFeeAmount,
+            fee_paid_at: new Date().toISOString(),
+            fee_payment_status: 'paid',
+            fee_payment_reference: txRef,
+            assigned_by_sa: inspSaId || null,
+            customer_id: inspCustomerId || null,
+          }]).select().single().catch(e => { console.error('Inspection record creation failed:', e.message); return { data: null }; });
+          newInspection = insertedInsp;
+          if (newInspection?.id) console.log('Inspection record created:', newInspection.id);
+        }
 
         if (newInspection?.id) {
-          console.log('Inspection record created:', newInspection.id);
           // Link to customer account if they have one and it wasn't already known
-          if (!inspCustomerId) {
+          if (!inspCustomerId && !newInspection.customer_id) {
             const { data: authUserList } = await adminClient.auth.admin.listUsers({ perPage: 1000 });
             var custUser = (authUserList?.users || []).find(function(u) { return u.email?.toLowerCase() === inspCustomerEmail?.toLowerCase(); });
             if (custUser) {
@@ -10884,6 +10911,46 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
     }
 
     console.log('Inspection fee payment initialized:', reference, '| fee:', inspectionFee, '| property:', property_id);
+
+    // Create pending inspection record immediately so customer sees it in their account
+    try {
+      var inspRecord = {
+        property_id: parseInt(property_id) || null,
+        customer_email: customer_email,
+        customer_name: customer_name || '',
+        customer_phone: customer_phone || '',
+        property_address: property.title + ' — ' + (property.location || ''),
+        status: 'pending',
+        inspection_type: 'customer',
+        fee_payment_amount: inspectionFee,
+        fee_payment_status: 'processing',
+        fee_payment_reference: reference,
+        assigned_by_sa: null, // will be set when SA assigns
+      };
+
+      // Link to customer auth account if they exist
+      if (customerId) {
+        inspRecord.customer_id = customerId;
+      } else {
+        const { data: authList } = await adminClient.auth.admin.listUsers({ perPage: 1000 });
+        var custUser = (authList?.users || []).find(function(u) {
+          return u.email?.toLowerCase() === customer_email.toLowerCase();
+        });
+        if (custUser) {
+          inspRecord.customer_id = custUser.id;
+        }
+      }
+
+      const { error: inspInsertErr } = await adminClient
+        .from('inspections')
+        .insert([inspRecord]);
+
+      if (inspInsertErr) console.error('Pending inspection record failed (non-blocking):', inspInsertErr.message);
+      else console.log('Pending inspection record created for:', customer_email);
+    } catch (inspErr) {
+      console.error('Inspection pre-create failed (non-blocking):', inspErr.message);
+    }
+
     res.json({
       requires_payment: true,
       checkout_url: initData.data.link,
