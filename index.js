@@ -6,6 +6,16 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const PORT = process.env.PORT || 5000;
+// Normalize a Nigerian phone/WhatsApp number to the digits-only 234-prefixed
+// format wa.me links require (e.g. '0813...' or '234813...' -> '234813...').
+var formatWaNumber = function(num) {
+  if (!num) return '2349139649368';
+  var d = String(num).replace(/\D/g, '');
+  if (d.startsWith('0')) return '234' + d.slice(1);
+  if (d.startsWith('234')) return d;
+  if (d.length === 10) return '234' + d;
+  return d;
+};
 // ── Environment Variable Validation ────────────────────
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
 const MISSING_ENV = REQUIRED_ENV.filter(k => !process.env[k]);
@@ -6850,7 +6860,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           'Time: ' + new Date().toLocaleString('en-NG', { timeZone: 'Africa/Lagos' });
 
         // wa.me requires digits only (no +, spaces or dashes) for the link to open in one tap
-        var waNumber = getHomeWhatsApp.replace(/[^\d]/g, '');
+        var waNumber = formatWaNumber(getHomeWhatsApp);
         var waLink = 'https://wa.me/' + waNumber + '?text=' + encodeURIComponent(paymentMsg);
 
         // Store in notifications with WhatsApp link so admin can tap to notify
@@ -7232,7 +7242,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           'Please assign a GHA to conduct this inspection.'
         );
 
-        var waLink = 'https://wa.me/' + saWhatsapp.replace(/\D/g, '') + '?text=' + waMsg;
+        var waLink = 'https://wa.me/' + formatWaNumber(saWhatsapp) + '?text=' + waMsg;
 
         // Get the SA for this property
         var inspSaId = null;
@@ -10875,13 +10885,7 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
       tx_ref: reference,
       amount: inspectionFee,
       currency: 'NGN',
-      redirect_url: 'https://trygethome.online/?inspection_payment=success' +
-        '&property_id=' + property_id +
-        '&ref=' + reference +
-        '&cname=' + encodeURIComponent(customer_name || '') +
-        '&cemail=' + encodeURIComponent(customer_email || '') +
-        '&cphone=' + encodeURIComponent(customer_phone || '') +
-        '&saw=' + encodeURIComponent(sa_whatsapp || ''),
+      redirect_url: 'https://trygethome.online/?inspection_payment=success',
       customer: { email: customer_email, name: customer_name || customer_email, phonenumber: customer_phone || '' },
       customizations: {
         title: 'GetHome Inspection Fee',
