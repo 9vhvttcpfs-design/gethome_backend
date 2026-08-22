@@ -4101,6 +4101,28 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
       console.error('Notification insert threw an exception (action still succeeded):', notifCatchErr.message);
     }
 
+    // Generate customer rating link
+    var ratingLink = 'https://trygethome.online/?rate=true&gha=' + inspection.gha_id + '&insp=' + inspection_id;
+
+    console.log('Rating link for customer:', ratingLink);
+
+    // Notify SA with the rating link to share with customer
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'SA',
+      recipient_id: saId,
+      type: 'rating_link_ready',
+      title: 'Share Rating Link with Customer',
+      message: 'Inspection confirmed! Share this link with the customer to rate the GHA:\n' + ratingLink,
+      is_read: false,
+      meta: JSON.stringify({
+        rating_link: ratingLink,
+        inspection_id: inspection_id,
+        customer_name: inspection.customer_name,
+        customer_phone: inspection.customer_phone,
+        gha_id: inspection.gha_id,
+      }),
+    }]).catch(e => console.error('Rating link notification failed:', e.message));
+
     res.json({ success: true });
   } catch (err) {
     console.error('SA confirm-inspection error:', err.message);
@@ -8355,29 +8377,24 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     var globalGhaRate = parseFloat(ghaRateSetting?.setting_value || 5);
 
     const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
-      // Only count confirmed inspections - GHA payment is earned when SA confirms,
-      // so the month attribution is based on sa_confirmed_at (not gha_done_at).
-      // Authoritative count comes from a dedicated head-count query (mirrors the SA
-      // section below); monthEnd is the exclusive start of next month rather than a
-      // hardcoded "-31", since that literal is an invalid date for shorter months
-      // (Feb, Apr, Jun, Sep, Nov) and Postgres would reject the filter outright.
-      const { count: confirmedCount } = await adminClient
+      // Count ALL confirmed customer inspections this month regardless of sa_confirmed_at
+      // - GHA payment is earned when SA confirms, so the month attribution is based on
+      // sa_confirmed_at, but that column may be null for some records, so we fall back
+      // to created_at and filter by month in JavaScript instead of a Postgres date range.
+      const { data: allConfirmedInspections } = await adminClient
         .from('inspections')
-        .select('id', { count: 'exact', head: true })
+        .select('id, status, gha_done_at, sa_confirmed_at, created_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
-        .eq('status', 'confirmed')
         .eq('inspection_type', 'customer')
-        .gte('sa_confirmed_at', monthStart)
-        .lt('sa_confirmed_at', monthEnd);
+        .eq('status', 'confirmed');  // CONFIRMED only - not done
 
-      const { data: inspections } = await adminClient
-        .from('inspections')
-        .select('id, status, gha_done_at, sa_confirmed_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
-        .eq('gha_id', gha.id)
-        .eq('inspection_type', 'customer')
-        .eq('status', 'confirmed')  // CONFIRMED only - not done
-        .gte('sa_confirmed_at', monthStart)
-        .lt('sa_confirmed_at', monthEnd);
+      const inspections = (allConfirmedInspections || []).filter(function(i) {
+        // Use sa_confirmed_at if available, otherwise fall back to created_at
+        var dateToCheck = i.sa_confirmed_at || i.created_at;
+        return dateToCheck && dateToCheck.startsWith(month);
+      });
+
+      const confirmedCount = inspections.length;
 
       // For each inspection, get the property title if property_id exists
       const enrichedInspections = await Promise.all((inspections || []).map(async function(insp) {
@@ -8636,19 +8653,23 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
       .select('id, gha_code, full_name, bank_name, account_number, account_name');
 
     var result = await Promise.all((ghas || []).map(async function(gha) {
-      // Count confirmed inspections - check both sa_confirmed=true AND status=confirmed
+      // Count ALL confirmed customer inspections this month regardless of sa_confirmed_at
       const { data: confirmedInspections } = await adminClient
         .from('inspections')
-        .select('id, sa_confirmed_at, property_address, customer_name, created_at')
+        .select('id, created_at, sa_confirmed_at, property_address, customer_name')
         .eq('gha_id', gha.id)
         .eq('status', 'confirmed')
-        .eq('inspection_type', 'customer')
-        .or('sa_confirmed_at.gte.' + monthStart + ',sa_confirmed_at.is.null')
-        .gte('created_at', monthStart)
-        .lt('created_at', monthEnd);
+        .eq('inspection_type', 'customer');
 
-      var count = (confirmedInspections || []).length;
-      console.log('GHA', gha.gha_code, '| confirmed this month:', count);
+      // Filter by month in JavaScript since sa_confirmed_at may be null
+      var monthInspections = (confirmedInspections || []).filter(function(i) {
+        // Use sa_confirmed_at if available, otherwise fall back to created_at
+        var dateToCheck = i.sa_confirmed_at || i.created_at;
+        return dateToCheck && dateToCheck.startsWith(month);
+      });
+
+      var count = monthInspections.length;
+      console.log('GHA', gha.gha_code, '| confirmed inspections this month:', count);
       var fee = await getInspectionFeeForCount(count);
       var totalPayment = count * fee;
 
@@ -8662,7 +8683,7 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         confirmed_inspections: count,
         fee_per_inspection: fee,
         total_inspection_payment: totalPayment,
-        inspections: confirmedInspections || [],
+        inspections: monthInspections,
       };
     }));
 
