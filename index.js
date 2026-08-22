@@ -4071,9 +4071,10 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
       return res.status(403).json({ error: 'You are not authorized to confirm this inspection' });
     }
 
-    if (inspection.status !== 'done') {
+    // Allow confirmation if status is done OR gha_done_at exists
+    if (inspection.status !== 'done' && !inspection.gha_done_at) {
       return res.status(400).json({
-        error: 'Inspection status is ' + inspection.status + '. Must be done before SA can confirm.',
+        error: 'GHA must mark inspection as done before SA can confirm.',
         current_status: inspection.status,
       });
     }
@@ -8653,25 +8654,30 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
       .select('id, gha_code, full_name, bank_name, account_number, account_name');
 
     var result = await Promise.all((ghas || []).map(async function(gha) {
-      // Count ALL confirmed customer inspections this month regardless of sa_confirmed_at
-      const { data: confirmedInspections } = await adminClient
+      const { data: allConfirmed } = await adminClient
         .from('inspections')
-        .select('id, created_at, sa_confirmed_at, property_address, customer_name')
+        .select('id, created_at, sa_confirmed_at, property_address, customer_name, status, inspection_type')
         .eq('gha_id', gha.id)
-        .eq('status', 'confirmed')
-        .eq('inspection_type', 'customer');
+        .eq('status', 'confirmed');
 
-      // Filter by month in JavaScript since sa_confirmed_at may be null
-      var monthInspections = (confirmedInspections || []).filter(function(i) {
-        // Use sa_confirmed_at if available, otherwise fall back to created_at
-        var dateToCheck = i.sa_confirmed_at || i.created_at;
-        return dateToCheck && dateToCheck.startsWith(month);
+      console.log('GHA', gha.gha_code, '| confirmed inspections (all types):', (allConfirmed || []).length);
+
+      // Filter by selected month - check both sa_confirmed_at and created_at
+      var monthInspections = (allConfirmed || []).filter(function(i) {
+        var d = i.sa_confirmed_at || i.created_at || '';
+        return d.substring(0, 7) === month;
       });
 
+      // If no month filter results use ALL confirmed (for testing)
+      if (monthInspections.length === 0 && req.query.all === 'true') {
+        monthInspections = allConfirmed || [];
+      }
+
       var count = monthInspections.length;
-      console.log('GHA', gha.gha_code, '| confirmed inspections this month:', count);
       var fee = await getInspectionFeeForCount(count);
       var totalPayment = count * fee;
+
+      console.log('GHA', gha.gha_code, '| this month:', count, '| fee:', fee, '| total:', totalPayment);
 
       return {
         gha_id: gha.id,
@@ -8681,17 +8687,16 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         account_number: gha.account_number,
         account_name: gha.account_name,
         confirmed_inspections: count,
+        all_time_confirmed: (allConfirmed || []).length,
         fee_per_inspection: fee,
         total_inspection_payment: totalPayment,
         inspections: monthInspections,
       };
     }));
 
-    // Only return GHAs with confirmed inspections
-    var activeGhas = result.filter(function(g) { return g.confirmed_inspections > 0; });
-    var grandTotal = activeGhas.reduce(function(sum, g) { return sum + g.total_inspection_payment; }, 0);
-
-    res.json({ ghas: activeGhas, grand_total: grandTotal, month });
+    // Show ALL GHAs not just ones with inspections so admin can see zeros too
+    var grandTotal = result.reduce(function(sum, g) { return sum + g.total_inspection_payment; }, 0);
+    res.json({ ghas: result, grand_total: grandTotal, month });
   } catch(err) {
     console.error('Inspection payments error:', err.message);
     res.status(500).json({ error: err.message });
@@ -11008,39 +11013,57 @@ app.get('/api/customer/inspections', async (req, res) => {
 
     // Enrich with SA whatsapp for messaging
     var enriched = await Promise.all((inspections || []).map(async function(insp) {
-      var saWhatsapp = null;
-      var saName = null;
-      if (insp.assigned_by_sa) {
-        const { data: sa } = await adminClient
-          .from('service_agents')
-          .select('id, full_name, whatsapp, phone, sa_code')
-          .eq('id', insp.assigned_by_sa)
-          .single();
-
-        // Use SA WhatsApp first, then phone, then GetHome default
-        saWhatsapp = sa?.whatsapp || sa?.phone || process.env.GETHOME_WHATSAPP || '2349139649368';
-        saName = sa?.full_name || sa?.sa_code || 'GetHome Team';
-
-        console.log('SA for inspection:', insp.id, '| SA:', saName, '| whatsapp:', saWhatsapp);
-      } else {
-        // No SA assigned yet - use GetHome number
-        saWhatsapp = process.env.GETHOME_WHATSAPP || '2349139649368';
-        saName = 'GetHome Team';
-        console.log('No SA assigned for inspection:', insp.id, '- using GetHome WhatsApp');
-      }
-
       // Get property details
       var propertyDetails = null;
       if (insp.property_id) {
         const { data: prop } = await adminClient
           .from('properties')
-          .select('title, location, image_urls, rent, price')
+          .select('title, location, image_urls, rent, price, created_by')
           .eq('id', insp.property_id)
           .single();
         propertyDetails = prop;
       }
 
-      console.log('Customer inspection enriched - id:', insp.id, '| sa_whatsapp:', saWhatsapp, '| sa_name:', saName);
+      var saWhatsapp = null;
+      var saName = 'GetHome Team';
+
+      // Priority 1: SA directly assigned to inspection
+      if (insp.assigned_by_sa) {
+        const { data: sa } = await adminClient
+          .from('service_agents')
+          .select('full_name, whatsapp, phone')
+          .eq('id', insp.assigned_by_sa)
+          .single();
+        if (sa) {
+          saWhatsapp = sa.whatsapp || sa.phone;
+          saName = sa.full_name || 'GetHome Team';
+        }
+      }
+
+      // Priority 2: SA from the property's agent profile
+      if (!saWhatsapp && propertyDetails?.created_by) {
+        const { data: agentProf } = await adminClient
+          .from('profiles')
+          .select('sa_id')
+          .eq('id', propertyDetails.created_by)
+          .single();
+        if (agentProf?.sa_id) {
+          const { data: sa } = await adminClient
+            .from('service_agents')
+            .select('full_name, whatsapp, phone')
+            .eq('id', agentProf.sa_id)
+            .single();
+          if (sa) {
+            saWhatsapp = sa.whatsapp || sa.phone;
+            saName = sa.full_name || 'GetHome Team';
+          }
+        }
+      }
+
+      // Priority 3: GetHome default
+      saWhatsapp = saWhatsapp || process.env.GETHOME_WHATSAPP || '2349139649368';
+
+      console.log('Customer inspection SA:', insp.id, '|', saName, '| whatsapp:', saWhatsapp);
 
       return Object.assign({}, insp, {
         sa_whatsapp: saWhatsapp,
