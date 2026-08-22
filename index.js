@@ -3908,6 +3908,49 @@ app.post('/api/sa/create-inspection', async (req, res) => {
     if (!gha) return res.status(404).json({ error: 'GHA not found' });
     if (gha.sa_id !== session.staff_id) return res.status(403).json({ error: 'This GHA does not belong to your team' });
 
+    // Check if customer already has a fee-paid inspection for this property
+    const { data: existingInsp } = await adminClient
+      .from('inspections')
+      .select('id, status, fee_payment_status')
+      .eq('customer_email', customer_email.trim().toLowerCase())
+      .eq('property_id', property_id ? parseInt(property_id) : null)
+      .in('status', ['pending', 'assigned'])
+      .maybeSingle();
+
+    if (existingInsp) {
+      // Update existing inspection instead of creating duplicate
+      const { data: updated, error: updateErr } = await adminClient
+        .from('inspections')
+        .update({
+          gha_id: gha_id,
+          assigned_by_sa: session.staff_id,
+          status: 'assigned',
+          inspection_date: inspection_date || null,
+          inspection_type: inspection_type || 'customer',
+          notes: notes || null,
+        })
+        .eq('id', existingInsp.id)
+        .select()
+        .single();
+
+      if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+      console.log('Updated existing inspection instead of creating duplicate:', existingInsp.id);
+
+      // Notify GHA
+      await adminClient.from('notifications').insert([{
+        recipient_type: 'GHA',
+        recipient_id: gha_id,
+        type: 'inspection_request',
+        title: 'New Inspection Assigned',
+        message: 'Inspect property for customer ' + customer_name + ' at ' + (property_address || 'address TBD') + (inspection_date ? ' on ' + new Date(inspection_date).toLocaleDateString() : ''),
+        is_read: false,
+      }]).catch(e => console.error('GHA notification failed:', e.message));
+
+      return res.json({ success: true, inspection: updated });
+    }
+
+    // No existing inspection found - create new one
     const { data: inspection, error: insertErr } = await adminClient.from('inspections').insert([{
       property_id: property_id ? parseInt(property_id) : null,
       gha_id: gha_id,
@@ -3919,7 +3962,7 @@ app.post('/api/sa/create-inspection', async (req, res) => {
       inspection_date: inspection_date || null,
       inspection_type: inspection_type || 'customer',
       notes: notes || null,
-      status: 'pending',
+      status: 'assigned',
     }]).select().single();
 
     if (insertErr) {
@@ -7522,23 +7565,40 @@ app.get('/api/admin/monthly-history', async (req, res) => {
 
     const months = [...new Set((availableMonths || []).map(r => r.month_year))];
 
-    // Sum ALL agent subscription payments currently active - premium, agency AND
-    // unlimited (no subscription_tier filter, so nothing is excluded).
-    const { data: allSubscriptions } = await adminClient
-      .from('profiles')
-      .select('email, subscription_tier, subscription_amount, subscription_status, is_unlimited')
-      .eq('role', 'agent')
-      .in('subscription_status', ['active'])
-      .not('subscription_amount', 'is', null)
-      .gt('subscription_amount', 0);
+    var totalSubscriptionRevenue, unlimitedCount, premiumCount, agencyCount;
 
-    var totalSubscriptionRevenue = (allSubscriptions || []).reduce(function(sum, p) {
-      return sum + parseFloat(p.subscription_amount || 0);
-    }, 0);
+    if (month === getBillingMonth()) {
+      // Current (unarchived) month - live subscriptions are the source of truth
+      // since this month's snapshot/summary rows haven't been finalized yet.
+      // Sum ALL agent subscription payments currently active - premium, agency AND
+      // unlimited (no subscription_tier filter, so nothing is excluded).
+      const { data: allSubscriptions } = await adminClient
+        .from('profiles')
+        .select('email, subscription_tier, subscription_amount, subscription_status, is_unlimited')
+        .eq('role', 'agent')
+        .in('subscription_status', ['active'])
+        .not('subscription_amount', 'is', null)
+        .gt('subscription_amount', 0);
 
-    var unlimitedCount = (allSubscriptions || []).filter(function(p) { return p.is_unlimited; }).length;
-    var premiumCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'premium'; }).length;
-    var agencyCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'agency'; }).length;
+      totalSubscriptionRevenue = (allSubscriptions || []).reduce(function(sum, p) {
+        return sum + parseFloat(p.subscription_amount || 0);
+      }, 0);
+
+      unlimitedCount = (allSubscriptions || []).filter(function(p) { return p.is_unlimited; }).length;
+      premiumCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'premium'; }).length;
+      agencyCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'agency'; }).length;
+    } else {
+      // Past month - a currently-active subscription tells us nothing about what
+      // was active back then, so derive the breakdown from that month's own
+      // archived snapshot rows instead of recalculating from live subscriptions.
+      totalSubscriptionRevenue = (agentSnaps || []).reduce(function(sum, p) {
+        return sum + parseFloat(p.subscription_amount || 0);
+      }, 0);
+
+      unlimitedCount = (agentSnaps || []).filter(function(p) { return p.is_unlimited; }).length;
+      premiumCount = (agentSnaps || []).filter(function(p) { return p.subscription_tier === 'premium'; }).length;
+      agencyCount = (agentSnaps || []).filter(function(p) { return p.subscription_tier === 'agency'; }).length;
+    }
 
     console.log('Monthly revenue - premium:', premiumCount, '| agency:', agencyCount, '| unlimited:', unlimitedCount, '| total:', totalSubscriptionRevenue);
 
@@ -8651,7 +8711,14 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
 
     const { data: ghas } = await adminClient
       .from('gha_agents')
-      .select('id, gha_code, full_name, bank_name, account_number, account_name');
+      .select('id, gha_code, full_name, bank_name, account_number, account_name, bank_code, average_rating');
+
+    if (!ghas || ghas.length === 0) {
+      console.log('No GHAs found');
+      return res.json({ ghas: [], grand_total: 0, month });
+    }
+
+    console.log('GHAs found:', ghas.length, '| first GHA bank:', ghas[0]?.bank_name);
 
     var result = await Promise.all((ghas || []).map(async function(gha) {
       const { data: allConfirmed } = await adminClient
@@ -8686,6 +8753,8 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         bank_name: gha.bank_name,
         account_number: gha.account_number,
         account_name: gha.account_name,
+        bank_code: gha.bank_code,
+        average_rating: gha.average_rating,
         confirmed_inspections: count,
         all_time_confirmed: (allConfirmed || []).length,
         fee_per_inspection: fee,
@@ -8775,11 +8844,17 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { staff_id, month_year, payment_notes } = req.body;
+    // Accept `month` as an alias for `month_year` for callers using either name.
+    const { staff_id, staff_type, payment_notes } = req.body;
+    const month_year = req.body.month_year || req.body.month;
     if (!staff_id || !month_year) return res.status(400).json({ error: 'staff_id and month_year are required' });
 
-    const { data: payment } = await adminClient.from('staff_payments')
-      .select('*').eq('staff_id', staff_id).eq('month_year', month_year).single();
+    // staff_id alone is ambiguous (GHA and SA ids are separate sequences and can
+    // collide), so filter by staff_type when the caller provides it.
+    var paymentQuery = adminClient.from('staff_payments')
+      .select('*').eq('staff_id', staff_id).eq('month_year', month_year);
+    if (staff_type) paymentQuery = paymentQuery.eq('staff_type', staff_type);
+    const { data: payment } = await paymentQuery.single();
     if (!payment) return res.status(404).json({ error: 'Payment record not found' });
 
     const { error: updateErr } = await adminClient.from('staff_payments').update({
@@ -8791,6 +8866,40 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     }).eq('staff_id', staff_id).eq('month_year', month_year);
 
     if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    // Mark ALL earnings for this staff member this month as paid, so the
+    // per-agent earnings rows stay in sync with the staff_payments record.
+    if (payment.staff_type === 'GHA') {
+      const { error: ghaPayErr } = await adminClient
+        .from('gha_earnings')
+        .update({
+          is_paid: true,
+          paid_at: new Date().toISOString(),
+          paid_by: admin.id,
+        })
+        .eq('gha_id', staff_id)
+        .eq('month_year', month_year)
+        .eq('is_paid', false);
+
+      if (ghaPayErr) return res.status(500).json({ error: ghaPayErr.message });
+
+      console.log('GHA earnings marked paid:', staff_id, '| month:', month_year);
+    } else if (payment.staff_type === 'SA') {
+      const { error: saPayErr } = await adminClient
+        .from('sa_earnings')
+        .update({
+          is_paid: true,
+          paid_at: new Date().toISOString(),
+          paid_by: admin.id,
+        })
+        .eq('sa_id', staff_id)
+        .eq('month_year', month_year)
+        .eq('is_paid', false);
+
+      if (saPayErr) return res.status(500).json({ error: saPayErr.message });
+
+      console.log('SA earnings marked paid:', staff_id, '| month:', month_year);
+    }
 
     // Notify staff member
     const { error: notifErr } = await adminClient.from('notifications').insert([{
