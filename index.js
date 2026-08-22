@@ -2573,11 +2573,23 @@ app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
       .order('created_at', { ascending: false }); // newest first
     if (error) throw error;
 
-    // Exclude done inspections GHA has cleared
     var visibleInspections = (inspections || []).filter(function(i) {
+      // Hide confirmed - SA has verified, GHA's job is done
+      if (i.status === 'confirmed') return false;
+      // Hide done inspections GHA manually cleared
       if (i.status === 'done' && i.cleared_by_gha === true) return false;
-      if (i.status === 'confirmed') return false; // confirmed clears automatically
       return true;
+    });
+
+    // Sort: newest assigned first, done inspections at bottom
+    visibleInspections.sort(function(a, b) {
+      // Pending/assigned come before done
+      var statusOrder = { pending: 0, assigned: 1, done: 2, cancelled: 3 };
+      var aOrder = statusOrder[a.status] || 99;
+      var bOrder = statusOrder[b.status] || 99;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      // Within same status, newest first
+      return new Date(b.created_at) - new Date(a.created_at);
     });
 
     const propertyIds = [...new Set(visibleInspections.map(function(i) { return i.property_id; }).filter(Boolean))];
@@ -8587,17 +8599,19 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
       .select('id, gha_code, full_name, bank_name, account_number, account_name');
 
     var result = await Promise.all((ghas || []).map(async function(gha) {
-      // Count confirmed inspections this month
+      // Count confirmed inspections - check both sa_confirmed=true AND status=confirmed
       const { data: confirmedInspections } = await adminClient
         .from('inspections')
-        .select('id, sa_confirmed_at, property_address, customer_name')
+        .select('id, sa_confirmed_at, property_address, customer_name, created_at')
         .eq('gha_id', gha.id)
         .eq('status', 'confirmed')
         .eq('inspection_type', 'customer')
-        .gte('sa_confirmed_at', monthStart)
-        .lt('sa_confirmed_at', monthEnd);
+        .or('sa_confirmed_at.gte.' + monthStart + ',sa_confirmed_at.is.null')
+        .gte('created_at', monthStart)
+        .lt('created_at', monthEnd);
 
       var count = (confirmedInspections || []).length;
+      console.log('GHA', gha.gha_code, '| confirmed this month:', count);
       var fee = await getInspectionFeeForCount(count);
       var totalPayment = count * fee;
 
@@ -10936,6 +10950,76 @@ app.get('/api/customer/inspections', async (req, res) => {
     res.json(enriched);
   } catch(err) {
     console.error('Customer inspections error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GHA clear notifications
+app.post('/api/gha/clear-notifications', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access required' });
+
+    const { clear_all, notification_id } = req.body;
+
+    if (clear_all) {
+      // Mark all GHA notifications as read/cleared
+      const { error } = await adminClient
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('recipient_type', 'GHA')
+        .eq('recipient_id', session.staff_id);
+      if (error) return res.status(500).json({ error: error.message });
+      console.log('GHA cleared all notifications:', session.staff_id);
+    } else if (notification_id) {
+      // Clear single notification
+      const { error } = await adminClient
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('id', notification_id)
+        .eq('recipient_id', session.staff_id);
+      if (error) return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ success: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// SA clear notifications
+app.post('/api/sa/clear-notifications', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const { clear_all, notification_id } = req.body;
+
+    if (clear_all) {
+      const { error } = await adminClient
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('recipient_type', 'SA')
+        .eq('recipient_id', session.staff_id);
+      if (error) return res.status(500).json({ error: error.message });
+      console.log('SA cleared all notifications:', session.staff_id);
+    } else if (notification_id) {
+      const { error } = await adminClient
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('id', notification_id)
+        .eq('recipient_id', session.staff_id);
+      if (error) return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ success: true });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
