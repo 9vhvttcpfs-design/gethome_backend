@@ -237,7 +237,7 @@ async function getInspectionFeeForCount(confirmedCount) {
 // to the global rate in app_settings, then to a safe 5% default.
 async function getStaffCommissionRate(staffId, staffType) {
   try {
-    // Check individual override first
+    // Always fetch fresh from the database - never use a cached value
     var table = staffType === 'GHA' ? 'gha_agents' : 'service_agents';
 
     const { data: staffData } = await adminClient
@@ -246,20 +246,24 @@ async function getStaffCommissionRate(staffId, staffType) {
       .eq('id', staffId)
       .single();
 
-    // If individual rate exists and differs from default use it
-    if (staffData?.commission_rate && staffData.commission_rate !== 5) {
-      return parseFloat(staffData.commission_rate);
-    }
+    var individualRate = staffData?.commission_rate;
 
-    // Fall back to global setting
+    // Get global rate from settings
     var settingKey = staffType === 'GHA' ? 'gha_commission_rate' : 'sa_commission_rate';
-    const { data: globalRate } = await adminClient
+    const { data: globalSetting } = await adminClient
       .from('app_settings')
       .select('setting_value')
       .eq('setting_key', settingKey)
       .single();
+    var globalRate = parseFloat(globalSetting?.setting_value || 5);
 
-    return parseFloat(globalRate?.setting_value || 5);
+    // Individual rate overrides global only if explicitly set and different
+    var effectiveRate = (individualRate && individualRate !== globalRate)
+      ? parseFloat(individualRate)
+      : globalRate;
+
+    console.log('Commission rate for', staffType, staffId, '| individual:', individualRate, '| global:', globalRate, '| effective:', effectiveRate);
+    return effectiveRate;
   } catch(err) {
     console.error('getStaffCommissionRate error:', err.message);
     return 5; // safe fallback
@@ -7383,23 +7387,50 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           newInspection = updatedInsp;
           if (newInspection?.id) console.log('Pending inspection record updated to paid:', newInspection.id);
         } else {
-          const { data: insertedInsp } = await adminClient.from('inspections').insert([{
-            property_id: inspPropertyId,
-            customer_email: inspCustomerEmail,
-            customer_name: inspCustomerName,
-            customer_phone: inspCustomerPhone,
-            property_address: inspProp.title + ' — ' + (inspProp.location || ''),
-            status: 'pending',
-            inspection_type: 'customer',
-            fee_payment_amount: inspFeeAmount,
-            fee_paid_at: new Date().toISOString(),
-            fee_payment_status: 'paid',
-            fee_payment_reference: txRef,
-            assigned_by_sa: inspSaId || null,
-            customer_id: inspCustomerId || null,
-          }]).select().single().catch(e => { console.error('Inspection record creation failed:', e.message); return { data: null }; });
-          newInspection = insertedInsp;
-          if (newInspection?.id) console.log('Inspection record created:', newInspection.id);
+          // Fallback: no pending record matched by tx_ref (e.g. init endpoint wasn't
+          // hit, or the reference changed) — check by customer+property before
+          // creating a new row so we don't end up with duplicate inspections.
+          const { data: existingWebhookInsp } = await adminClient
+            .from('inspections')
+            .select('id, status')
+            .eq('customer_email', inspCustomerEmail.toLowerCase())
+            .eq('property_id', inspPropertyId)
+            .not('status', 'eq', 'cancelled')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (existingWebhookInsp) {
+            const { data: updatedInsp2 } = await adminClient.from('inspections').update({
+              fee_payment_amount: inspFeeAmount,
+              fee_payment_status: 'paid',
+              fee_paid_at: new Date().toISOString(),
+              fee_payment_reference: txRef,
+              assigned_by_sa: inspSaId || null,
+              customer_id: inspCustomerId || null,
+            }).eq('id', existingWebhookInsp.id).select().single()
+              .catch(e => { console.error('Existing inspection (by customer+property) update failed:', e.message); return { data: null }; });
+            newInspection = updatedInsp2;
+            if (newInspection?.id) console.log('Updated existing inspection with fee paid:', newInspection.id);
+          } else {
+            const { data: insertedInsp } = await adminClient.from('inspections').insert([{
+              property_id: inspPropertyId,
+              customer_email: inspCustomerEmail,
+              customer_name: inspCustomerName,
+              customer_phone: inspCustomerPhone,
+              property_address: inspProp.title + ' — ' + (inspProp.location || ''),
+              status: 'pending',
+              inspection_type: 'customer',
+              fee_payment_amount: inspFeeAmount,
+              fee_paid_at: new Date().toISOString(),
+              fee_payment_status: 'paid',
+              fee_payment_reference: txRef,
+              assigned_by_sa: inspSaId || null,
+              customer_id: inspCustomerId || null,
+            }]).select().single().catch(e => { console.error('Inspection record creation failed:', e.message); return { data: null }; });
+            newInspection = insertedInsp;
+            if (newInspection?.id) console.log('Inspection record created:', newInspection.id);
+          }
         }
 
         if (newInspection?.id) {
@@ -8533,13 +8564,16 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       var breakdown = count > 0 ? [{ tier: 'current', count: count, rate: inspFee, subtotal: inspPayment }] : [];
       console.log('GHA', gha.gha_code, '| confirmed:', count, '| fee:', inspFee, '| total:', inspPayment);
 
-      // Commission from subscriptions — sums ALL earnings rows for the month
-      // regardless of whether they came from premium, agency, or unlimited plan payments.
+      // Commission from subscriptions — sums only UNPAID earnings rows for the month
+      // (premium, agency, or unlimited plan payments alike). Once a GHA is marked
+      // paid, those rows flip to is_paid:true and drop out of the current due amount
+      // instead of inflating it if more earnings land later in the same month.
       const { data: earnings } = await adminClient
         .from('gha_earnings')
         .select('commission_amount, subscription_amount, is_paid, agent_id')
         .eq('gha_id', gha.id)
-        .eq('month_year', month);
+        .eq('month_year', month)
+        .eq('is_paid', false); // ONLY unpaid
 
       const commissionTotal = (earnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
@@ -8547,6 +8581,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       const totalRevenue = (earnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.subscription_amount) || 0);
       }, 0);
+      console.log('GHA', gha.gha_code, '| unpaid earnings this month:', commissionTotal, '| rows:', (earnings || []).length);
 
       // gha_earnings has no plan-type column, so the unlimited-plan share of this
       // commission is derived by checking which earning agents are currently on
@@ -8634,13 +8669,16 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     var globalSaRate = parseFloat(saRateSetting?.setting_value || 5);
 
     const saPayments = await Promise.all((sas || []).map(async function(sa) {
-      // SA commission from subscriptions — sums ALL earnings rows for the month
-      // regardless of whether they came from premium, agency, or unlimited plan payments.
+      // SA commission from subscriptions — sums only UNPAID earnings rows for the month
+      // (premium, agency, or unlimited plan payments alike). Once an SA is marked
+      // paid, those rows flip to is_paid:true and drop out of the current due amount
+      // instead of inflating it if more earnings land later in the same month.
       const { data: saEarnings } = await adminClient
         .from('sa_earnings')
         .select('commission_amount, subscription_amount, is_paid, agent_id')
         .eq('sa_id', sa.id)
-        .eq('month_year', month);
+        .eq('month_year', month)
+        .eq('is_paid', false); // ONLY unpaid
 
       const commissionTotal = (saEarnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
@@ -8648,6 +8686,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       const totalRevenue = (saEarnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.subscription_amount) || 0);
       }, 0);
+      console.log('SA', sa.sa_code, '| unpaid earnings this month:', commissionTotal, '| rows:', (saEarnings || []).length);
 
       // sa_earnings has no plan-type column, so the unlimited-plan share of this
       // commission is derived by checking which earning agents are currently on
@@ -11133,12 +11172,35 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
         }
       }
 
-      const { error: inspInsertErr } = await adminClient
+      // Check for existing inspection for this customer+property combination
+      // to avoid creating duplicate records on repeat payment attempts.
+      const { data: existingFeeInsp } = await adminClient
         .from('inspections')
-        .insert([inspRecord]);
+        .select('id, status, fee_payment_status')
+        .eq('customer_email', customer_email.toLowerCase())
+        .eq('property_id', parseInt(property_id))
+        .not('status', 'eq', 'cancelled')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-      if (inspInsertErr) console.error('Pending inspection record failed (non-blocking):', inspInsertErr.message);
-      else console.log('Pending inspection record created for:', customer_email);
+      if (existingFeeInsp) {
+        // Update existing instead of creating new
+        const { error: inspUpdateErr } = await adminClient.from('inspections')
+          .update({ fee_payment_status: 'processing', fee_payment_reference: reference })
+          .eq('id', existingFeeInsp.id);
+
+        if (inspUpdateErr) console.error('Existing inspection fee update failed (non-blocking):', inspUpdateErr.message);
+        else console.log('Updated existing inspection fee record:', existingFeeInsp.id);
+      } else {
+        // Create new inspection record
+        const { error: inspInsertErr } = await adminClient
+          .from('inspections')
+          .insert([inspRecord]);
+
+        if (inspInsertErr) console.error('Pending inspection record failed (non-blocking):', inspInsertErr.message);
+        else console.log('Pending inspection record created for:', customer_email);
+      }
     } catch (inspErr) {
       console.error('Inspection pre-create failed (non-blocking):', inspErr.message);
     }
