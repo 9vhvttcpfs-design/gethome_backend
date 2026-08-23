@@ -5829,15 +5829,6 @@ app.post('/api/properties', async (req, res) => {
     }
 
     const isAdmin     = profileData.role === 'admin';
-    // is_unlimited (verification-tier override) and unlimited_listings (admin-granted
-    // bypass via /api/admin/set-unlimited-listings) both skip the listing limit check.
-    const isUnlimited = profileData.is_unlimited === true || profileData.unlimited_listings === true;
-    if (profileData.unlimited_listings === true) {
-      console.log('Agent has unlimited listings - bypassing limit check:', agentId);
-    }
-    const level       = profileData.verification_level || 'basic';
-    const limits      = { basic: 3, verified: 15, premium: 999 };
-    const limit       = limits[level] || 3;
 
     // Approval check
     if (!isAdmin && profileData.status !== 'approved') {
@@ -5851,23 +5842,57 @@ app.post('/api/properties', async (req, res) => {
     // Override created_by with the authenticated user ID so agents can't post as other agents
     req.body.created_by = agentId;
 
-    // Check listing limit for free tier agents
-    if (!isAdmin && !isUnlimited) {
-      const { count } = await supabase
-        .from('properties')
-        .select('id', { count: 'exact', head: true })
-        .eq('created_by', agentId)
-        .or('is_deleted.eq.false,is_deleted.is.null');
+    // Check listing limit based on subscription tier
+    if (!isAdmin) {
+      // Get agent profile with subscription details
+      const { data: agentProfile } = await adminClient
+        .from('profiles')
+        .select('subscription_tier, subscription_status, subscription_end, is_unlimited, unlimited_expires_at, unlimited_listings')
+        .eq('id', agentId)
+        .single();
 
-      console.log('Listing limit check:', { agentId, tier: level, current: count, limit });
+      console.log('Listing limit check - agent:', agentId, '| tier:', agentProfile?.subscription_tier, '| is_unlimited:', agentProfile?.is_unlimited, '| status:', agentProfile?.subscription_status);
 
-      if (count >= limit) {
-        return res.status(403).json({
-          error: 'Listing limit reached. Your ' + level + ' tier allows up to ' + limit + ' listings. Please contact admin to upgrade your verification tier.',
-          limit,
-          current: count,
-          tier: level,
-        });
+      // Check unlimited first
+      var isUnlimited = agentProfile?.is_unlimited === true || agentProfile?.unlimited_listings === true;
+      var unlimitedExpired = agentProfile?.unlimited_expires_at &&
+        new Date(agentProfile.unlimited_expires_at) < new Date();
+
+      if (isUnlimited && !unlimitedExpired) {
+        console.log('Agent has unlimited plan - bypassing limit check');
+        // Allow upload - no limit check needed
+      } else {
+        // Check subscription is active and not expired
+        var subEnd = agentProfile?.subscription_end;
+        var subExpired = subEnd && new Date(subEnd) < new Date();
+        var subStatus = agentProfile?.subscription_status;
+        var subTier = agentProfile?.subscription_tier || 'free';
+
+        if (subExpired || subStatus === 'expired') {
+          return res.status(403).json({ error: 'Your subscription has expired. Please renew to upload listings.', status: 'expired' });
+        }
+
+        // Get listing limits per tier
+        var tierLimits = { free: 3, premium: 15, agency: 100, unlimited: 999999 };
+        var limit = tierLimits[subTier] || 3;
+
+        // Count active listings
+        const { count: listingCount } = await adminClient
+          .from('properties')
+          .select('id', { count: 'exact', head: true })
+          .eq('created_by', agentId)
+          .or('is_deleted.eq.false,is_deleted.is.null');
+
+        console.log('Listing count:', listingCount, '| limit:', limit, '| tier:', subTier);
+
+        if (listingCount >= limit) {
+          return res.status(403).json({
+            error: 'You have reached your ' + limit + ' listing limit for the ' + subTier + ' plan. Upgrade to upload more listings.',
+            status: 'limit_reached',
+            current_count: listingCount,
+            limit: limit,
+          });
+        }
       }
     }
 
@@ -8746,6 +8771,15 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
 
       console.log('GHA', gha.gha_code, '| this month:', count, '| fee:', fee, '| total:', totalPayment);
 
+      // Check if already paid this month
+      const { data: payRecord } = await adminClient
+        .from('staff_payments')
+        .select('payment_status, paid_at')
+        .eq('staff_id', gha.id)
+        .eq('staff_type', 'GHA')
+        .eq('month_year', month)
+        .maybeSingle();
+
       return {
         gha_id: gha.id,
         gha_code: gha.gha_code,
@@ -8759,6 +8793,8 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         all_time_confirmed: (allConfirmed || []).length,
         fee_per_inspection: fee,
         total_inspection_payment: totalPayment,
+        is_paid: payRecord?.payment_status === 'paid',
+        paid_at: payRecord?.paid_at || null,
         inspections: monthInspections,
       };
     }));
@@ -11261,6 +11297,46 @@ app.post('/api/sa/clear-notifications', async (req, res) => {
 
     res.json({ success: true });
   } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/mark-inspection-payment-paid - manually mark a GHA's inspection fee as paid
+app.post('/api/admin/mark-inspection-payment-paid', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { gha_id, month, amount, inspection_count } = req.body;
+    if (!gha_id || !month) return res.status(400).json({ error: 'gha_id and month required' });
+
+    var now = new Date().toISOString();
+
+    // Record in staff_payments table
+    const { error: payErr } = await adminClient
+      .from('staff_payments')
+      .upsert([{
+        staff_id: gha_id,
+        staff_type: 'GHA',
+        month_year: month,
+        inspection_count: inspection_count || 0,
+        inspection_payment: parseFloat(amount || 0),
+        total_payment: parseFloat(amount || 0),
+        payment_status: 'paid',
+        paid_at: now,
+        paid_by: admin.id,
+        updated_at: now,
+      }], { onConflict: 'staff_id,month_year' });
+
+    if (payErr) {
+      console.error('Staff payment record error:', payErr.message);
+      return res.status(500).json({ error: payErr.message });
+    }
+
+    console.log('Inspection payment marked paid - GHA:', gha_id, '| month:', month, '| amount:', amount);
+    res.json({ success: true, message: 'Inspection payment marked as paid' });
+  } catch(err) {
+    console.error('Mark inspection payment paid error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
