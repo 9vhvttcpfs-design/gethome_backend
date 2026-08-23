@@ -6995,7 +6995,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         if (agentSubErr) console.error('Agents subscription update failed:', agentSubErr.message);
 
         // Also update profiles table for any reads that check there
-        const { error: profileSubErr } = await adminClient
+        const { data: updatedProfile, error: profileSubErr } = await adminClient
           .from('profiles')
           .update({
             subscription_tier: tier,
@@ -7004,8 +7004,15 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             subscription_amount: amount,
             subscription_status: 'active',
           })
-          .eq('id', agentId);
-        if (profileSubErr) console.error('Profiles subscription update failed:', profileSubErr.message);
+          .eq('id', agentId)
+          .select('id, email, subscription_tier, subscription_status')
+          .single();
+
+        if (profileSubErr) {
+          console.error('CRITICAL: Profiles subscription update failed:', profileSubErr.message, '| agent:', agentId);
+        } else {
+          console.log('Profiles subscription verified:', updatedProfile?.email, '| tier:', updatedProfile?.subscription_tier, '| status:', updatedProfile?.subscription_status);
+        }
 
         if (agentSubErr && profileSubErr) {
           console.error('Subscription update failed on both tables (non-blocking):', agentSubErr.message, profileSubErr.message);
@@ -7202,7 +7209,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         var expiryISO = expiryDate.toISOString();
 
         // Update profiles with ALL fields the agent portal reads
-        const { error: profileErr } = await adminClient
+        const { data: unlimitedProfile, error: profileErr } = await adminClient
           .from('profiles')
           .update({
             is_unlimited: true,
@@ -7214,8 +7221,15 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             subscription_end: expiryISO,
             subscription_amount: unlimitedAmount,
           })
-          .eq('id', unlimitedAgentId);
-        if (profileErr) console.error('Unlimited plan profiles update failed:', profileErr.message);
+          .eq('id', unlimitedAgentId)
+          .select('id, email, is_unlimited, subscription_tier')
+          .single();
+
+        if (profileErr) {
+          console.error('CRITICAL: Unlimited plan profiles update failed:', profileErr.message, '| agent:', unlimitedAgentId);
+        } else {
+          console.log('Unlimited plan verified:', unlimitedProfile?.email, '| is_unlimited:', unlimitedProfile?.is_unlimited, '| tier:', unlimitedProfile?.subscription_tier);
+        }
 
         // Update agents table
         await adminClient.from('agents').update({
