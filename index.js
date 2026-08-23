@@ -237,36 +237,26 @@ async function getInspectionFeeForCount(confirmedCount) {
 // to the global rate in app_settings, then to a safe 5% default.
 async function getStaffCommissionRate(staffId, staffType) {
   try {
-    // Always fetch fresh from the database - never use a cached value
     var table = staffType === 'GHA' ? 'gha_agents' : 'service_agents';
-
-    const { data: staffData } = await adminClient
-      .from(table)
-      .select('commission_rate')
-      .eq('id', staffId)
-      .single();
-
-    var individualRate = staffData?.commission_rate;
-
-    // Get global rate from settings
     var settingKey = staffType === 'GHA' ? 'gha_commission_rate' : 'sa_commission_rate';
-    const { data: globalSetting } = await adminClient
-      .from('app_settings')
-      .select('setting_value')
-      .eq('setting_key', settingKey)
-      .single();
-    var globalRate = parseFloat(globalSetting?.setting_value || 5);
 
-    // Individual rate overrides global only if explicitly set and different
-    var effectiveRate = (individualRate && individualRate !== globalRate)
-      ? parseFloat(individualRate)
-      : globalRate;
+    // Fetch both in parallel
+    const [staffResult, globalResult] = await Promise.all([
+      adminClient.from(table).select('commission_rate').eq('id', staffId).single(),
+      adminClient.from('app_settings').select('setting_value').eq('setting_key', settingKey).single(),
+    ]);
 
-    console.log('Commission rate for', staffType, staffId, '| individual:', individualRate, '| global:', globalRate, '| effective:', effectiveRate);
+    var individualRate = parseFloat(staffResult?.data?.commission_rate || 0);
+    var globalRate = parseFloat(globalResult?.data?.setting_value || 5);
+
+    // Individual rate takes priority if explicitly set (> 0)
+    var effectiveRate = individualRate > 0 ? individualRate : globalRate;
+
+    console.log('Commission rate -', staffType, staffId, '| individual:', individualRate, '| global:', globalRate, '| using:', effectiveRate);
     return effectiveRate;
   } catch(err) {
     console.error('getStaffCommissionRate error:', err.message);
-    return 5; // safe fallback
+    return 5;
   }
 }
 // Revokes unlimited_listings for any agent whose unlimited_expires_at has passed.
@@ -7879,7 +7869,7 @@ app.get('/api/gha/monthly-history', async (req, res) => {
     // so unlimited-plan earnings are included alongside premium/agency ones.
     const { data: ghaMonthlyEarnings } = await adminClient
       .from('gha_earnings')
-      .select('commission_amount, subscription_amount, commission_rate, agent_id, month_year, is_paid, created_at')
+      .select('commission_amount, subscription_amount, commission_rate, agent_id, agent_email, month_year, is_paid, created_at')
       .eq('gha_id', session.staff_id)
       .eq('month_year', month);
 
@@ -7889,6 +7879,10 @@ app.get('/api/gha/monthly-history', async (req, res) => {
     const totalCommission = (ghaMonthlyEarnings || []).reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
+    const totalPaid = (ghaMonthlyEarnings || []).filter(function(e) { return e.is_paid; }).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+    const agentsCount = (ghaMonthlyEarnings || []).length;
 
     // monthly_agent_snapshots.commission_generated is a point-in-time value
     // written by the take_monthly_snapshot() DB function and can read 0 for
@@ -7917,6 +7911,8 @@ app.get('/api/gha/monthly-history', async (req, res) => {
       earnings: ghaMonthlyEarnings || [],
       total_revenue: totalRevenue,
       total_commission: totalCommission,
+      total_paid: totalPaid,
+      agents_count: agentsCount,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
