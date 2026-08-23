@@ -5704,13 +5704,45 @@ app.get('/api/properties', async (req, res) => {
       console.error('Supabase properties error:', error.message, '| code:', error.code);
       return res.status(500).json({ error: error.message });
     }
+
+    // Batch-enrich with the listing agent's profile photo/phone so the
+    // customer-facing fee-breakdown card can show who listed the property.
+    // agent_display_name is already denormalized onto the row at upload time
+    // (see POST /api/properties), but agent_photo_url/agent_phone are not, so
+    // those are joined in here from profiles instead.
+    const agentIds = [...new Set(data.map(p => p.created_by).filter(Boolean))];
+    let agentProfilesById = {};
+    if (agentIds.length > 0) {
+      const { data: agentProfiles, error: profErr } = await adminClient
+        .from('profiles')
+        .select('id, full_name, agency_name, agent_type, profile_photo_url, phone')
+        .in('id', agentIds);
+      if (profErr) {
+        console.error('Properties agent enrichment error:', profErr.message);
+      } else {
+        agentProfilesById = Object.fromEntries((agentProfiles || []).map(a => [a.id, a]));
+      }
+    }
+
     const out = data.map(p => {
       const rent    = parseFloat(p.rent)           || 0;
       const agency  = parseFloat(p.agency_fee)     || 0;
       const agree   = parseFloat(p.agreement_fee)  || 0;
       const caution = parseFloat(p.caution_fee)    || 0;
       const svc     = parseFloat(p.service_charge) || 0;
-      return { ...p, rent, agency_fee: agency, agreement_fee: agree, caution_fee: caution, service_charge: svc, total_payment: rent + agency + agree + caution + svc };
+      const agentProf = agentProfilesById[p.created_by];
+      const displayName = p.agent_display_name || (agentProf
+        ? (agentProf.agent_type === 'agency' ? (agentProf.agency_name || 'Agency') : (agentProf.full_name || 'Agent'))
+        : null);
+      return {
+        ...p,
+        rent, agency_fee: agency, agreement_fee: agree, caution_fee: caution, service_charge: svc,
+        total_payment: rent + agency + agree + caution + svc,
+        agent_display_name: displayName,
+        agent_photo_url: agentProf?.profile_photo_url || null,
+        agent_phone: agentProf?.phone || null,
+        agent_type: p.agent_type || agentProf?.agent_type || null,
+      };
     });
     res.json(out);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -7858,11 +7890,29 @@ app.get('/api/gha/monthly-history', async (req, res) => {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
 
+    // monthly_agent_snapshots.commission_generated is a point-in-time value
+    // written by the take_monthly_snapshot() DB function and can read 0 for
+    // agents it didn't have a commission figure for at snapshot time. Prefer
+    // the live commission_amount from gha_earnings (the actual paid-commission
+    // ledger) per agent when one exists, so the per-agent row matches the
+    // total_commission figure above instead of showing a stale/blank amount.
+    const commissionByAgent = {};
+    (ghaMonthlyEarnings || []).forEach(function(e) {
+      if (e.agent_id) commissionByAgent[e.agent_id] = parseFloat(e.commission_amount || 0);
+    });
+    const enrichedSnaps = (agentSnaps || []).map(function(s) {
+      var key = s.agent_id || s.id;
+      var liveCommission = commissionByAgent[key];
+      return Object.assign({}, s, {
+        commission_generated: liveCommission !== undefined ? liveCommission : s.commission_generated,
+      });
+    });
+
     console.log('GHA monthly history', month, '| earnings rows:', (ghaMonthlyEarnings || []).length, '| total commission:', totalCommission);
 
     res.json({
       month,
-      agent_snapshots: agentSnaps || [],
+      agent_snapshots: enrichedSnaps,
       available_months: months,
       earnings: ghaMonthlyEarnings || [],
       total_revenue: totalRevenue,
