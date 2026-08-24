@@ -3866,8 +3866,27 @@ app.get('/api/admin/earnings', async (req, res) => {
       sa_name: saMap[e.sa_id]?.full_name || 'Unknown',
     }));
 
-    const ghaTotal = ghaList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
-    const saTotal  = saList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    // "Due" totals must only count unpaid rows - once a GHA/SA is marked paid for
+    // the month, those rows flip is_paid:true and should drop out of what's owed
+    // instead of continuing to inflate the dashboard total.
+    const ghaUnpaidList = ghaList.filter(e => !e.is_paid);
+    const saUnpaidList  = saList.filter(e => !e.is_paid);
+    const ghaTotal = ghaUnpaidList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+    const saTotal  = saUnpaidList.reduce((sum, e) => sum + (parseFloat(e.commission_amount) || 0), 0);
+
+    // All-time paid history (across all months, not just the queried one)
+    const { data: paidGha } = await adminClient
+      .from('gha_earnings')
+      .select('gha_id, commission_amount, month_year, paid_at')
+      .eq('is_paid', true)
+      .order('paid_at', { ascending: false });
+    const { data: paidSa } = await adminClient
+      .from('sa_earnings')
+      .select('sa_id, commission_amount, month_year, paid_at')
+      .eq('is_paid', true)
+      .order('paid_at', { ascending: false });
+
+    console.log('Admin earnings', month, '| unpaid GHA rows:', ghaUnpaidList.length, '| unpaid SA rows:', saUnpaidList.length, '| paid GHA rows (all-time):', (paidGha || []).length, '| paid SA rows (all-time):', (paidSa || []).length);
 
     res.json({
       month,
@@ -3876,6 +3895,8 @@ app.get('/api/admin/earnings', async (req, res) => {
       gha_total: ghaTotal,
       sa_total: saTotal,
       grand_total: ghaTotal + saTotal,
+      gha_paid_history: paidGha || [],
+      sa_paid_history: paidSa || [],
     });
   } catch (err) {
     console.error('Earnings endpoint exception:', err.message);
@@ -7266,9 +7287,15 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         // Get agent's GHA and SA for commission
         const { data: agentProfile } = await adminClient
           .from('profiles')
-          .select('gha_id, sa_id, email, full_name')
+          .select('gha_id, sa_id, email, full_name, subscription_amount')
           .eq('id', unlimitedAgentId)
           .single();
+
+        console.log('Unlimited agent profile:', JSON.stringify(agentProfile));
+
+        if (!agentProfile?.gha_id && !agentProfile?.sa_id) {
+          console.error('CRITICAL: Agent has no GHA or SA linked - cannot create earnings. Agent:', unlimitedAgentId);
+        }
 
         var monthYear = getBillingMonth();
 
@@ -7707,6 +7734,29 @@ app.get('/api/admin/monthly-history', async (req, res) => {
       .select('sa_id, commission_amount, subscription_amount, is_paid, commission_rate')
       .eq('month_year', month);
 
+    var totalGhaCommission = (allGhaEarnings || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+
+    var totalSaCommission = (allSaEarnings || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+
+    // Confirmed inspections for the month - sa_confirmed_at can be null on some
+    // records, so fall back to created_at and filter in JS (mirrors the pattern
+    // used in /api/admin/staff-payments) rather than a Postgres date range.
+    const { data: monthConfirmedInspections } = await adminClient
+      .from('inspections')
+      .select('id, gha_id, status, sa_confirmed_at, created_at')
+      .eq('status', 'confirmed');
+
+    var totalInspections = (monthConfirmedInspections || []).filter(function(i) {
+      var d = i.sa_confirmed_at || i.created_at;
+      return d && d.startsWith(month);
+    }).length;
+
+    console.log('Monthly history', month, '| GHA commission:', totalGhaCommission, '| SA commission:', totalSaCommission, '| inspections:', totalInspections);
+
     // Group by GHA
     var ghaEarningsMap = {};
     (allGhaEarnings || []).forEach(function(e) {
@@ -7769,6 +7819,11 @@ app.get('/api/admin/monthly-history', async (req, res) => {
         agency_count: agencyCount,
         unlimited_count: unlimitedCount,
       },
+      gha_commission: totalGhaCommission,
+      sa_commission: totalSaCommission,
+      total_inspections: totalInspections,
+      gha_earnings: allGhaEarnings || [],
+      sa_earnings: allSaEarnings || [],
     });
   } catch (err) {
     console.error('Monthly history error:', err.message);
