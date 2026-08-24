@@ -233,8 +233,9 @@ async function getInspectionFeeForCount(confirmedCount) {
   }
 }
 // Gets the current commission rate for a staff member: checks their individual
-// override first (gha_agents/service_agents.commission_rate), then falls back
-// to the global rate in app_settings, then to a safe 5% default.
+// override first - commission_rate_override if explicitly set, else the plain
+// commission_rate column (gha_agents/service_agents) - then falls back to the
+// global rate in app_settings, then to a safe 5% default.
 async function getStaffCommissionRate(staffId, staffType) {
   try {
     var table = staffType === 'GHA' ? 'gha_agents' : 'service_agents';
@@ -242,17 +243,19 @@ async function getStaffCommissionRate(staffId, staffType) {
 
     // Fetch both in parallel
     const [staffResult, globalResult] = await Promise.all([
-      adminClient.from(table).select('commission_rate').eq('id', staffId).single(),
+      adminClient.from(table).select('commission_rate, commission_rate_override').eq('id', staffId).single(),
       adminClient.from('app_settings').select('setting_value').eq('setting_key', settingKey).single(),
     ]);
 
+    var overrideRate = parseFloat(staffResult?.data?.commission_rate_override || 0);
     var individualRate = parseFloat(staffResult?.data?.commission_rate || 0);
     var globalRate = parseFloat(globalResult?.data?.setting_value || 5);
 
-    // Individual rate takes priority if explicitly set (> 0)
-    var effectiveRate = individualRate > 0 ? individualRate : globalRate;
+    // commission_rate_override wins if explicitly set (> 0), then plain
+    // commission_rate, then the global setting
+    var effectiveRate = overrideRate > 0 ? overrideRate : (individualRate > 0 ? individualRate : globalRate);
 
-    console.log('Commission rate -', staffType, staffId, '| individual:', individualRate, '| global:', globalRate, '| using:', effectiveRate);
+    console.log('Commission rate -', staffType, staffId, '| override:', overrideRate, '| individual:', individualRate, '| global:', globalRate, '| using:', effectiveRate);
     return effectiveRate;
   } catch(err) {
     console.error('getStaffCommissionRate error:', err.message);
@@ -1168,12 +1171,10 @@ app.post('/api/staff/login', async (req, res) => {
     const token = require('crypto').randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
-    // Delete all previous sessions for this staff member before creating a new one
-    await serviceClient.from('staff_sessions')
-      .delete()
-      .eq('staff_id', staff.id);
-    console.log('Cleared old sessions for:', staffId);
-
+    // Previous sessions are kept (not deleted) so staff_sessions accumulates real
+    // login history for attendance scoring — see calculateAttendanceScore(). Expired
+    // rows are excluded everywhere sessions are looked up via the expires_at filter,
+    // so this doesn't grant old tokens any renewed validity.
     await serviceClient.from('staff_sessions').insert([{
       staff_id: staff.id,
       staff_role: role,
@@ -2408,10 +2409,13 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     if (inspectionsResult.error) console.error('GHA overview inspections count error:', inspectionsResult.error.message);
 
     var monthEarnings = monthEarningsResult.data || [];
-    var monthlyCommission = monthEarnings.reduce(function(sum, e) {
+    // Dashboard should only ever show what's still owed, not what's already been paid out.
+    var unpaidMonthEarnings = monthEarnings.filter(function(e) { return !e.is_paid; });
+    var monthlyCommission = unpaidMonthEarnings.reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
     var isPaid = monthEarnings.length > 0 && monthEarnings.every(function(e) { return e.is_paid; });
+    console.log('GHA pending commission:', monthlyCommission, '| unpaid rows:', unpaidMonthEarnings.length, '| total rows:', monthEarnings.length);
 
     var ghaInfo = ghaInfoResult.data;
 
@@ -2921,12 +2925,15 @@ app.get('/api/sa/overview', async (req, res) => {
       .eq('sa_id', session.staff_id)
       .eq('month_year', billingMonth);
 
-    var monthlyEarnings = (saEarnings || []).reduce(function(sum, e) {
+    // Dashboard should only ever show what's still owed, not what's already been paid out.
+    var unpaidSaEarnings = (saEarnings || []).filter(function(e) { return !e.is_paid; });
+    var monthlyEarnings = unpaidSaEarnings.reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
 
     var earningsPaid = (saEarnings || []).length > 0 &&
       (saEarnings || []).every(function(e) { return e.is_paid; });
+    console.log('SA pending commission:', monthlyEarnings, '| unpaid rows:', unpaidSaEarnings.length, '| total rows:', (saEarnings || []).length);
 
     // Pending agents awaiting approval
     const { count: pendingCount } = await adminClient
@@ -7877,6 +7884,12 @@ app.get('/api/sa/monthly-history', async (req, res) => {
     var totalRevenue = (saMonthlyEarnings || []).reduce(function(sum, e) {
       return sum + parseFloat(e.subscription_amount || 0);
     }, 0);
+    var totalPaid = (saMonthlyEarnings || []).filter(function(e) { return e.is_paid; }).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+    var totalPending = (saMonthlyEarnings || []).filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
 
     console.log('SA monthly history', month, '| earnings rows:', (saMonthlyEarnings || []).length, '| total commission:', totalCommission);
 
@@ -7888,6 +7901,8 @@ app.get('/api/sa/monthly-history', async (req, res) => {
       earnings: saMonthlyEarnings || [],
       total_commission: totalCommission,
       total_revenue: totalRevenue,
+      total_paid: totalPaid,
+      total_pending: totalPending,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -7937,6 +7952,9 @@ app.get('/api/gha/monthly-history', async (req, res) => {
     const totalPaid = (ghaMonthlyEarnings || []).filter(function(e) { return e.is_paid; }).reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
+    const totalPending = (ghaMonthlyEarnings || []).filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
     const agentsCount = (ghaMonthlyEarnings || []).length;
 
     // monthly_agent_snapshots.commission_generated is a point-in-time value
@@ -7967,6 +7985,7 @@ app.get('/api/gha/monthly-history', async (req, res) => {
       total_revenue: totalRevenue,
       total_commission: totalCommission,
       total_paid: totalPaid,
+      total_pending: totalPending,
       agents_count: agentsCount,
     });
   } catch (err) {
@@ -8300,14 +8319,124 @@ app.get('/api/admin/all-ratings', async (req, res) => {
   }
 });
 
+// Auto-calculate attendance from staff_sessions login data. staff_sessions now
+// accumulates every login (see /api/staff/login) instead of being wiped on each
+// new one, so this reflects real login activity for the given month.
+async function calculateAttendanceScore(staffId, staffType, monthYear) {
+  try {
+    var monthStart = monthYear + '-01';
+    var nextMonth = new Date(monthYear + '-01T00:00:00Z');
+    nextMonth.setUTCMonth(nextMonth.getUTCMonth() + 1);
+    var monthEnd = nextMonth.toISOString().slice(0, 10);
+
+    // Count unique days logged in this month
+    const { data: sessions } = await adminClient
+      .from('staff_sessions')
+      .select('created_at')
+      .eq('staff_id', staffId)
+      .gte('created_at', monthStart)
+      .lt('created_at', monthEnd);
+
+    if (!sessions || sessions.length === 0) {
+      console.log('No sessions found for attendance:', staffType, staffId, monthYear);
+      return null;
+    }
+
+    // Count unique days with logins
+    var uniqueDays = new Set(
+      sessions.map(function(s) { return s.created_at.slice(0, 10); })
+    ).size;
+
+    // Working days in the month - actual Mon-Fri count, not an approximation
+    var targetMonth = new Date(monthYear + '-01T00:00:00Z').getUTCMonth();
+    var d = new Date(monthYear + '-01T00:00:00Z');
+    var workingDays = 0;
+    while (d.getUTCMonth() === targetMonth) {
+      var day = d.getUTCDay();
+      if (day !== 0 && day !== 6) workingDays++;
+      d.setUTCDate(d.getUTCDate() + 1);
+    }
+
+    var attendanceRate = Math.min(100, Math.round((uniqueDays / workingDays) * 100 * 10) / 10);
+    console.log('Attendance -', staffType, staffId, '| logins:', uniqueDays, '| working days:', workingDays, '| score:', attendanceRate + '%');
+    return attendanceRate;
+  } catch (err) {
+    console.error('Attendance calc error:', err.message);
+    return null;
+  }
+}
+
 app.post('/api/admin/calculate-kpis', async (req, res) => {
   try {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
     const month = req.body.month || new Date().toISOString().slice(0, 7);
-    const { data, error } = await adminClient.rpc('calculate_staff_kpis', { target_month: month });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
+
+    const [{ data: ghas }, { data: sas }] = await Promise.all([
+      adminClient.from('gha_agents').select('id, gha_code, full_name, location, sa_id'),
+      adminClient.from('service_agents').select('id, sa_code, full_name, location'),
+    ]);
+
+    const staffList = [
+      ...(ghas || []).map(function(g) { return { id: g.id, code: g.gha_code, name: g.full_name, location: g.location, type: 'GHA' }; }),
+      ...(sas || []).map(function(s) { return { id: s.id, code: s.sa_code, name: s.full_name, location: s.location, type: 'SA' }; }),
+    ];
+
+    // Step 1: write auto-calculated attendance BEFORE calling the RPC, so its
+    // overall_score computation (which reads attendance_score off staff_kpis)
+    // sees the fresh value instead of running against last month's leftovers.
+    // A staff/month row with an attendance_score already set is left alone -
+    // that's either a manual correction via POST /api/admin/staff-kpis, or an
+    // earlier auto-write for this same month; neither should be silently redone.
+    await Promise.all(staffList.map(async function(staff) {
+      var autoScore = await calculateAttendanceScore(staff.id, staff.type, month);
+      if (autoScore == null) return; // no login data this month - leave whatever is already there
+
+      const { data: existingKpi } = await adminClient
+        .from('staff_kpis')
+        .select('attendance_score')
+        .eq('staff_id', staff.id)
+        .eq('month_year', month)
+        .maybeSingle();
+
+      if (existingKpi?.attendance_score != null) {
+        console.log(staff.type, 'manual/existing attendance kept:', staff.code, existingKpi.attendance_score + '%');
+        return;
+      }
+
+      const { error: attErr } = await adminClient.from('staff_kpis').upsert([{
+        staff_id: staff.id,
+        staff_type: staff.type,
+        staff_code: staff.code,
+        staff_name: staff.name,
+        month_year: month,
+        attendance_score: autoScore,
+        updated_at: new Date().toISOString(),
+      }], { onConflict: 'staff_id,month_year' });
+      if (attErr) console.error('Attendance upsert failed for', staff.code, ':', attErr.message);
+      else console.log(staff.type, 'auto-attendance written:', staff.code, autoScore + '%');
+    }));
+
+    // Step 2: attendance values are committed - now let the RPC compute the
+    // other KPI fields and roll everything (including the attendance we just
+    // wrote) into overall_score.
+    const { data: kpiResult, error: kpiErr } = await adminClient
+      .rpc('calculate_staff_kpis', { target_month: month });
+    if (kpiErr) return res.status(500).json({ error: kpiErr.message });
+
+    // Step 3: return the final per-staff rows for this month
+    const { data: finalScores } = await adminClient
+      .from('staff_kpis')
+      .select('*')
+      .eq('month_year', month)
+      .order('staff_type');
+
+    res.json({
+      success: true,
+      month,
+      scores: finalScores || [],
+      rpc_result: kpiResult,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -8598,7 +8727,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     // ── GHA PAYMENTS ────────────────────────────────
     const { data: ghas } = await adminClient
       .from('gha_agents')
-      .select('id, gha_code, full_name, email, sa_id, commission_rate, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
+      .select('id, gha_code, full_name, email, location, sa_id, commission_rate, commission_rate_override, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
 
     // Global fallback rate, kept only to label each GHA's rate source below
     const { data: ghaRateSetting } = await adminClient
@@ -8692,7 +8821,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
 
       // Current commission rate (individual override, else global setting) — for display
       const commissionRate = await getStaffCommissionRate(gha.id, 'GHA');
-      const commissionRateSource = (gha.commission_rate && parseFloat(gha.commission_rate) !== globalGhaRate) ? 'individual' : 'global';
+      const commissionRateSource = ((gha.commission_rate_override && parseFloat(gha.commission_rate_override) > 0) || (gha.commission_rate && parseFloat(gha.commission_rate) !== globalGhaRate)) ? 'individual' : 'global';
 
       const totalPayment = inspPayment + commissionTotal;
       console.log('GHA', gha.gha_code, '| inspections:', count, '| insp pay:', inspPayment, '| commission:', commissionTotal, '| total:', totalPayment);
@@ -8727,6 +8856,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         gha_code: gha.gha_code,
         gha_name: gha.full_name,
         staff_email: gha.email,
+        location: gha.location || null,
         sa_code: gha.service_agents?.sa_code || null,
         sa_name: gha.service_agents?.full_name || null,
         bank_name: gha.bank_name || null,
@@ -8759,7 +8889,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
     // ── SA PAYMENTS ─────────────────────────────────
     const { data: sas } = await adminClient
       .from('service_agents')
-      .select('id, sa_code, full_name, email, commission_rate, bank_name, account_number, account_name, bank_code');
+      .select('id, sa_code, full_name, email, location, whatsapp_number, commission_rate, commission_rate_override, bank_name, account_number, account_name, bank_code');
 
     // Global fallback rate, kept only to label each SA's rate source below
     const { data: saRateSetting } = await adminClient
@@ -8797,7 +8927,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
 
       // Current commission rate (individual override, else global setting) — for display
       const commissionRate = await getStaffCommissionRate(sa.id, 'SA');
-      const commissionRateSource = (sa.commission_rate && parseFloat(sa.commission_rate) !== globalSaRate) ? 'individual' : 'global';
+      const commissionRateSource = ((sa.commission_rate_override && parseFloat(sa.commission_rate_override) > 0) || (sa.commission_rate && parseFloat(sa.commission_rate) !== globalSaRate)) ? 'individual' : 'global';
 
       // SA inspection oversight bonus (optional: ₦500 per confirmed inspection under them)
       const { count: confirmedCount } = await adminClient
@@ -8838,6 +8968,8 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         sa_code: sa.sa_code,
         sa_name: sa.full_name,
         staff_email: sa.email,
+        location: sa.location || null,
+        whatsapp_number: sa.whatsapp_number || null,
         bank_name: sa.bank_name || null,
         account_number: sa.account_number || null,
         account_name: sa.account_name || null,
@@ -11538,3 +11670,36 @@ app.listen(PORT, () => console.log(` GetHome backend running on port ${PORT}`));
 // Sweep for expired unlimited-listing plans on startup, then every hour
 checkAndExpireUnlimitedPlans();
 setInterval(checkAndExpireUnlimitedPlans, 60 * 60 * 1000);
+
+// Clean up expired staff sessions daily. staff_sessions is no longer wiped on
+// each login (see /api/staff/login) so it can back attendance calculation off
+// real history - this keeps it from growing unbounded once that history is
+// older than any attendance lookup needs.
+// Runs every 24 hours - removes sessions expired more than 35 days ago, which
+// keeps the current month's data plus the prior month for monthly history
+// lookups, and discards everything older than that.
+var SESSION_CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+
+async function cleanupExpiredSessions() {
+  try {
+    var cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 35);
+
+    const { error, count } = await adminClient
+      .from('staff_sessions')
+      .delete({ count: 'exact' })
+      .lt('expires_at', cutoff.toISOString());
+
+    if (error) {
+      console.error('Session cleanup error:', error.message);
+    } else {
+      console.log('Session cleanup completed - removed', count || 0, 'expired sessions older than 35 days');
+    }
+  } catch (err) {
+    console.error('Session cleanup exception:', err.message);
+  }
+}
+
+// Run once on startup then every 24 hours
+cleanupExpiredSessions();
+setInterval(cleanupExpiredSessions, SESSION_CLEANUP_INTERVAL);
