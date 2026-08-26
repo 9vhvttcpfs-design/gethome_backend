@@ -7282,6 +7282,25 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
       console.log('Unlimited plan payment received - agent:', unlimitedAgentId, '| amount:', unlimitedAmount);
 
+      if (!unlimitedAgentId) {
+        // Last resort - find agent by customerEmail
+        console.error('metaAgentId is null - attempting lookup by customerEmail:', customerEmail);
+        if (customerEmail) {
+          const { data: emailLookup } = await adminClient
+            .from('profiles')
+            .select('id')
+            .eq('email', customerEmail)
+            .eq('role', 'agent')
+            .single();
+          if (emailLookup?.id) {
+            unlimitedAgentId = emailLookup.id;
+            console.log('Found agent by email:', customerEmail, '| id:', unlimitedAgentId);
+          } else {
+            console.error('CRITICAL: Cannot find agent by email either:', customerEmail);
+          }
+        }
+      }
+
       if (unlimitedAgentId) {
         // Duration is admin-configurable via app_settings (unlimited_plan_duration_months),
         // falling back to 6 months if unset/invalid.
