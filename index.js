@@ -1325,6 +1325,11 @@ app.get('/api/gha/profile', async (req, res) => {
       sa_email: sa.email || null,
       sa_whatsapp: sa.whatsapp_number || null,
       agent_count: agentCount || 0,
+      bank_name: ghaRecord.bank_name || null,
+      account_number: ghaRecord.account_number || null,
+      account_name: ghaRecord.account_name || null,
+      bank_code: ghaRecord.bank_code || null,
+      has_bank_details: !!(ghaRecord.bank_name && ghaRecord.account_number),
     });
   } catch (err) {
     console.error('GHA profile error:', err.message);
@@ -2352,25 +2357,17 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
 
     // GHA commission rate (individual override, else global setting)
     var commissionRate = await getStaffCommissionRate(ghaId, 'GHA');
-    var totalCommission = Math.round(totalRevenue * (commissionRate / 100));
 
     // Current billing month, for this month's earnings from gha_earnings
-    var billingMonth = (function() {
-      var d = new Date();
-      if (d.getDate() >= 28) {
-        var next = new Date(d.getFullYear(), d.getMonth() + 1, 1);
-        return next.toISOString().slice(0, 7);
-      }
-      return d.toISOString().slice(0, 7);
-    })();
+    var billingMonth = getBillingMonth();
 
     // Run remaining queries in parallel
-    const [monthEarningsResult, inspectionsResult, ghaInfoResult, soldResult, activeResult] = await Promise.all([
+    const [allEarningsResult, inspectionsResult, ghaInfoResult, soldResult, activeResult] = await Promise.all([
       adminClient
         .from('gha_earnings')
-        .select('commission_amount, is_paid')
+        .select('commission_amount, subscription_amount, is_paid, paid_at, month_year')
         .eq('gha_id', ghaId)
-        .eq('month_year', billingMonth),
+        .order('month_year', { ascending: false }),
 
       adminClient
         .from('inspections')
@@ -2407,14 +2404,30 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     if (soldResult.error) console.error('GHA overview sold count error:', soldResult.error.message);
     if (activeResult.error) console.error('GHA overview active count error:', activeResult.error.message);
     if (inspectionsResult.error) console.error('GHA overview inspections count error:', inspectionsResult.error.message);
+    if (allEarningsResult.error) console.error('GHA overview earnings fetch error:', allEarningsResult.error.message);
 
-    var monthEarnings = monthEarningsResult.data || [];
+    var allEarnings = allEarningsResult.data || [];
+
+    // Lifetime totals across every month, paid + unpaid
+    var totalEverEarned = allEarnings.reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+    var totalPaid = allEarnings.filter(function(e) { return e.is_paid; }).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+    var totalPending = allEarnings.filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+
+    // Current billing month only, for the "owed this month" / paid-status fields
+    var monthEarnings = allEarnings.filter(function(e) { return e.month_year === billingMonth; });
     // Dashboard should only ever show what's still owed, not what's already been paid out.
     var unpaidMonthEarnings = monthEarnings.filter(function(e) { return !e.is_paid; });
     var monthlyCommission = unpaidMonthEarnings.reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
     var isPaid = monthEarnings.length > 0 && monthEarnings.every(function(e) { return e.is_paid; });
+    console.log('GHA overview earnings - total ever:', totalEverEarned, '| paid:', totalPaid, '| pending:', totalPending);
     console.log('GHA pending commission:', monthlyCommission, '| unpaid rows:', unpaidMonthEarnings.length, '| total rows:', monthEarnings.length);
 
     var ghaInfo = ghaInfoResult.data;
@@ -2425,7 +2438,10 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
       expired_subscriptions: expiredAgents.length,
       free_agents: freeAgents.length,
       total_revenue: totalRevenue,
-      total_commission: totalCommission,
+      total_commission: totalPending,
+      total_ever_earned: totalEverEarned,
+      total_paid_out: totalPaid,
+      pending_commission: totalPending,
       commission_rate: commissionRate,
       monthly_commission: monthlyCommission,
       commission_paid: isPaid,
@@ -6899,7 +6915,22 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           return Math.abs(paid - expected) <= Math.max(expected * tol, 50);
         };
 
-        if (within(amount, unlimitedPrice)) {
+        if (within(amount, unlimitedPrice) && within(amount, premiumPrice)) {
+          // Unlimited and premium prices coincide (e.g. testing with a token amount) -
+          // use the agent's current subscription tier to disambiguate the payment's intent.
+          if (agentProf.subscription_tier === 'premium' || agentProf.subscription_tier === 'agency') {
+            // Already on a paid plan - this payment is an upgrade to unlimited
+            paymentType = 'unlimited_plan';
+            console.log('Tiebreaker: agent on', agentProf.subscription_tier, '- treating as unlimited upgrade');
+          } else if (agentProf.subscription_tier === 'unlimited') {
+            paymentType = 'unlimited_plan';
+            console.log('Tiebreaker: unlimited renewal');
+          } else {
+            paymentType = 'unlimited_plan';
+            console.log('Tiebreaker: free agent - defaulting to unlimited');
+          }
+          metaAgentId = agentProf.id;
+        } else if (within(amount, unlimitedPrice)) {
           paymentType = 'unlimited_plan';
           metaAgentId = agentProf.id;
           console.log('Fallback: unlimited_plan match');
@@ -7226,8 +7257,12 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
     // Handle unlimited plan payment
     if (status === 'successful' && paymentType === 'unlimited_plan') {
+      console.log('=== UNLIMITED PLAN WEBHOOK START ===');
+      console.log('metaAgentId:', metaAgentId);
+      console.log('customerEmail:', customerEmail);
+      console.log('amount:', amount);
+      console.log('paymentType:', paymentType);
       var unlimitedAgentId = metaAgentId;
-      var txRef = txRef || null;
 
       // Use verified amount from Flutterwave - never use a cached/stale value
       var unlimitedAmount = parseFloat(verifiedData?.amount || event?.data?.amount || 0);
@@ -7299,6 +7334,9 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           .single();
 
         console.log('Unlimited agent profile:', JSON.stringify(agentProfile));
+        console.log('Agent profile fetched:', JSON.stringify(agentProfile));
+        console.log('GHA ID:', agentProfile?.gha_id);
+        console.log('SA ID:', agentProfile?.sa_id);
 
         if (!agentProfile?.gha_id && !agentProfile?.sa_id) {
           console.error('CRITICAL: Agent has no GHA or SA linked - cannot create earnings. Agent:', unlimitedAgentId);
@@ -7321,6 +7359,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             month_year: monthYear,
             is_paid: false,
           }], { onConflict: 'gha_id,agent_id,month_year' });
+          console.log('GHA earnings result - error:', JSON.stringify(ghaErr), '| success:', !ghaErr);
           if (ghaErr) console.error('GHA unlimited earnings FAILED:', ghaErr.message);
           else console.log('GHA unlimited earnings saved successfully');
         } else {
@@ -7342,6 +7381,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             month_year: monthYear,
             is_paid: false,
           }], { onConflict: 'sa_id,agent_id,month_year' });
+          console.log('SA earnings result - error:', JSON.stringify(saErr), '| success:', !saErr);
           if (saErr) console.error('SA unlimited earnings FAILED:', saErr.message);
           else console.log('SA unlimited earnings saved successfully');
         } else {
@@ -7361,6 +7401,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
         console.log('Unlimited plan activated for agent:', unlimitedAgentId, '| expires:', expiryISO);
       }
+      console.log('=== UNLIMITED PLAN WEBHOOK END ===');
     }
 
     // Handle inspection fee payment
