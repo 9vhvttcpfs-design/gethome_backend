@@ -1374,18 +1374,21 @@ app.get('/api/gha/profile', async (req, res) => {
       phone: ghaRecord.phone,
       location: ghaRecord.location,
       status: ghaRecord.status,
-      commission_rate: ghaRecord.commission_rate || 5,
+      commission_rate: ghaRecord.commission_rate,
+      commission_rate_override: ghaRecord.commission_rate_override,
       sa_id: ghaRecord.sa_id,
-      sa_code: sa.sa_code || 'Not assigned',
-      sa_name: sa.full_name || 'Not assigned',
-      sa_email: sa.email || null,
-      sa_whatsapp: sa.whatsapp_number || null,
+      sa_code: sa.sa_code,
+      sa_name: sa.full_name,
+      sa_email: sa.email,
+      sa_whatsapp: sa.whatsapp_number,
+      average_rating: ghaRecord.average_rating,
+      total_ratings: ghaRecord.total_ratings,
       agent_count: agentCount || 0,
       bank_name: ghaRecord.bank_name || null,
       account_number: ghaRecord.account_number || null,
       account_name: ghaRecord.account_name || null,
       bank_code: ghaRecord.bank_code || null,
-      has_bank_details: !!(ghaRecord.bank_name && ghaRecord.account_number),
+      has_bank_details: !!(ghaRecord.bank_name && ghaRecord.account_number && ghaRecord.account_name),
     });
   } catch (err) {
     console.error('GHA profile error:', err.message);
@@ -5238,11 +5241,19 @@ app.get('/api/sa/profile', verifyStaffToken, async (req, res) => {
     const saId = req.staffSession.staff_id;
     const { data, error } = await serviceClient
       .from('service_agents')
-      .select('id, full_name, email, phone, location, whatsapp_number, sa_code, created_at')
+      .select('id, full_name, email, phone, location, whatsapp_number, sa_code, created_at, bank_name, account_number, account_name, bank_code')
       .eq('id', saId)
       .single();
     if (error) throw error;
-    res.json(data);
+    const saRecord = data;
+    res.json({
+      ...saRecord,
+      bank_name: saRecord.bank_name || null,
+      account_number: saRecord.account_number || null,
+      account_name: saRecord.account_name || null,
+      bank_code: saRecord.bank_code || null,
+      has_bank_details: !!(saRecord.bank_name && saRecord.account_number && saRecord.account_name),
+    });
   } catch (err) {
     console.error('sa/profile error:', err.message);
     res.status(500).json({ error: err.message });
@@ -8717,295 +8728,109 @@ async function sumCommissionForUnlimitedAgents(earnings) {
   }, 0);
 }
 
-// GET /api/admin/staff-payments - calculate and return all staff payment totals
+// GET /api/admin/staff-payments - unpaid commissions + inspection dues per staff member
 app.get('/api/admin/staff-payments', async (req, res) => {
   try {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const month = req.query.month || getBillingMonth();
-    const monthStart = month + '-01';
-    const monthEnd = new Date(new Date(monthStart).setMonth(new Date(monthStart).getMonth() + 1)).toISOString().slice(0, 10);
+    var month = req.query.month || getBillingMonth();
 
-    // ── GHA PAYMENTS ────────────────────────────────
+    // Get all GHAs with their unpaid earnings
     const { data: ghas } = await adminClient
       .from('gha_agents')
-      .select('id, gha_code, full_name, email, location, sa_id, commission_rate, commission_rate_override, bank_name, account_number, account_name, bank_code, service_agents(sa_code, full_name)');
+      .select('id, gha_code, full_name, location, bank_name, account_number, account_name, bank_code, commission_rate, commission_rate_override');
 
-    // Global fallback rate, kept only to label each GHA's rate source below
-    const { data: ghaRateSetting } = await adminClient
-      .from('app_settings')
-      .select('setting_value')
-      .eq('setting_key', 'gha_commission_rate')
-      .single();
-    var globalGhaRate = parseFloat(ghaRateSetting?.setting_value || 5);
-
-    const ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
-      // Count ALL confirmed customer inspections this month regardless of sa_confirmed_at
-      // - GHA payment is earned when SA confirms, so the month attribution is based on
-      // sa_confirmed_at, but that column may be null for some records, so we fall back
-      // to created_at and filter by month in JavaScript instead of a Postgres date range.
-      const { data: allConfirmedInspections } = await adminClient
-        .from('inspections')
-        .select('id, status, gha_done_at, sa_confirmed_at, created_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
-        .eq('gha_id', gha.id)
-        .eq('inspection_type', 'customer')
-        .eq('status', 'confirmed');  // CONFIRMED only - not done
-
-      const inspections = (allConfirmedInspections || []).filter(function(i) {
-        // Use sa_confirmed_at if available, otherwise fall back to created_at
-        var dateToCheck = i.sa_confirmed_at || i.created_at;
-        return dateToCheck && dateToCheck.startsWith(month);
-      });
-
-      const confirmedCount = inspections.length;
-
-      // For each inspection, get the property title if property_id exists
-      const enrichedInspections = await Promise.all((inspections || []).map(async function(insp) {
-        var propertyTitle = insp.property_address || 'N/A';
-        if (insp.property_id) {
-          const { data: prop } = await adminClient
-            .from('properties')
-            .select('title, location, created_by')
-            .eq('id', insp.property_id)
-            .maybeSingle();
-          if (prop) {
-            propertyTitle = prop.title || insp.property_address || 'N/A';
-            // Get the agent's GHA
-            if (prop.created_by) {
-              const { data: agentProfile } = await adminClient
-                .from('profiles')
-                .select('gha_id, gha_code')
-                .eq('id', prop.created_by)
-                .maybeSingle();
-              insp.agent_gha_id = agentProfile?.gha_id || null;
-              insp.agent_gha_code = agentProfile?.gha_code || null;
-            }
-          }
-        }
-        return Object.assign({}, insp, {
-          property_title: propertyTitle,
-          customer_display: insp.customer_email || insp.customer_name || 'Unknown Customer',
-        });
-      }));
-
-      const count = confirmedCount || 0;
-
-      // Dynamic tiered inspection payment (tiers configurable via app_settings)
-      var inspFee = await getInspectionFeeForCount(count);
-      var inspPayment = count * inspFee;
-      var breakdown = count > 0 ? [{ tier: 'current', count: count, rate: inspFee, subtotal: inspPayment }] : [];
-      console.log('GHA', gha.gha_code, '| confirmed:', count, '| fee:', inspFee, '| total:', inspPayment);
-
-      // Commission from subscriptions — sums only UNPAID earnings rows for the month
-      // (premium, agency, or unlimited plan payments alike). Once a GHA is marked
-      // paid, those rows flip to is_paid:true and drop out of the current due amount
-      // instead of inflating it if more earnings land later in the same month.
-      const { data: earnings } = await adminClient
+    var ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
+      // Unpaid commission earnings
+      const { data: unpaidComm } = await adminClient
         .from('gha_earnings')
-        .select('commission_amount, subscription_amount, commission_rate, agent_email, payment_reference, created_at, is_paid, agent_id')
+        .select('commission_amount, subscription_amount, commission_rate, agent_email, payment_reference, created_at')
         .eq('gha_id', gha.id)
         .eq('month_year', month)
-        .eq('is_paid', false); // ONLY unpaid - sums ALL matching rows, not just one
+        .eq('is_paid', false);
 
-      const commissionTotal = (earnings || []).reduce(function(sum, e) {
-        return sum + (parseFloat(e.commission_amount) || 0);
-      }, 0);
-      const totalRevenue = (earnings || []).reduce(function(sum, e) {
-        return sum + (parseFloat(e.subscription_amount) || 0);
-      }, 0);
-      console.log('GHA', gha.gha_code, '| unpaid rows:', (earnings || []).length, '| total due:', commissionTotal, '| revenue:', totalRevenue);
+      // Confirmed inspections this month
+      const { data: confirmedInsp } = await adminClient
+        .from('inspections')
+        .select('id, sa_confirmed_at, property_address, customer_name')
+        .eq('gha_id', gha.id)
+        .eq('status', 'confirmed')
+        .gte('created_at', month + '-01')
+        .lte('created_at', month + '-31');
 
-      // gha_earnings has no plan-type column, so the unlimited-plan share of this
-      // commission is derived by checking which earning agents are currently on
-      // the unlimited plan (profiles.is_unlimited) — reflects current status, not
-      // necessarily the agent's plan at the time the earning was recorded.
-      const unlimitedCommission = await sumCommissionForUnlimitedAgents(earnings);
-
-      // Current commission rate (individual override, else global setting) — for display
-      const commissionRate = await getStaffCommissionRate(gha.id, 'GHA');
-      const commissionRateSource = ((gha.commission_rate_override && parseFloat(gha.commission_rate_override) > 0) || (gha.commission_rate && parseFloat(gha.commission_rate) !== globalGhaRate)) ? 'individual' : 'global';
-
-      const totalPayment = inspPayment + commissionTotal;
-      console.log('GHA', gha.gha_code, '| inspections:', count, '| insp pay:', inspPayment, '| commission:', commissionTotal, '| total:', totalPayment);
-
-      // Check existing payment record
-      const { data: existingPayment } = await adminClient
+      // Check if inspection payment already paid
+      const { data: inspPayRecord } = await adminClient
         .from('staff_payments')
-        .select('*')
+        .select('payment_status, paid_at, inspection_payment')
         .eq('staff_id', gha.id)
+        .eq('staff_type', 'GHA')
         .eq('month_year', month)
         .maybeSingle();
 
-      // Upsert payment record
-      await adminClient.from('staff_payments').upsert([{
-        staff_id: gha.id,
-        staff_type: 'GHA',
-        staff_code: gha.gha_code,
-        staff_name: gha.full_name,
-        staff_email: gha.email,
-        month_year: month,
-        inspection_count: count,
-        inspection_payment: inspPayment,
-        commission_amount: commissionTotal,
-        total_payment: totalPayment,
-        payment_status: existingPayment?.payment_status || 'unpaid',
-        updated_at: new Date().toISOString(),
-      }], { onConflict: 'staff_id,month_year' });
+      var inspCount = (confirmedInsp || []).length;
+      var inspFee = await getInspectionFeeForCount(inspCount);
+      var inspPayment = inspPayRecord?.payment_status === 'paid' ? 0 : inspCount * inspFee;
+
+      var totalCommission = (unpaidComm || []).reduce(function(sum, e) {
+        return sum + parseFloat(e.commission_amount || 0);
+      }, 0);
 
       return {
-        staff_id: gha.id,
-        staff_type: 'GHA',
+        gha_id: gha.id,
         gha_code: gha.gha_code,
-        gha_name: gha.full_name,
-        staff_email: gha.email,
-        location: gha.location || null,
-        sa_code: gha.service_agents?.sa_code || null,
-        sa_name: gha.service_agents?.full_name || null,
-        bank_name: gha.bank_name || null,
-        account_number: gha.account_number || null,
-        account_name: gha.account_name || null,
-        bank_code: gha.bank_code || null,
-        inspection_count: count,
+        full_name: gha.full_name,
+        location: gha.location,
+        bank_name: gha.bank_name,
+        account_number: gha.account_number,
+        account_name: gha.account_name,
+        bank_code: gha.bank_code,
+        unpaid_commission: totalCommission,
+        commission_rows: unpaidComm || [],
+        confirmed_inspections: inspCount,
+        fee_per_inspection: inspFee,
         inspection_payment: inspPayment,
-        inspection_breakdown: breakdown,
-        inspection_summary: {
-          confirmed_inspections: count,
-          fee_per_inspection: inspFee,
-          total_inspection_payment: inspPayment,
-          breakdown: breakdown,
-        },
-        inspections: enrichedInspections,
-        commission_amount: commissionTotal,
-        unlimited_commission: unlimitedCommission,
-        total_revenue: totalRevenue,
-        earnings_count: (earnings || []).length,
-        commission_rate: commissionRate,
-        commission_rate_source: commissionRateSource,
-        total_payment: totalPayment,
-        payment_status: existingPayment?.payment_status || 'unpaid',
-        paid_at: existingPayment?.paid_at || null,
-        flutterwave_reference: existingPayment?.flutterwave_reference || null,
+        inspection_paid: inspPayRecord?.payment_status === 'paid',
+        total_due: totalCommission + inspPayment,
+        has_bank_details: !!(gha.bank_name && gha.account_number && gha.account_name),
       };
     }));
 
-    // ── SA PAYMENTS ─────────────────────────────────
+    // Get all SAs with their unpaid earnings
     const { data: sas } = await adminClient
       .from('service_agents')
-      .select('id, sa_code, full_name, email, location, whatsapp_number, commission_rate, commission_rate_override, bank_name, account_number, account_name, bank_code');
+      .select('id, sa_code, full_name, location, bank_name, account_number, account_name, bank_code, commission_rate, commission_rate_override');
 
-    // Global fallback rate, kept only to label each SA's rate source below
-    const { data: saRateSetting } = await adminClient
-      .from('app_settings')
-      .select('setting_value')
-      .eq('setting_key', 'sa_commission_rate')
-      .single();
-    var globalSaRate = parseFloat(saRateSetting?.setting_value || 5);
-
-    const saPayments = await Promise.all((sas || []).map(async function(sa) {
-      // SA commission from subscriptions — sums only UNPAID earnings rows for the month
-      // (premium, agency, or unlimited plan payments alike). Once an SA is marked
-      // paid, those rows flip to is_paid:true and drop out of the current due amount
-      // instead of inflating it if more earnings land later in the same month.
-      const { data: saEarnings } = await adminClient
+    var saPayments = await Promise.all((sas || []).map(async function(sa) {
+      const { data: unpaidComm } = await adminClient
         .from('sa_earnings')
-        .select('commission_amount, subscription_amount, commission_rate, payment_reference, created_at, is_paid, agent_id')
+        .select('commission_amount, subscription_amount, commission_rate, agent_id, payment_reference, created_at')
         .eq('sa_id', sa.id)
         .eq('month_year', month)
-        .eq('is_paid', false); // ONLY unpaid - sums ALL matching rows, not just one
+        .eq('is_paid', false);
 
-      const commissionTotal = (saEarnings || []).reduce(function(sum, e) {
-        return sum + (parseFloat(e.commission_amount) || 0);
+      var totalCommission = (unpaidComm || []).reduce(function(sum, e) {
+        return sum + parseFloat(e.commission_amount || 0);
       }, 0);
-      const totalRevenue = (saEarnings || []).reduce(function(sum, e) {
-        return sum + (parseFloat(e.subscription_amount) || 0);
-      }, 0);
-      console.log('SA', sa.sa_code, '| unpaid rows:', (saEarnings || []).length, '| total due:', commissionTotal, '| revenue:', totalRevenue);
-
-      // sa_earnings has no plan-type column, so the unlimited-plan share of this
-      // commission is derived by checking which earning agents are currently on
-      // the unlimited plan (profiles.is_unlimited) — reflects current status, not
-      // necessarily the agent's plan at the time the earning was recorded.
-      const unlimitedCommission = await sumCommissionForUnlimitedAgents(saEarnings);
-
-      // Current commission rate (individual override, else global setting) — for display
-      const commissionRate = await getStaffCommissionRate(sa.id, 'SA');
-      const commissionRateSource = ((sa.commission_rate_override && parseFloat(sa.commission_rate_override) > 0) || (sa.commission_rate && parseFloat(sa.commission_rate) !== globalSaRate)) ? 'individual' : 'global';
-
-      // SA inspection oversight bonus (optional: ₦500 per confirmed inspection under them)
-      const { count: confirmedCount } = await adminClient
-        .from('inspections')
-        .select('id', { count: 'exact', head: true })
-        .eq('assigned_by_sa', sa.id)
-        .eq('status', 'confirmed')
-        .gte('created_at', monthStart)
-        .lt('created_at', monthEnd);
-
-      const totalPayment = commissionTotal;
-
-      const { data: existingPayment } = await adminClient
-        .from('staff_payments')
-        .select('*')
-        .eq('staff_id', sa.id)
-        .eq('month_year', month)
-        .maybeSingle();
-
-      await adminClient.from('staff_payments').upsert([{
-        staff_id: sa.id,
-        staff_type: 'SA',
-        staff_code: sa.sa_code,
-        staff_name: sa.full_name,
-        staff_email: sa.email,
-        month_year: month,
-        inspection_count: confirmedCount || 0,
-        inspection_payment: 0,
-        commission_amount: commissionTotal,
-        total_payment: totalPayment,
-        payment_status: existingPayment?.payment_status || 'unpaid',
-        updated_at: new Date().toISOString(),
-      }], { onConflict: 'staff_id,month_year' });
 
       return {
-        staff_id: sa.id,
-        staff_type: 'SA',
+        sa_id: sa.id,
         sa_code: sa.sa_code,
-        sa_name: sa.full_name,
-        staff_email: sa.email,
-        location: sa.location || null,
-        whatsapp_number: sa.whatsapp_number || null,
-        bank_name: sa.bank_name || null,
-        account_number: sa.account_number || null,
-        account_name: sa.account_name || null,
-        bank_code: sa.bank_code || null,
-        inspections_overseen: confirmedCount || 0,
-        commission_amount: commissionTotal,
-        unlimited_commission: unlimitedCommission,
-        total_revenue: totalRevenue,
-        earnings_count: (saEarnings || []).length,
-        commission_rate: commissionRate,
-        commission_rate_source: commissionRateSource,
-        total_payment: totalPayment,
-        payment_status: existingPayment?.payment_status || 'unpaid',
-        paid_at: existingPayment?.paid_at || null,
-        flutterwave_reference: existingPayment?.flutterwave_reference || null,
+        full_name: sa.full_name,
+        location: sa.location,
+        bank_name: sa.bank_name,
+        account_number: sa.account_number,
+        account_name: sa.account_name,
+        bank_code: sa.bank_code,
+        unpaid_commission: totalCommission,
+        commission_rows: unpaidComm || [],
+        total_due: totalCommission,
+        has_bank_details: !!(sa.bank_name && sa.account_number && sa.account_name),
       };
     }));
 
-    const ghaGrandTotal = ghaPayments.reduce(function(sum, g) { return sum + g.total_payment; }, 0);
-    const saGrandTotal = saPayments.reduce(function(sum, s) { return sum + s.total_payment; }, 0);
-
-    res.json({
-      month,
-      gha_payments: ghaPayments.sort(function(a, b) { return b.total_payment - a.total_payment; }),
-      sa_payments: saPayments.sort(function(a, b) { return b.total_payment - a.total_payment; }),
-      totals: {
-        gha_total: ghaGrandTotal,
-        sa_total: saGrandTotal,
-        grand_total: ghaGrandTotal + saGrandTotal,
-        unpaid_count: [...ghaPayments, ...saPayments].filter(function(p) { return p.payment_status === 'unpaid' && p.total_payment > 0; }).length,
-      }
-    });
-  } catch (err) {
+    res.json({ ghas: ghaPayments, sas: saPayments, month });
+  } catch(err) {
     console.error('Staff payments error:', err.message);
     res.status(500).json({ error: err.message });
   }
@@ -11212,9 +11037,57 @@ app.post('/api/admin/activate-unlimited', async (req, res) => {
     await adminClient.from('agents').update({
       unlimited_listings: true, unlimited_expires_at: expiryISO,
     }).eq('id', prof.id);
+
+    // Admin activation - no commission created
+    // Only Flutterwave payments trigger commission
+    console.log('Admin activated unlimited for agent:', agent_email, '- NO commission created (admin activation)');
+
     console.log('Manual unlimited activated for:', agent_email, '| expires:', expiryISO);
     res.json({ success: true, message: agent_email + ' unlimited activated until ' + expiry.toLocaleDateString() });
   } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/admin/deactivate-unlimited
+app.post('/api/admin/deactivate-unlimited', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { agent_email } = req.body;
+    if (!agent_email) return res.status(400).json({ error: 'agent_email required' });
+
+    const { data: prof } = await adminClient
+      .from('profiles').select('id, email').eq('email', agent_email).single();
+    if (!prof) return res.status(404).json({ error: 'Agent not found' });
+
+    await adminClient.from('profiles').update({
+      is_unlimited: false,
+      unlimited_listings: false,
+      unlimited_expires_at: null,
+      subscription_tier: 'free',
+      subscription_status: 'inactive',
+    }).eq('id', prof.id);
+
+    await adminClient.from('agents').update({
+      unlimited_listings: false,
+      unlimited_expires_at: null,
+    }).eq('id', prof.id);
+
+    // Notify agent
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'AGENT',
+      recipient_id: prof.id,
+      type: 'unlimited_deactivated',
+      title: 'Unlimited Plan Deactivated',
+      message: 'Your Unlimited Plan has been deactivated by admin. Please contact support for more information.',
+      is_read: false,
+    }]).catch(e => console.error('Deactivation notification failed:', e.message));
+
+    console.log('Admin deactivated unlimited for:', agent_email);
+    res.json({ success: true, message: 'Unlimited plan deactivated for ' + agent_email });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/admin/agent-details/:id
@@ -11667,6 +11540,98 @@ app.post('/api/admin/mark-inspection-payment-paid', async (req, res) => {
     res.json({ success: true, message: 'Inspection payment marked as paid' });
   } catch(err) {
     console.error('Mark inspection payment paid error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/earnings - per-payment joined GHA + SA commission view for a month
+app.get('/api/admin/earnings', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    var month = req.query.month || getBillingMonth();
+
+    // Get all GHA earnings this month
+    const { data: ghaEarnings } = await adminClient
+      .from('gha_earnings')
+      .select('gha_id, agent_id, agent_email, commission_amount, commission_rate, subscription_amount, payment_reference, is_paid, created_at')
+      .eq('month_year', month)
+      .order('created_at', { ascending: false });
+
+    // Get all SA earnings this month
+    const { data: saEarnings } = await adminClient
+      .from('sa_earnings')
+      .select('sa_id, agent_id, commission_amount, commission_rate, subscription_amount, payment_reference, is_paid, created_at')
+      .eq('month_year', month);
+
+    var earningsMap = {};
+
+    // Add GHA earnings rows
+    (ghaEarnings || []).forEach(function(ge) {
+      var ref = ge.payment_reference || ('gha_' + ge.agent_id + '_' + month);
+      if (!earningsMap[ref]) {
+        earningsMap[ref] = {
+          agent_email: ge.agent_email,
+          agent_id: ge.agent_id,
+          subscription_amount: parseFloat(ge.subscription_amount || 0),
+          commission_rate: ge.commission_rate,
+          gha_commission: 0,
+          sa_commission: 0,
+          payment_reference: ge.payment_reference,
+          is_paid: ge.is_paid,
+          created_at: ge.created_at,
+        };
+      }
+      earningsMap[ref].gha_commission += parseFloat(ge.commission_amount || 0);
+    });
+
+    // Add SA earnings — create new row if no matching GHA row exists
+    (saEarnings || []).forEach(function(se) {
+      var ref = se.payment_reference || ('sa_' + se.agent_id + '_' + month);
+      if (earningsMap[ref]) {
+        // Merge into existing GHA row
+        earningsMap[ref].sa_commission += parseFloat(se.commission_amount || 0);
+      } else {
+        // SA-only agent (no GHA assigned) — create standalone row
+        earningsMap[ref] = {
+          agent_email: se.agent_email || se.agent_id,
+          agent_id: se.agent_id,
+          subscription_amount: parseFloat(se.subscription_amount || 0),
+          commission_rate: se.commission_rate,
+          gha_commission: 0,
+          sa_commission: parseFloat(se.commission_amount || 0),
+          payment_reference: se.payment_reference,
+          is_paid: se.is_paid,
+          created_at: se.created_at,
+        };
+      }
+    });
+
+    var earningsList = Object.values(earningsMap).sort(function(a, b) {
+      return new Date(b.created_at) - new Date(a.created_at);
+    });
+
+    // Recalculate totals from merged list
+    var totalRevenue = earningsList.reduce(function(sum, e) { return sum + e.subscription_amount; }, 0);
+    var totalGha = earningsList.reduce(function(sum, e) { return sum + e.gha_commission; }, 0);
+    var totalSa = earningsList.reduce(function(sum, e) { return sum + e.sa_commission; }, 0);
+    var agentCount = new Set(earningsList.map(function(e) { return e.agent_id; })).size;
+
+    console.log('Earnings', month, '| rows:', earningsList.length, '| revenue:', totalRevenue, '| gha:', totalGha, '| sa:', totalSa, '| agents:', agentCount);
+
+    res.json({
+      month,
+      summary: {
+        total_revenue: totalRevenue,
+        gha_commission: totalGha,
+        sa_commission: totalSa,
+        agent_count: agentCount,
+      },
+      earnings: earningsList,
+    });
+  } catch(err) {
+    console.error('Earnings error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
