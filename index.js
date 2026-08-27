@@ -1016,42 +1016,42 @@ app.get('/api/admin/deposits', async (req, res) => {
 
     // Deposits live on the properties table (deposit_* columns), not a separate
     // table. Page through every property that has an active deposit.
-    const { data: deposits, count, error: depositsErr } = await adminClient
+    const { data: deposits, count } = await adminClient
       .from('properties')
-      .select('*', { count: 'exact' })
-      .not('deposit_status', 'is', null)
-      .neq('deposit_status', 'none')
-      .or('is_deleted.eq.false,is_deleted.is.null')
-      .order('deposit_date', { ascending: false })
+      .select('id, title, location, deposit_amount, deposit_status, deposit_confirmed, deposit_date, deposit_reference, depositor_email, depositor_name, depositor_phone, created_by, created_at', { count: 'exact' })
+      .not('depositor_email', 'is', null)
+      .order('deposit_date', { ascending: false, nullsFirst: false })
       .range(offset, offset + limit - 1);
-    if (depositsErr) throw depositsErr;
 
-    // Enrich each deposit with the depositor's profile details. The only
-    // depositor identity stored on the property is depositor_email, so look the
-    // customer up in profiles by email.
+    // Enrich with customer profile
     var enriched = await Promise.all((deposits || []).map(async function(dep) {
-      var customerName = null;
-      var customerEmail = dep.depositor_email || null;
-      var customerPhone = null;
+      var custName = dep.depositor_name || null;
+      var custEmail = dep.depositor_email || null;
+      var custPhone = dep.depositor_phone || null;
 
-      if (customerEmail) {
+      if (custEmail && !custName) {
         const { data: custProf } = await adminClient
           .from('profiles')
-          .select('full_name, email, phone')
-          .eq('email', customerEmail)
+          .select('full_name, phone')
+          .eq('email', custEmail)
           .maybeSingle();
-        customerName = custProf?.full_name || null;
-        customerEmail = custProf?.email || customerEmail;
-        customerPhone = custProf?.phone || null;
+        custName = custProf?.full_name || null;
+        custPhone = custProf?.phone || custPhone;
       }
 
-      return Object.assign({}, dep, {
-        customer_name: customerName || 'Unknown',
-        customer_email: customerEmail || 'N/A',
-        customer_phone: customerPhone || 'N/A',
+      return {
+        id: dep.id,
         property_title: dep.title || 'N/A',
         property_location: dep.location || 'N/A',
-      });
+        customer_name: custName || dep.depositor_name || 'Unknown',
+        customer_email: custEmail || 'N/A',
+        customer_phone: custPhone || 'N/A',
+        amount: parseFloat(dep.deposit_amount || 0),
+        status: dep.deposit_status || 'pending',
+        confirmed: dep.deposit_confirmed || false,
+        deposit_date: dep.deposit_date,
+        reference: dep.deposit_reference,
+      };
     }));
 
     // Also surface agent subscription payments for a full transaction view.
@@ -1064,12 +1064,8 @@ app.get('/api/admin/deposits', async (req, res) => {
       .order('subscription_start', { ascending: false })
       .limit(50);
 
-    res.json({
-      deposits: enriched,
-      total: count || 0,
-      page,
-      subscriptions: subscriptions || [],
-    });
+    console.log('Deposits fetched:', enriched.length, '| total:', count);
+    res.json({ deposits: enriched, total: count || 0, subscriptions: subscriptions || [] });
   } catch (err) {
     console.error('Get deposits error:', err.message);
     res.status(500).json({ error: err.message });
@@ -5869,12 +5865,29 @@ app.get('/api/properties', async (req, res) => {
     if (agentIds.length > 0) {
       const { data: agentProfiles, error: profErr } = await adminClient
         .from('profiles')
-        .select('id, full_name, agency_name, agent_type, profile_photo_url, phone')
+        .select('id, full_name, agency_name, agent_type, profile_photo_url, phone, sa_id')
         .in('id', agentIds);
       if (profErr) {
         console.error('Properties agent enrichment error:', profErr.message);
       } else {
         agentProfilesById = Object.fromEntries((agentProfiles || []).map(a => [a.id, a]));
+      }
+    }
+
+    // Batch-enrich with each listing agent's assigned Service Agent (SA)
+    // WhatsApp/phone so the customer-facing fee-breakdown "Make Enquiry" button
+    // can open a chat with the SA that handles this property.
+    const saIds = [...new Set(Object.values(agentProfilesById).map(a => a.sa_id).filter(Boolean))];
+    let saContactById = {};
+    if (saIds.length > 0) {
+      const { data: saRows, error: saErr } = await adminClient
+        .from('service_agents')
+        .select('id, whatsapp, phone')
+        .in('id', saIds);
+      if (saErr) {
+        console.error('Properties SA enrichment error:', saErr.message);
+      } else {
+        saContactById = Object.fromEntries((saRows || []).map(s => [s.id, s.whatsapp || s.phone || null]));
       }
     }
 
@@ -5895,6 +5908,7 @@ app.get('/api/properties', async (req, res) => {
         agent_display_name: displayName,
         agent_photo_url: agentProf?.profile_photo_url || null,
         agent_phone: agentProf?.phone || null,
+        sa_whatsapp: (agentProf && agentProf.sa_id) ? (saContactById[agentProf.sa_id] || null) : null,
         agent_type: p.agent_type || agentProf?.agent_type || null,
       };
     });
