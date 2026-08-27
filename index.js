@@ -1111,6 +1111,62 @@ function getBillingMonth() {
   return now.toISOString().slice(0, 7);
 }
 
+// Recomputes and upserts the single aggregate monthly_snapshots row for monthYear
+// from the live gha_earnings/sa_earnings/inspections tables. Reads ALL rows for the
+// month (including multiple payment_reference rows per agent), so it stays accurate
+// after the switch to a payment_reference-based conflict key. Called after every
+// earnings-creating webhook/endpoint so the snapshot is always current.
+async function generateMonthlySnapshot(monthYear) {
+  try {
+    const [ghaEarnings, saEarnings, inspections] = await Promise.all([
+      adminClient.from('gha_earnings')
+        .select('commission_amount, subscription_amount, is_paid, agent_id')
+        .eq('month_year', monthYear),
+      adminClient.from('sa_earnings')
+        .select('commission_amount, subscription_amount, is_paid')
+        .eq('month_year', monthYear),
+      adminClient.from('inspections')
+        .select('id')
+        .eq('status', 'confirmed')
+        .gte('sa_confirmed_at', monthYear + '-01')
+        .lt('sa_confirmed_at', monthYear + '-31'),
+    ]);
+
+    var totalRevenue = (ghaEarnings.data || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.subscription_amount || 0);
+    }, 0);
+    var totalGhaComm = (ghaEarnings.data || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+    var totalSaComm = (saEarnings.data || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+    var unpaidGha = (ghaEarnings.data || [])
+      .filter(function(e) { return !e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+    var unpaidSa = (saEarnings.data || [])
+      .filter(function(e) { return !e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+    var agentCount = new Set((ghaEarnings.data || []).map(function(e) { return e.agent_id; })).size;
+
+    await adminClient.from('monthly_snapshots').upsert([{
+      month_year: monthYear,
+      total_revenue: totalRevenue,
+      gha_commission: totalGhaComm,
+      sa_commission: totalSaComm,
+      unpaid_gha_commission: unpaidGha,
+      unpaid_sa_commission: unpaidSa,
+      total_inspections: (inspections.data || []).length,
+      agent_subscriptions: agentCount,
+      updated_at: new Date().toISOString(),
+    }], { onConflict: 'month_year' });
+
+    console.log('Snapshot updated:', monthYear, '| revenue:', totalRevenue, '| gha:', totalGhaComm, '| sa:', totalSaComm, '| agents:', agentCount);
+  } catch(err) {
+    console.error('generateMonthlySnapshot error:', err.message);
+  }
+}
+
 async function verifyStaffToken(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -4572,6 +4628,7 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
       if (hasPaid) {
         var monthYear = getBillingMonth();
         var agentEmail = agentSubscription?.email || '';
+        var assignRef = 'assign_' + agent_id + '_' + monthYear;
 
         // GHA earnings
         var ghaRate = await getStaffCommissionRate(gha.id, 'GHA');
@@ -4584,10 +4641,11 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
           commission_rate: ghaRate,
           commission_amount: ghaCommission,
           month_year: monthYear,
+          payment_reference: assignRef,
           is_paid: false,
-        }], { onConflict: 'gha_id,agent_id,month_year' });
+        }], { onConflict: 'gha_id,agent_id,payment_reference' });
         if (ghaEarnErr) console.error('GHA earnings on assign failed:', ghaEarnErr.message);
-        else console.log('GHA earnings created:', gha.gha_code, '₦' + ghaCommission + ' (' + ghaRate + '%)');
+        else console.log('GHA earnings created:', gha.gha_code, '₦' + ghaCommission + ' (' + ghaRate + '%) - ref:', assignRef);
 
         // SA earnings
         if (gha.sa_id) {
@@ -4601,11 +4659,15 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
             commission_rate: saRate,
             commission_amount: saCommission,
             month_year: monthYear,
+            payment_reference: assignRef,
             is_paid: false,
-          }], { onConflict: 'sa_id,agent_id,month_year' });
+          }], { onConflict: 'sa_id,agent_id,payment_reference' });
           if (saEarnErr) console.error('SA earnings on assign failed:', saEarnErr.message);
-          else console.log('SA earnings created: ₦' + saCommission + ' (' + saRate + '%)');
+          else console.log('SA earnings created: ₦' + saCommission + ' (' + saRate + '%) - ref:', assignRef);
         }
+
+        // Keep the monthly snapshot current after these earnings rows
+        await generateMonthlySnapshot(monthYear);
       } else {
         console.log('Agent has no paid subscription - no earnings created. Tier:', agentSubscription?.subscription_tier, '| Amount:', subAmount);
       }
@@ -7127,6 +7189,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
           console.log('Commission rates - GHA:', ghaCommissionRate + '%', '=₦' + ghaCommission, '| SA:', saCommissionRate + '%', '=₦' + saCommission);
 
+          var paymentRef = txRef || (paymentType + '_' + customerEmail + '_' + Date.now());
+
           // Create GHA earnings row
           if (agentProfile?.gha_id) {
             const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
@@ -7137,10 +7201,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               commission_rate: ghaCommissionRate,
               commission_amount: ghaCommission,
               month_year: monthYear,
+              payment_reference: paymentRef,
               is_paid: false,
-            }], { onConflict: 'gha_id,agent_id,month_year', ignoreDuplicates: false });
+            }], { onConflict: 'gha_id,agent_id,payment_reference', ignoreDuplicates: false });
             if (ghaEarnErr) console.error('GHA earnings upsert failed (non-blocking):', ghaEarnErr.message);
-            else console.log('GHA earnings created:', agentProfile.gha_id, 'commission:', ghaCommission);
+            else console.log('GHA subscription earnings created - ref:', paymentRef, '| commission:', ghaCommission);
 
             // Notify GHA
             const { error: ghaNotifErr } = await adminClient.from('notifications').insert([{
@@ -7164,10 +7229,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               commission_rate: saCommissionRate,
               commission_amount: saCommission,
               month_year: monthYear,
+              payment_reference: paymentRef,
               is_paid: false,
-            }], { onConflict: 'sa_id,agent_id,month_year', ignoreDuplicates: false });
+            }], { onConflict: 'sa_id,agent_id,payment_reference', ignoreDuplicates: false });
             if (saEarnErr) console.error('SA earnings upsert failed (non-blocking):', saEarnErr.message);
-            else console.log('SA earnings created:', agentProfile.sa_id, 'commission:', saCommission);
+            else console.log('SA subscription earnings created - ref:', paymentRef, '| commission:', saCommission);
 
             // Notify SA
             const { error: saNotifErr } = await adminClient.from('notifications').insert([{
@@ -7180,6 +7246,9 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             }]);
             if (saNotifErr) console.error('SA notification failed (non-blocking):', saNotifErr.message);
           }
+
+          // Keep the monthly snapshot current after these earnings rows
+          await generateMonthlySnapshot(monthYear);
         }
       }
     }
@@ -7362,12 +7431,13 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         }
 
         var monthYear = getBillingMonth();
+        var unlimitedRef = txRef || ('unlimited_' + unlimitedAgentId + '_' + Date.now());
 
         // GHA commission
         if (agentProfile?.gha_id) {
           var ghaRate = await getStaffCommissionRate(agentProfile.gha_id, 'GHA');
           var ghaCommission = Math.round(unlimitedAmount * (ghaRate / 100));
-          console.log('Creating GHA earnings - gha_id:', agentProfile.gha_id, '| rate:', ghaRate, '| commission:', ghaCommission);
+          console.log('Creating GHA earnings - gha_id:', agentProfile.gha_id, '| rate:', ghaRate, '| commission:', ghaCommission, '| ref:', unlimitedRef);
           const { error: ghaErr } = await adminClient.from('gha_earnings').upsert([{
             gha_id: agentProfile.gha_id,
             agent_id: unlimitedAgentId,
@@ -7376,8 +7446,9 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             commission_rate: ghaRate,
             commission_amount: ghaCommission,
             month_year: monthYear,
+            payment_reference: unlimitedRef,
             is_paid: false,
-          }], { onConflict: 'gha_id,agent_id,month_year' });
+          }], { onConflict: 'gha_id,agent_id,payment_reference' });
           console.log('GHA earnings result - error:', JSON.stringify(ghaErr), '| success:', !ghaErr);
           if (ghaErr) console.error('GHA unlimited earnings FAILED:', ghaErr.message);
           else console.log('GHA unlimited earnings saved successfully');
@@ -7389,7 +7460,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         if (agentProfile?.sa_id) {
           var saRate = await getStaffCommissionRate(agentProfile.sa_id, 'SA');
           var saCommission = Math.round(unlimitedAmount * (saRate / 100));
-          console.log('Creating SA earnings - sa_id:', agentProfile.sa_id, '| rate:', saRate, '| commission:', saCommission);
+          console.log('Creating SA earnings - sa_id:', agentProfile.sa_id, '| rate:', saRate, '| commission:', saCommission, '| ref:', unlimitedRef);
           const { error: saErr } = await adminClient.from('sa_earnings').upsert([{
             sa_id: agentProfile.sa_id,
             gha_id: agentProfile.gha_id || null,
@@ -7398,14 +7469,18 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             commission_rate: saRate,
             commission_amount: saCommission,
             month_year: monthYear,
+            payment_reference: unlimitedRef,
             is_paid: false,
-          }], { onConflict: 'sa_id,agent_id,month_year' });
+          }], { onConflict: 'sa_id,agent_id,payment_reference' });
           console.log('SA earnings result - error:', JSON.stringify(saErr), '| success:', !saErr);
           if (saErr) console.error('SA unlimited earnings FAILED:', saErr.message);
           else console.log('SA unlimited earnings saved successfully');
         } else {
           console.error('No sa_id found for agent:', unlimitedAgentId, '- no SA commission created');
         }
+
+        // Keep the monthly snapshot current after these earnings rows
+        await generateMonthlySnapshot(monthYear);
 
         // Notify agent
         await adminClient.from('notifications').insert([{
@@ -7730,169 +7805,64 @@ app.get('/api/admin/monthly-history', async (req, res) => {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    var month = req.query.month || getBillingMonth();
 
-    const { data: ghaSum } = await adminClient
-      .from('monthly_gha_summaries')
+    // Get snapshot for this month
+    const { data: snapshot } = await adminClient
+      .from('monthly_snapshots')
       .select('*')
       .eq('month_year', month)
-      .order('total_subscription_revenue', { ascending: false });
+      .maybeSingle();
 
-    const { data: agentSnaps } = await adminClient
-      .from('monthly_agent_snapshots')
-      .select('*')
-      .eq('month_year', month)
-      .order('subscription_amount', { ascending: false });
+    // Get detailed earnings breakdown
+    const [ghaEarnings, saEarnings, inspPayments] = await Promise.all([
+      adminClient.from('gha_earnings')
+        .select('gha_id, agent_id, agent_email, commission_amount, subscription_amount, commission_rate, is_paid, paid_at, payment_reference, created_at')
+        .eq('month_year', month)
+        .order('created_at', { ascending: false }),
+      adminClient.from('sa_earnings')
+        .select('sa_id, agent_id, commission_amount, subscription_amount, commission_rate, is_paid, paid_at, payment_reference, created_at')
+        .eq('month_year', month)
+        .order('created_at', { ascending: false }),
+      adminClient.from('staff_payments')
+        .select('staff_id, staff_type, inspection_payment, inspection_count, payment_status, paid_at')
+        .eq('month_year', month),
+    ]);
 
-    const { data: availableMonths } = await adminClient
-      .from('monthly_gha_summaries')
-      .select('month_year')
-      .order('month_year', { ascending: false });
+    // Calculate from live data if snapshot missing
+    var totalRevenue = snapshot?.total_revenue ||
+      (ghaEarnings.data || []).reduce(function(sum, e) { return sum + parseFloat(e.subscription_amount || 0); }, 0);
+    var totalGhaComm = snapshot?.gha_commission ||
+      (ghaEarnings.data || []).reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+    var totalSaComm = snapshot?.sa_commission ||
+      (saEarnings.data || []).reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
 
-    const months = [...new Set((availableMonths || []).map(r => r.month_year))];
+    var unpaidGha = (ghaEarnings.data || [])
+      .filter(function(e) { return !e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+    var unpaidSa = (saEarnings.data || [])
+      .filter(function(e) { return !e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+    var totalInspPayment = (inspPayments.data || [])
+      .filter(function(p) { return p.staff_type === 'GHA'; })
+      .reduce(function(sum, p) { return sum + parseFloat(p.inspection_payment || 0); }, 0);
 
-    var totalSubscriptionRevenue, unlimitedCount, premiumCount, agencyCount;
-
-    if (month === getBillingMonth()) {
-      // Current (unarchived) month - live subscriptions are the source of truth
-      // since this month's snapshot/summary rows haven't been finalized yet.
-      // Sum ALL agent subscription payments currently active - premium, agency AND
-      // unlimited (no subscription_tier filter, so nothing is excluded).
-      const { data: allSubscriptions } = await adminClient
-        .from('profiles')
-        .select('email, subscription_tier, subscription_amount, subscription_status, is_unlimited')
-        .eq('role', 'agent')
-        .in('subscription_status', ['active'])
-        .not('subscription_amount', 'is', null)
-        .gt('subscription_amount', 0);
-
-      totalSubscriptionRevenue = (allSubscriptions || []).reduce(function(sum, p) {
-        return sum + parseFloat(p.subscription_amount || 0);
-      }, 0);
-
-      unlimitedCount = (allSubscriptions || []).filter(function(p) { return p.is_unlimited; }).length;
-      premiumCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'premium'; }).length;
-      agencyCount = (allSubscriptions || []).filter(function(p) { return p.subscription_tier === 'agency'; }).length;
-    } else {
-      // Past month - a currently-active subscription tells us nothing about what
-      // was active back then, so derive the breakdown from that month's own
-      // archived snapshot rows instead of recalculating from live subscriptions.
-      totalSubscriptionRevenue = (agentSnaps || []).reduce(function(sum, p) {
-        return sum + parseFloat(p.subscription_amount || 0);
-      }, 0);
-
-      unlimitedCount = (agentSnaps || []).filter(function(p) { return p.is_unlimited; }).length;
-      premiumCount = (agentSnaps || []).filter(function(p) { return p.subscription_tier === 'premium'; }).length;
-      agencyCount = (agentSnaps || []).filter(function(p) { return p.subscription_tier === 'agency'; }).length;
-    }
-
-    console.log('Monthly revenue - premium:', premiumCount, '| agency:', agencyCount, '| unlimited:', unlimitedCount, '| total:', totalSubscriptionRevenue);
-
-    // Get ALL earnings for this month - premium, agency AND unlimited. gha_earnings/
-    // sa_earnings carry no plan-type column and nothing here filters by one, so
-    // unlimited-plan earnings are included right alongside premium/agency earnings.
-    const { data: allGhaEarnings } = await adminClient
-      .from('gha_earnings')
-      .select('gha_id, commission_amount, subscription_amount, is_paid, commission_rate')
-      .eq('month_year', month);
-
-    const { data: allSaEarnings } = await adminClient
-      .from('sa_earnings')
-      .select('sa_id, commission_amount, subscription_amount, is_paid, commission_rate')
-      .eq('month_year', month);
-
-    var totalGhaCommission = (allGhaEarnings || []).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-
-    var totalSaCommission = (allSaEarnings || []).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-
-    // Confirmed inspections for the month - sa_confirmed_at can be null on some
-    // records, so fall back to created_at and filter in JS (mirrors the pattern
-    // used in /api/admin/staff-payments) rather than a Postgres date range.
-    const { data: monthConfirmedInspections } = await adminClient
-      .from('inspections')
-      .select('id, gha_id, status, sa_confirmed_at, created_at')
-      .eq('status', 'confirmed');
-
-    var totalInspections = (monthConfirmedInspections || []).filter(function(i) {
-      var d = i.sa_confirmed_at || i.created_at;
-      return d && d.startsWith(month);
-    }).length;
-
-    console.log('Monthly history', month, '| GHA commission:', totalGhaCommission, '| SA commission:', totalSaCommission, '| inspections:', totalInspections);
-
-    // Group by GHA
-    var ghaEarningsMap = {};
-    (allGhaEarnings || []).forEach(function(e) {
-      if (!ghaEarningsMap[e.gha_id]) ghaEarningsMap[e.gha_id] = { total_commission: 0, total_revenue: 0 };
-      ghaEarningsMap[e.gha_id].total_commission += parseFloat(e.commission_amount || 0);
-      ghaEarningsMap[e.gha_id].total_revenue += parseFloat(e.subscription_amount || 0);
-    });
-
-    // Group by SA
-    var saEarningsMap = {};
-    (allSaEarnings || []).forEach(function(e) {
-      if (!saEarningsMap[e.sa_id]) saEarningsMap[e.sa_id] = { total_commission: 0, total_revenue: 0 };
-      saEarningsMap[e.sa_id].total_commission += parseFloat(e.commission_amount || 0);
-      saEarningsMap[e.sa_id].total_revenue += parseFloat(e.subscription_amount || 0);
-    });
-
-    // Overlay the live (unfiltered) earnings totals onto the stored snapshot rows so
-    // unlimited-plan subscriptions show up even if the snapshot itself was taken
-    // without accounting for them.
-    const ghaSummaries = (ghaSum || []).map(function(row) {
-      var live = ghaEarningsMap[row.gha_id];
-      if (!live) return row;
-      return Object.assign({}, row, {
-        total_commission: live.total_commission,
-        total_subscription_revenue: live.total_revenue,
-      });
-    });
-
-    // SA-level totals have no dedicated snapshot table, so build them directly
-    // from sa_earnings.
-    const saIds = Object.keys(saEarningsMap);
-    let saSummaries = [];
-    if (saIds.length > 0) {
-      const { data: saDetails } = await adminClient
-        .from('service_agents')
-        .select('id, sa_code, full_name')
-        .in('id', saIds);
-      saSummaries = (saDetails || []).map(function(sa) {
-        var live = saEarningsMap[sa.id] || { total_commission: 0, total_revenue: 0 };
-        return {
-          sa_id: sa.id,
-          sa_code: sa.sa_code,
-          full_name: sa.full_name,
-          month_year: month,
-          total_commission: live.total_commission,
-          total_subscription_revenue: live.total_revenue,
-        };
-      }).sort(function(a, b) { return b.total_subscription_revenue - a.total_subscription_revenue; });
-    }
+    console.log('Monthly history', month, '| revenue:', totalRevenue, '| gha comm:', totalGhaComm, '| sa comm:', totalSaComm);
 
     res.json({
       month,
-      gha_summaries: ghaSummaries,
-      sa_summaries: saSummaries,
-      agent_snapshots: agentSnaps || [],
-      available_months: months,
-      active_subscriptions_summary: {
-        total_subscription_revenue: totalSubscriptionRevenue,
-        premium_count: premiumCount,
-        agency_count: agencyCount,
-        unlimited_count: unlimitedCount,
-      },
-      gha_commission: totalGhaCommission,
-      sa_commission: totalSaCommission,
-      total_inspections: totalInspections,
-      gha_earnings: allGhaEarnings || [],
-      sa_earnings: allSaEarnings || [],
+      total_subscription_revenue: totalRevenue,
+      gha_commission: totalGhaComm,
+      sa_commission: totalSaComm,
+      unpaid_gha_commission: unpaidGha,
+      unpaid_sa_commission: unpaidSa,
+      total_inspections: snapshot?.total_inspections || 0,
+      total_inspection_payment: totalInspPayment,
+      agent_subscriptions: snapshot?.agent_subscriptions || 0,
+      gha_earnings: ghaEarnings.data || [],
+      sa_earnings: saEarnings.data || [],
     });
-  } catch (err) {
+  } catch(err) {
     console.error('Monthly history error:', err.message);
     res.status(500).json({ error: err.message });
   }
@@ -7909,60 +7879,53 @@ app.get('/api/sa/monthly-history', async (req, res) => {
 
     const month = req.query.month || new Date().toISOString().slice(0, 7);
 
-    const { data: ghaSum } = await adminClient
-      .from('monthly_gha_summaries')
-      .select('*')
+    const { data: allEarnings } = await adminClient
+      .from('sa_earnings')
+      .select('agent_id, commission_amount, commission_rate, subscription_amount, is_paid, paid_at, payment_reference, created_at')
       .eq('sa_id', session.staff_id)
       .eq('month_year', month)
-      .order('total_subscription_revenue', { ascending: false });
+      .order('created_at', { ascending: false });
 
-    const { data: agentSnaps } = await adminClient
-      .from('monthly_agent_snapshots')
-      .select('*')
-      .eq('sa_id', session.staff_id)
-      .eq('month_year', month);
+    var paidTotal = (allEarnings || [])
+      .filter(function(e) { return e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
 
-    const { data: availableMonths } = await adminClient
-      .from('monthly_gha_summaries')
-      .select('month_year')
-      .eq('sa_id', session.staff_id)
-      .order('month_year', { ascending: false });
+    var unpaidTotal = (allEarnings || [])
+      .filter(function(e) { return !e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
 
-    const months = [...new Set((availableMonths || []).map(r => r.month_year))];
+    // Group by agent for per-agent breakdown - an agent can have multiple rows
+    // this month now that earnings are keyed by payment_reference instead of
+    // being collapsed to one row per agent per month. sa_earnings carries no
+    // agent_email column, so agent_id is the only grouping key available.
+    var agentMap = {};
+    (allEarnings || []).forEach(function(e) {
+      var key = e.agent_id;
+      if (!agentMap[key]) {
+        agentMap[key] = {
+          agent_id: e.agent_id,
+          total_commission: 0,
+          total_subscription: 0,
+          payments: [],
+          is_paid: true,
+        };
+      }
+      agentMap[key].total_commission += parseFloat(e.commission_amount || 0);
+      agentMap[key].total_subscription += parseFloat(e.subscription_amount || 0);
+      agentMap[key].payments.push(e);
+      if (!e.is_paid) agentMap[key].is_paid = false;
+    });
 
-    // SA monthly history - all earnings this month, no subscription-type filter,
-    // so unlimited-plan earnings are included alongside premium/agency ones.
-    const { data: saMonthlyEarnings } = await adminClient
-      .from('sa_earnings')
-      .select('commission_amount, subscription_amount, commission_rate, agent_id, month_year, is_paid, created_at')
-      .eq('sa_id', session.staff_id)
-      .eq('month_year', month);
-
-    var totalCommission = (saMonthlyEarnings || []).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-    var totalRevenue = (saMonthlyEarnings || []).reduce(function(sum, e) {
-      return sum + parseFloat(e.subscription_amount || 0);
-    }, 0);
-    var totalPaid = (saMonthlyEarnings || []).filter(function(e) { return e.is_paid; }).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-    var totalPending = (saMonthlyEarnings || []).filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-
-    console.log('SA monthly history', month, '| earnings rows:', (saMonthlyEarnings || []).length, '| total commission:', totalCommission);
+    console.log('SA monthly history', month, '| earnings rows:', (allEarnings || []).length, '| total commission:', paidTotal + unpaidTotal);
 
     res.json({
       month,
-      gha_summaries: ghaSum || [],
-      agent_snapshots: agentSnaps || [],
-      available_months: months,
-      earnings: saMonthlyEarnings || [],
-      total_commission: totalCommission,
-      total_revenue: totalRevenue,
-      total_paid: totalPaid,
-      total_pending: totalPending,
+      earnings: allEarnings || [],
+      agents: Object.values(agentMap),
+      paid_commission: paidTotal,
+      pending_commission: unpaidTotal,
+      total_commission: paidTotal + unpaidTotal,
+      agents_count: Object.keys(agentMap).length,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -7980,73 +7943,53 @@ app.get('/api/gha/monthly-history', async (req, res) => {
 
     const month = req.query.month || new Date().toISOString().slice(0, 7);
 
-    const { data: agentSnaps } = await adminClient
-      .from('monthly_agent_snapshots')
-      .select('*')
+    const { data: allEarnings } = await adminClient
+      .from('gha_earnings')
+      .select('agent_id, agent_email, commission_amount, commission_rate, subscription_amount, is_paid, paid_at, payment_reference, created_at')
       .eq('gha_id', session.staff_id)
       .eq('month_year', month)
-      .order('subscription_amount', { ascending: false });
+      .order('created_at', { ascending: false });
 
-    const { data: availableMonths } = await adminClient
-      .from('monthly_agent_snapshots')
-      .select('month_year')
-      .eq('gha_id', session.staff_id)
-      .order('month_year', { ascending: false });
+    var paidTotal = (allEarnings || [])
+      .filter(function(e) { return e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
 
-    const months = [...new Set((availableMonths || []).map(r => r.month_year))];
+    var unpaidTotal = (allEarnings || [])
+      .filter(function(e) { return !e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
 
-    // GHA monthly history - all earnings this month, no subscription-type filter,
-    // so unlimited-plan earnings are included alongside premium/agency ones.
-    const { data: ghaMonthlyEarnings } = await adminClient
-      .from('gha_earnings')
-      .select('commission_amount, subscription_amount, commission_rate, agent_id, agent_email, month_year, is_paid, created_at')
-      .eq('gha_id', session.staff_id)
-      .eq('month_year', month);
-
-    const totalRevenue = (ghaMonthlyEarnings || []).reduce(function(sum, e) {
-      return sum + parseFloat(e.subscription_amount || 0);
-    }, 0);
-    const totalCommission = (ghaMonthlyEarnings || []).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-    const totalPaid = (ghaMonthlyEarnings || []).filter(function(e) { return e.is_paid; }).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-    const totalPending = (ghaMonthlyEarnings || []).filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) {
-      return sum + parseFloat(e.commission_amount || 0);
-    }, 0);
-    const agentsCount = (ghaMonthlyEarnings || []).length;
-
-    // monthly_agent_snapshots.commission_generated is a point-in-time value
-    // written by the take_monthly_snapshot() DB function and can read 0 for
-    // agents it didn't have a commission figure for at snapshot time. Prefer
-    // the live commission_amount from gha_earnings (the actual paid-commission
-    // ledger) per agent when one exists, so the per-agent row matches the
-    // total_commission figure above instead of showing a stale/blank amount.
-    const commissionByAgent = {};
-    (ghaMonthlyEarnings || []).forEach(function(e) {
-      if (e.agent_id) commissionByAgent[e.agent_id] = parseFloat(e.commission_amount || 0);
-    });
-    const enrichedSnaps = (agentSnaps || []).map(function(s) {
-      var key = s.agent_id || s.id;
-      var liveCommission = commissionByAgent[key];
-      return Object.assign({}, s, {
-        commission_generated: liveCommission !== undefined ? liveCommission : s.commission_generated,
-      });
+    // Group by agent for per-agent breakdown - an agent can have multiple rows
+    // this month now that earnings are keyed by payment_reference instead of
+    // being collapsed to one row per agent per month.
+    var agentMap = {};
+    (allEarnings || []).forEach(function(e) {
+      var key = e.agent_email || e.agent_id;
+      if (!agentMap[key]) {
+        agentMap[key] = {
+          agent_email: e.agent_email,
+          agent_id: e.agent_id,
+          total_commission: 0,
+          total_subscription: 0,
+          payments: [],
+          is_paid: true,
+        };
+      }
+      agentMap[key].total_commission += parseFloat(e.commission_amount || 0);
+      agentMap[key].total_subscription += parseFloat(e.subscription_amount || 0);
+      agentMap[key].payments.push(e);
+      if (!e.is_paid) agentMap[key].is_paid = false;
     });
 
-    console.log('GHA monthly history', month, '| earnings rows:', (ghaMonthlyEarnings || []).length, '| total commission:', totalCommission);
+    console.log('GHA monthly history', month, '| earnings rows:', (allEarnings || []).length, '| total commission:', paidTotal + unpaidTotal);
 
     res.json({
       month,
-      agent_snapshots: enrichedSnaps,
-      available_months: months,
-      earnings: ghaMonthlyEarnings || [],
-      total_revenue: totalRevenue,
-      total_commission: totalCommission,
-      total_paid: totalPaid,
-      total_pending: totalPending,
-      agents_count: agentsCount,
+      earnings: allEarnings || [],
+      agents: Object.values(agentMap),
+      paid_commission: paidTotal,
+      pending_commission: unpaidTotal,
+      total_commission: paidTotal + unpaidTotal,
+      agents_count: Object.keys(agentMap).length,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -8860,10 +8803,10 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       // instead of inflating it if more earnings land later in the same month.
       const { data: earnings } = await adminClient
         .from('gha_earnings')
-        .select('commission_amount, subscription_amount, is_paid, agent_id')
+        .select('commission_amount, subscription_amount, commission_rate, agent_email, payment_reference, created_at, is_paid, agent_id')
         .eq('gha_id', gha.id)
         .eq('month_year', month)
-        .eq('is_paid', false); // ONLY unpaid
+        .eq('is_paid', false); // ONLY unpaid - sums ALL matching rows, not just one
 
       const commissionTotal = (earnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
@@ -8871,7 +8814,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       const totalRevenue = (earnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.subscription_amount) || 0);
       }, 0);
-      console.log('GHA', gha.gha_code, '| unpaid earnings this month:', commissionTotal, '| rows:', (earnings || []).length);
+      console.log('GHA', gha.gha_code, '| unpaid rows:', (earnings || []).length, '| total due:', commissionTotal, '| revenue:', totalRevenue);
 
       // gha_earnings has no plan-type column, so the unlimited-plan share of this
       // commission is derived by checking which earning agents are currently on
@@ -8966,10 +8909,10 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       // instead of inflating it if more earnings land later in the same month.
       const { data: saEarnings } = await adminClient
         .from('sa_earnings')
-        .select('commission_amount, subscription_amount, is_paid, agent_id')
+        .select('commission_amount, subscription_amount, commission_rate, payment_reference, created_at, is_paid, agent_id')
         .eq('sa_id', sa.id)
         .eq('month_year', month)
-        .eq('is_paid', false); // ONLY unpaid
+        .eq('is_paid', false); // ONLY unpaid - sums ALL matching rows, not just one
 
       const commissionTotal = (saEarnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.commission_amount) || 0);
@@ -8977,7 +8920,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       const totalRevenue = (saEarnings || []).reduce(function(sum, e) {
         return sum + (parseFloat(e.subscription_amount) || 0);
       }, 0);
-      console.log('SA', sa.sa_code, '| unpaid earnings this month:', commissionTotal, '| rows:', (saEarnings || []).length);
+      console.log('SA', sa.sa_code, '| unpaid rows:', (saEarnings || []).length, '| total due:', commissionTotal, '| revenue:', totalRevenue);
 
       // sa_earnings has no plan-type column, so the unlimited-plan share of this
       // commission is derived by checking which earning agents are currently on
@@ -9255,35 +9198,47 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     // Mark ALL earnings for this staff member this month as paid, so the
     // per-agent earnings rows stay in sync with the staff_payments record.
     if (payment.staff_type === 'GHA') {
-      const { error: ghaPayErr } = await adminClient
+      // Mark ALL unpaid rows for this GHA this month as paid
+      const { data: markedRows, error: ghaPayErr } = await adminClient
         .from('gha_earnings')
         .update({
           is_paid: true,
-          paid_at: new Date().toISOString(),
+          paid_at: now,
           paid_by: admin.id,
         })
         .eq('gha_id', staff_id)
         .eq('month_year', month_year)
-        .eq('is_paid', false);
+        .eq('is_paid', false)
+        .select('commission_amount');
 
       if (ghaPayErr) return res.status(500).json({ error: ghaPayErr.message });
 
-      console.log('GHA earnings marked paid:', staff_id, '| month:', month_year);
+      var totalPaid = (markedRows || []).reduce(function(sum, r) {
+        return sum + parseFloat(r.commission_amount || 0);
+      }, 0);
+
+      console.log('GHA marked paid:', staff_id, '| month:', month_year, '| rows:', (markedRows || []).length, '| total:', totalPaid);
     } else if (payment.staff_type === 'SA') {
-      const { error: saPayErr } = await adminClient
+      // Mark ALL unpaid rows for this SA this month as paid
+      const { data: markedRows, error: saPayErr } = await adminClient
         .from('sa_earnings')
         .update({
           is_paid: true,
-          paid_at: new Date().toISOString(),
+          paid_at: now,
           paid_by: admin.id,
         })
         .eq('sa_id', staff_id)
         .eq('month_year', month_year)
-        .eq('is_paid', false);
+        .eq('is_paid', false)
+        .select('commission_amount');
 
       if (saPayErr) return res.status(500).json({ error: saPayErr.message });
 
-      console.log('SA earnings marked paid:', staff_id, '| month:', month_year);
+      var totalPaid = (markedRows || []).reduce(function(sum, r) {
+        return sum + parseFloat(r.commission_amount || 0);
+      }, 0);
+
+      console.log('SA marked paid:', staff_id, '| month:', month_year, '| rows:', (markedRows || []).length, '| total:', totalPaid);
     }
 
     // Notify staff member
@@ -10512,6 +10467,7 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
 
     var ghaCommission = Math.round(subscriptionAmount * ghaRate);
     var saCommission = Math.round(subscriptionAmount * saRate);
+    var manualRef = 'manual_' + profile.id + '_' + Date.now();
 
     if (profile.gha_id) {
       const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
@@ -10522,8 +10478,9 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         commission_rate: ghaRate * 100,
         commission_amount: ghaCommission,
         month_year: monthYear,
+        payment_reference: manualRef,
         is_paid: false,
-      }], { onConflict: 'gha_id,agent_id,month_year', ignoreDuplicates: false });
+      }], { onConflict: 'gha_id,agent_id,payment_reference', ignoreDuplicates: false });
       if (ghaEarnErr) console.error('GHA earnings upsert failed:', ghaEarnErr.message);
     }
 
@@ -10536,8 +10493,9 @@ app.post('/api/admin/manual-upgrade', async (req, res) => {
         commission_rate: saRate * 100,
         commission_amount: saCommission,
         month_year: monthYear,
+        payment_reference: manualRef,
         is_paid: false,
-      }], { onConflict: 'sa_id,agent_id,month_year', ignoreDuplicates: false });
+      }], { onConflict: 'sa_id,agent_id,payment_reference', ignoreDuplicates: false });
       if (saEarnErr) console.error('SA earnings upsert failed:', saEarnErr.message);
     }
 
@@ -11321,6 +11279,7 @@ app.post('/api/admin/fix-unlimited-earnings', async (req, res) => {
     var unlimitedAmount = parseFloat(agentProf.subscription_amount || 0);
     var monthYear = getBillingMonth();
     var results = [];
+    var fixRef = 'fix_' + agentProf.id + '_' + monthYear;
 
     if (agentProf.gha_id) {
       var ghaRate = await getStaffCommissionRate(agentProf.gha_id, 'GHA');
@@ -11333,8 +11292,9 @@ app.post('/api/admin/fix-unlimited-earnings', async (req, res) => {
         commission_rate: ghaRate,
         commission_amount: ghaCommission,
         month_year: monthYear,
+        payment_reference: fixRef,
         is_paid: false,
-      }], { onConflict: 'gha_id,agent_id,month_year' });
+      }], { onConflict: 'gha_id,agent_id,payment_reference' });
       if (ghaErr) results.push('GHA earnings failed: ' + ghaErr.message);
       else results.push('GHA earnings created: ₦' + ghaCommission + ' (' + ghaRate + '%)');
     } else {
@@ -11352,8 +11312,9 @@ app.post('/api/admin/fix-unlimited-earnings', async (req, res) => {
         commission_rate: saRate,
         commission_amount: saCommission,
         month_year: monthYear,
+        payment_reference: fixRef,
         is_paid: false,
-      }], { onConflict: 'sa_id,agent_id,month_year' });
+      }], { onConflict: 'sa_id,agent_id,payment_reference' });
       if (saErr) results.push('SA earnings failed: ' + saErr.message);
       else results.push('SA earnings created: ₦' + saCommission + ' (' + saRate + '%)');
     } else {
