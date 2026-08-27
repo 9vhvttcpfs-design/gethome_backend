@@ -1007,22 +1007,69 @@ Please review and confirm this deposit in the Admin Dashboard.`
 // ──────────────────────────────────────────────────────────
 app.get('/api/admin/deposits', async (req, res) => {
   try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'No token provided' });
-    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
-    const user = userData?.user;
-    if (authError || !user) return res.status(401).json({ error: 'Unauthorized - please log out and log back in' });
-    const { data: callerProfile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
-    if (callerProfile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-    const { data: deposits, error: depositsErr } = await adminClient
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    var page = parseInt(req.query.page) || 1;
+    var limit = parseInt(req.query.limit) || 50;
+    var offset = (page - 1) * limit;
+
+    // Deposits live on the properties table (deposit_* columns), not a separate
+    // table. Page through every property that has an active deposit.
+    const { data: deposits, count, error: depositsErr } = await adminClient
       .from('properties')
-      .select('*')
+      .select('*', { count: 'exact' })
       .not('deposit_status', 'is', null)
       .neq('deposit_status', 'none')
       .or('is_deleted.eq.false,is_deleted.is.null')
-      .order('deposit_date', { ascending: false });
+      .order('deposit_date', { ascending: false })
+      .range(offset, offset + limit - 1);
     if (depositsErr) throw depositsErr;
-    res.json(deposits || []);
+
+    // Enrich each deposit with the depositor's profile details. The only
+    // depositor identity stored on the property is depositor_email, so look the
+    // customer up in profiles by email.
+    var enriched = await Promise.all((deposits || []).map(async function(dep) {
+      var customerName = null;
+      var customerEmail = dep.depositor_email || null;
+      var customerPhone = null;
+
+      if (customerEmail) {
+        const { data: custProf } = await adminClient
+          .from('profiles')
+          .select('full_name, email, phone')
+          .eq('email', customerEmail)
+          .maybeSingle();
+        customerName = custProf?.full_name || null;
+        customerEmail = custProf?.email || customerEmail;
+        customerPhone = custProf?.phone || null;
+      }
+
+      return Object.assign({}, dep, {
+        customer_name: customerName || 'Unknown',
+        customer_email: customerEmail || 'N/A',
+        customer_phone: customerPhone || 'N/A',
+        property_title: dep.title || 'N/A',
+        property_location: dep.location || 'N/A',
+      });
+    }));
+
+    // Also surface agent subscription payments for a full transaction view.
+    const { data: subscriptions } = await adminClient
+      .from('profiles')
+      .select('email, full_name, subscription_tier, subscription_amount, subscription_start, subscription_status')
+      .eq('role', 'agent')
+      .not('subscription_amount', 'is', null)
+      .gt('subscription_amount', 0)
+      .order('subscription_start', { ascending: false })
+      .limit(50);
+
+    res.json({
+      deposits: enriched,
+      total: count || 0,
+      page,
+      subscriptions: subscriptions || [],
+    });
   } catch (err) {
     console.error('Get deposits error:', err.message);
     res.status(500).json({ error: err.message });
