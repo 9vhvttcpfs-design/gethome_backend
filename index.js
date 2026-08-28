@@ -4128,14 +4128,15 @@ app.post('/api/sa/create-inspection', async (req, res) => {
       console.log('Updated existing inspection instead of creating duplicate:', existingInsp.id);
 
       // Notify GHA
-      await adminClient.from('notifications').insert([{
+      const { error: ghaNotifErr } = await adminClient.from('notifications').insert([{
         recipient_type: 'GHA',
         recipient_id: gha_id,
         type: 'inspection_request',
         title: 'New Inspection Assigned',
         message: 'Inspect property for customer ' + customer_name + ' at ' + (property_address || 'address TBD') + (inspection_date ? ' on ' + new Date(inspection_date).toLocaleDateString() : ''),
         is_read: false,
-      }]).catch(e => console.error('GHA notification failed:', e.message));
+      }]);
+      if (ghaNotifErr) console.error('GHA notification failed:', ghaNotifErr.message);
 
       return res.json({ success: true, inspection: updated });
     }
