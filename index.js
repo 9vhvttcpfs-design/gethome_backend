@@ -2464,7 +2464,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     var billingMonth = getBillingMonth();
 
     // Run remaining queries in parallel
-    const [allEarningsResult, inspectionsResult, ghaInfoResult, soldResult, activeResult] = await Promise.all([
+    const [allEarningsResult, inspectionsResult, ghaInfoResult, soldResult, activeResult, confirmedInspResult, pendingInspResult, doneInspResult] = await Promise.all([
       adminClient
         .from('gha_earnings')
         .select('commission_amount, subscription_amount, is_paid, paid_at, month_year')
@@ -2501,12 +2501,37 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
             .eq('is_sold', false)
             .or('is_deleted.eq.false,is_deleted.is.null')
         : Promise.resolve({ count: 0, error: null }),
+
+      // Confirmed inspections for this GHA in the current billing month
+      adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', ghaId)
+        .eq('status', 'confirmed')
+        .gte('sa_confirmed_at', billingMonth + '-01'),
+
+      // Inspections still awaiting the GHA
+      adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', ghaId)
+        .in('status', ['pending', 'assigned']),
+
+      // Inspections the GHA has marked done (not yet SA-confirmed)
+      adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', ghaId)
+        .eq('status', 'done'),
     ]);
 
     if (soldResult.error) console.error('GHA overview sold count error:', soldResult.error.message);
     if (activeResult.error) console.error('GHA overview active count error:', activeResult.error.message);
     if (inspectionsResult.error) console.error('GHA overview inspections count error:', inspectionsResult.error.message);
     if (allEarningsResult.error) console.error('GHA overview earnings fetch error:', allEarningsResult.error.message);
+    if (confirmedInspResult.error) console.error('GHA overview confirmed insp count error:', confirmedInspResult.error.message);
+    if (pendingInspResult.error) console.error('GHA overview pending insp count error:', pendingInspResult.error.message);
+    if (doneInspResult.error) console.error('GHA overview done insp count error:', doneInspResult.error.message);
 
     var allEarnings = allEarningsResult.data || [];
 
@@ -2531,6 +2556,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     var isPaid = monthEarnings.length > 0 && monthEarnings.every(function(e) { return e.is_paid; });
     console.log('GHA overview earnings - total ever:', totalEverEarned, '| paid:', totalPaid, '| pending:', totalPending);
     console.log('GHA pending commission:', monthlyCommission, '| unpaid rows:', unpaidMonthEarnings.length, '| total rows:', monthEarnings.length);
+    console.log('GHA overview inspections - confirmed:', confirmedInspResult.count, '| pending:', pendingInspResult.count, '| done:', doneInspResult.count);
 
     var ghaInfo = ghaInfoResult.data;
 
@@ -2543,11 +2569,16 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
       total_commission: totalPending,
       total_ever_earned: totalEverEarned,
       total_paid_out: totalPaid,
+      all_time_commission: totalEverEarned,
       pending_commission: totalPending,
       commission_rate: commissionRate,
       monthly_commission: monthlyCommission,
       commission_paid: isPaid,
+      billing_month: billingMonth,
       inspections_done: inspectionsResult.count || 0,
+      confirmed_inspections: confirmedInspResult.count || 0,
+      pending_inspections: pendingInspResult.count || 0,
+      done_inspections: doneInspResult.count || 0,
       average_rating: ghaInfo?.average_rating || 0,
       total_ratings: ghaInfo?.total_ratings || 0,
       gha_code: ghaInfo?.gha_code || ghaCode,
