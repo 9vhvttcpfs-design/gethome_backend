@@ -9028,7 +9028,7 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
 
     const { data: ghas } = await adminClient
       .from('gha_agents')
-      .select('id, gha_code, full_name, bank_name, account_number, account_name, bank_code, average_rating');
+      .select('id, gha_code, full_name, location, bank_name, account_number, account_name, bank_code, sa_id');
 
     if (!ghas || ghas.length === 0) {
       console.log('No GHAs found');
@@ -9036,6 +9036,7 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
     }
 
     console.log('GHAs found:', ghas.length, '| first GHA bank:', ghas[0]?.bank_name);
+    console.log('GHA bank check - first GHA:', ghas?.[0]?.gha_code, '| bank:', ghas?.[0]?.bank_name, '| account:', ghas?.[0]?.account_number);
 
     var result = await Promise.all((ghas || []).map(async function(gha) {
       const { data: allConfirmed } = await adminClient
@@ -9076,11 +9077,12 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         gha_id: gha.id,
         gha_code: gha.gha_code,
         full_name: gha.full_name,
-        bank_name: gha.bank_name,
-        account_number: gha.account_number,
-        account_name: gha.account_name,
-        bank_code: gha.bank_code,
-        average_rating: gha.average_rating,
+        location: gha.location,
+        bank_name: gha.bank_name || null,
+        account_number: gha.account_number || null,
+        account_name: gha.account_name || null,
+        bank_code: gha.bank_code || null,
+        has_bank_details: !!(gha.bank_name && gha.account_number && gha.account_name),
         confirmed_inspections: count,
         all_time_confirmed: (allConfirmed || []).length,
         fee_per_inspection: fee,
