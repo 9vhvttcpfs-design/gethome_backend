@@ -8003,18 +8003,143 @@ app.get('/api/admin/monthly-history', async (req, res) => {
 
     console.log('Monthly history', month, '| revenue:', totalRevenue, '| gha comm:', totalGhaComm, '| sa comm:', totalSaComm);
 
+    // Build gha_summaries — one row per GHA with their agents' activity
+    const { data: ghas } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name, sa_id');
+
+    var ghaSummaries = await Promise.all((ghas || []).map(async function(gha) {
+      // Get earnings for agents under this GHA
+      const { data: ghaEarn } = await adminClient
+        .from('gha_earnings')
+        .select('agent_id, agent_email, commission_amount, subscription_amount, is_paid, payment_reference, created_at')
+        .eq('gha_id', gha.id)
+        .eq('month_year', month);
+
+      var totalRev = (ghaEarn || []).reduce(function(s, e) { return s + parseFloat(e.subscription_amount || 0); }, 0);
+      var totalGhaComm = (ghaEarn || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
+
+      // Get SA commission for these agents
+      const { data: saEarn } = await adminClient
+        .from('sa_earnings')
+        .select('commission_amount, is_paid')
+        .eq('gha_id', gha.id)
+        .eq('month_year', month);
+      var totalSaComm = (saEarn || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
+
+      // Get confirmed inspections
+      const { count: inspCount } = await adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .eq('status', 'confirmed')
+        .gte('sa_confirmed_at', month + '-01')
+        .lte('sa_confirmed_at', month + '-31');
+
+      return {
+        gha_id: gha.id,
+        gha_code: gha.gha_code,
+        gha_name: gha.full_name,
+        full_name: gha.full_name,
+        sa_id: gha.sa_id,
+        total_subscription_revenue: totalRev,
+        revenue: totalRev,
+        total_gha_commission: totalGhaComm,
+        gha_commission: totalGhaComm,
+        total_sa_commission: totalSaComm,
+        sa_commission: totalSaComm,
+        inspections_completed: inspCount || 0,
+        inspection_done: inspCount || 0,
+        total_agents: (ghaEarn || []).length,
+        active_subscriptions: new Set((ghaEarn || []).map(function(e) { return e.agent_id; })).size,
+        earnings: ghaEarn || [],
+      };
+    }));
+
+    // Build agent_snapshots — one row per payment/agent
+    const { data: allGhaEarnings } = await adminClient
+      .from('gha_earnings')
+      .select('gha_id, agent_id, agent_email, commission_amount, commission_rate, subscription_amount, is_paid, paid_at, payment_reference, created_at')
+      .eq('month_year', month)
+      .order('created_at', { ascending: false });
+
+    // Get agent profiles
+    var snapAgentIds = [...new Set((allGhaEarnings || []).map(function(e) { return e.agent_id; }).filter(Boolean))];
+    var snapAgentMap = {};
+    if (snapAgentIds.length > 0) {
+      const { data: snapProfs } = await adminClient
+        .from('profiles').select('id, email, full_name, subscription_tier').in('id', snapAgentIds);
+      (snapProfs || []).forEach(function(p) { snapAgentMap[p.id] = p; });
+    }
+
+    var ghaCodeMap = {};
+    (ghas || []).forEach(function(g) { ghaCodeMap[g.id] = { gha_code: g.gha_code, gha_name: g.full_name }; });
+
+    var agentSnapshots = (allGhaEarnings || []).map(function(e) {
+      var prof = snapAgentMap[e.agent_id] || {};
+      var ghaInfo = ghaCodeMap[e.gha_id] || {};
+      return {
+        agent_id: e.agent_id,
+        agent_email: e.agent_email || prof.email || '—',
+        email: e.agent_email || prof.email || '—',
+        full_name: prof.full_name || null,
+        subscription_tier: prof.subscription_tier || null,
+        gha_id: e.gha_id,
+        gha_code: ghaInfo.gha_code || '—',
+        gha_name: ghaInfo.gha_name || '—',
+        commission_amount: parseFloat(e.commission_amount || 0),
+        subscription_amount: parseFloat(e.subscription_amount || 0),
+        commission_rate: e.commission_rate,
+        is_paid: e.is_paid,
+        paid_at: e.paid_at,
+        payment_reference: e.payment_reference,
+        month_year: month,
+      };
+    });
+
+    // Get available months
+    const { data: availMonths } = await adminClient
+      .from('gha_earnings').select('month_year').order('month_year', { ascending: false });
+    var availableMonths = [...new Set((availMonths || []).map(function(r) { return r.month_year; }))];
+
+    // Summary totals
+    var grandRevenue = ghaSummaries.reduce(function(s, g) { return s + g.total_subscription_revenue; }, 0);
+    var grandGha = ghaSummaries.reduce(function(s, g) { return s + g.total_gha_commission; }, 0);
+    var grandSa = ghaSummaries.reduce(function(s, g) { return s + g.total_sa_commission; }, 0);
+    var unpaidGhaComm = (allGhaEarnings || []).filter(function(e) { return !e.is_paid; }).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
+
+    const { data: saEarningsAll } = await adminClient
+      .from('sa_earnings').select('commission_amount, is_paid').eq('month_year', month);
+    var unpaidSaComm = (saEarningsAll || []).filter(function(e) { return !e.is_paid; }).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
+
+    const { count: totalInsp } = await adminClient
+      .from('inspections').select('id', { count: 'exact', head: true })
+      .eq('status', 'confirmed')
+      .gte('sa_confirmed_at', month + '-01')
+      .lte('sa_confirmed_at', month + '-31');
+
+    console.log('Admin monthly history', month, '| gha_summaries:', ghaSummaries.length, '| snapshots:', agentSnapshots.length, '| revenue:', grandRevenue);
+
     res.json({
       month,
-      total_subscription_revenue: totalRevenue,
-      gha_commission: totalGhaComm,
-      sa_commission: totalSaComm,
-      unpaid_gha_commission: unpaidGha,
-      unpaid_sa_commission: unpaidSa,
-      total_inspections: snapshot?.total_inspections || 0,
-      total_inspection_payment: totalInspPayment,
-      agent_subscriptions: snapshot?.agent_subscriptions || 0,
-      gha_earnings: ghaEarnings.data || [],
-      sa_earnings: saEarnings.data || [],
+      gha_summaries: ghaSummaries,
+      agent_snapshots: agentSnapshots,
+      available_months: availableMonths,
+      totals: {
+        total_gha_commission: grandGha,
+        total_sa_commission: grandSa,
+        total_revenue: grandRevenue,
+        unpaid_gha_commission: unpaidGhaComm,
+        unpaid_sa_commission: unpaidSaComm,
+      },
+      // Flat fields for stat cards
+      total_subscription_revenue: grandRevenue,
+      gha_commission: grandGha,
+      sa_commission: grandSa,
+      unpaid_gha_commission: unpaidGhaComm,
+      unpaid_sa_commission: unpaidSaComm,
+      total_inspections: totalInsp || 0,
+      agent_subscriptions: agentSnapshots.length,
     });
   } catch(err) {
     console.error('Monthly history error:', err.message);
@@ -8114,25 +8239,130 @@ app.get('/api/sa/monthly-history', async (req, res) => {
 
     var availableMonths = [...new Set((availableMonthsData || []).map(function(r) { return r.month_year; }))];
 
+    // Get GHAs under this SA
+    const { data: saGhas } = await adminClient
+      .from('gha_agents')
+      .select('id, gha_code, full_name')
+      .eq('sa_id', session.staff_id);
+
+    var saGhaIds = (saGhas || []).map(function(g) { return g.id; });
+
+    // Build gha_summaries for SA's GHAs only
+    var saGhaSummaries = await Promise.all((saGhas || []).map(async function(gha) {
+      const { data: ghaEarn } = await adminClient
+        .from('gha_earnings')
+        .select('agent_id, agent_email, commission_amount, subscription_amount, is_paid, payment_reference, created_at')
+        .eq('gha_id', gha.id)
+        .eq('month_year', month);
+
+      // SA commission for agents under this GHA
+      const { data: saEarnForGha } = await adminClient
+        .from('sa_earnings')
+        .select('commission_amount, is_paid')
+        .eq('sa_id', session.staff_id)
+        .eq('gha_id', gha.id)
+        .eq('month_year', month);
+
+      var totalRev = (ghaEarn || []).reduce(function(s, e) { return s + parseFloat(e.subscription_amount || 0); }, 0);
+      var totalGhaComm = (ghaEarn || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
+      var totalSaComm = (saEarnForGha || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
+
+      const { count: inspCount } = await adminClient
+        .from('inspections')
+        .select('id', { count: 'exact', head: true })
+        .eq('gha_id', gha.id)
+        .eq('status', 'confirmed')
+        .gte('sa_confirmed_at', month + '-01')
+        .lte('sa_confirmed_at', month + '-31');
+
+      return {
+        gha_id: gha.id,
+        gha_code: gha.gha_code,
+        gha_name: gha.full_name,
+        full_name: gha.full_name,
+        total_subscription_revenue: totalRev,
+        revenue: totalRev,
+        total_gha_commission: totalGhaComm,
+        gha_commission: totalGhaComm,
+        total_sa_commission: totalSaComm,
+        sa_commission: totalSaComm,
+        inspections_completed: inspCount || 0,
+        total_agents: new Set((ghaEarn || []).map(function(e) { return e.agent_id; })).size,
+        active_subscriptions: new Set((ghaEarn || []).map(function(e) { return e.agent_id; })).size,
+      };
+    }));
+
+    // Agent snapshots for SA - all agents under SA's GHAs
+    var saEarningsQuery = await adminClient
+      .from('sa_earnings')
+      .select('agent_id, commission_amount, commission_rate, subscription_amount, is_paid, paid_at, payment_reference, created_at, gha_id')
+      .eq('sa_id', session.staff_id)
+      .eq('month_year', month)
+      .order('created_at', { ascending: false });
+
+    var saAgentIds = [...new Set((saEarningsQuery.data || []).map(function(e) { return e.agent_id; }).filter(Boolean))];
+    var saAgentMap = {};
+    if (saAgentIds.length > 0) {
+      const { data: saAgentProfs } = await adminClient
+        .from('profiles').select('id, email, full_name, subscription_tier').in('id', saAgentIds);
+      (saAgentProfs || []).forEach(function(p) { saAgentMap[p.id] = p; });
+    }
+
+    var saGhaMap = {};
+    (saGhas || []).forEach(function(g) { saGhaMap[g.id] = g; });
+
+    var saAgentSnapshots = (saEarningsQuery.data || []).map(function(e) {
+      var prof = saAgentMap[e.agent_id] || {};
+      var gha = saGhaMap[e.gha_id] || {};
+      return {
+        agent_id: e.agent_id,
+        agent_email: prof.email || e.agent_id,
+        email: prof.email || '—',
+        full_name: prof.full_name || null,
+        subscription_tier: prof.subscription_tier || null,
+        gha_id: e.gha_id,
+        gha_code: gha.gha_code || '—',
+        gha_name: gha.full_name || '—',
+        commission_amount: parseFloat(e.commission_amount || 0),
+        subscription_amount: parseFloat(e.subscription_amount || 0),
+        commission_rate: e.commission_rate,
+        is_paid: e.is_paid,
+        paid_at: e.paid_at,
+        payment_reference: e.payment_reference,
+        month_year: month,
+      };
+    });
+
+    var saGrandRev = saGhaSummaries.reduce(function(s, g) { return s + g.total_subscription_revenue; }, 0);
+    var saGrandGha = saGhaSummaries.reduce(function(s, g) { return s + g.total_gha_commission; }, 0);
+    var saGrandSa = saGhaSummaries.reduce(function(s, g) { return s + g.total_sa_commission; }, 0);
+
+    var saAvailMonths = [...new Set((saEarningsQuery.data || []).map(function(e) {
+      return e.month_year || month;
+    }))];
+    if (!saAvailMonths.includes(month)) saAvailMonths.unshift(month);
+
+    const { data: allSaMonths } = await adminClient
+      .from('sa_earnings').select('month_year').eq('sa_id', session.staff_id).order('month_year', { ascending: false });
+    saAvailMonths = [...new Set((allSaMonths || []).map(function(r) { return r.month_year; }))];
+
+    console.log('SA monthly history', month, '| gha_summaries:', saGhaSummaries.length, '| snapshots:', saAgentSnapshots.length);
+
     res.json({
       month,
-      // Shape SA frontend reads
-      agent_snapshots: agentSnapshots,
-      gha_summaries: [], // SA sees agents not GHAs
-      available_months: availableMonths,
+      gha_summaries: saGhaSummaries,
+      agent_snapshots: saAgentSnapshots,
+      available_months: saAvailMonths,
       totals: {
-        total_revenue: totalRevenue,
-        total_commission: paidTotal + unpaidTotal,
-        pending_commission: unpaidTotal,
-        paid_commission: paidTotal,
-        agent_count: Object.keys(agentEarningsMap).length,
+        total_gha_commission: saGrandGha,
+        total_sa_commission: saGrandSa,
+        total_revenue: saGrandRev,
+        pending_commission: saAgentSnapshots.filter(function(e) { return !e.is_paid; }).reduce(function(s, e) { return s + e.commission_amount; }, 0),
+        paid_commission: saAgentSnapshots.filter(function(e) { return e.is_paid; }).reduce(function(s, e) { return s + e.commission_amount; }, 0),
       },
-      // Also include flat fields for any direct reads
-      paid_commission: paidTotal,
-      pending_commission: unpaidTotal,
-      total_commission: paidTotal + unpaidTotal,
-      total_revenue: totalRevenue,
-      agents_count: Object.keys(agentEarningsMap).length,
+      total_subscription_revenue: saGrandRev,
+      gha_commission: saGrandGha,
+      sa_commission: saGrandSa,
     });
   } catch(err) {
     console.error('SA monthly history error:', err.message);
