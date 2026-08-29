@@ -4373,7 +4373,7 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
     console.log('Rating link for customer:', ratingLink);
 
     // Notify SA with the rating link to share with customer
-    await adminClient.from('notifications').insert([{
+    const { error: ratingNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'SA',
       recipient_id: saId,
       type: 'rating_link_ready',
@@ -4387,7 +4387,8 @@ app.post('/api/sa/confirm-inspection', verifyStaffToken, async (req, res) => {
         customer_phone: inspection.customer_phone,
         gha_id: inspection.gha_id,
       }),
-    }]).catch(e => console.error('Rating link notification failed:', e.message));
+    }]);
+    if (ratingNotifErr) console.error('Notification error:', ratingNotifErr.message);
 
     res.json({ success: true });
   } catch (err) {
@@ -11561,11 +11562,12 @@ async function seedPlanPriceSettings() {
       { setting_key: 'premium_plan_price', setting_value: '8500' },
       { setting_key: 'agency_plan_price', setting_value: '35000' },
       { setting_key: 'featured_listing_fee', setting_value: '5000' },
+      { setting_key: 'escrow_fee_rate', setting_value: '0.0075' },
       { setting_key: 'promo_enabled', setting_value: 'false' },
       { setting_key: 'promo_details', setting_json: { discount_percent: 0, applies_to: 'all' } },
     ], { onConflict: 'setting_key', ignoreDuplicates: true });
     if (error) console.error('Seed plan price settings failed:', error.message);
-    else console.log('Plan price settings seeded (premium_plan_price, agency_plan_price, featured_listing_fee, promo_enabled, promo_details)');
+    else console.log('Plan price settings seeded (premium_plan_price, agency_plan_price, featured_listing_fee, escrow_fee_rate, promo_enabled, promo_details)');
   } catch (err) {
     console.error('Seed plan price settings exception:', err.message);
   }
