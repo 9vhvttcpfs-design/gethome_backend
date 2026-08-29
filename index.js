@@ -11988,6 +11988,67 @@ app.post('/api/admin/mark-inspection-payment-paid', async (req, res) => {
   }
 });
 
+// GET /api/properties/:id/fee-breakdown - full customer-facing fee breakdown
+// including the dynamically-configured GetHome escrow fee.
+app.get('/api/properties/:id/fee-breakdown', async (req, res) => {
+  try {
+    var propertyId = req.params.id;
+
+    // Get property details
+    const { data: property } = await adminClient
+      .from('properties')
+      .select('id, title, location, rent, price, property_type, listing_type, agency_fee_percent, agreement_fee_percent, caution_fee_percent, service_charge, inspection_fee')
+      .eq('id', propertyId)
+      .single();
+
+    if (!property) return res.status(404).json({ error: 'Property not found' });
+
+    // Get escrow settings dynamically
+    const [escrowRateSetting, escrowCapSetting] = await Promise.all([
+      adminClient.from('app_settings').select('setting_value').eq('setting_key', 'escrow_fee_rate').maybeSingle(),
+      adminClient.from('app_settings').select('setting_value').eq('setting_key', 'escrow_fee_cap').maybeSingle(),
+    ]);
+
+    var escrowRate = parseFloat(escrowRateSetting?.data?.setting_value || 0.0075);
+    var escrowCap = parseFloat(escrowCapSetting?.data?.setting_value || 5000);
+
+    var basePrice = parseFloat(property.rent || property.price || 0);
+
+    // Calculate all fees
+    var agencyFee = Math.round(basePrice * (parseFloat(property.agency_fee_percent || 5) / 100));
+    var agreementFee = Math.round(basePrice * (parseFloat(property.agreement_fee_percent || 5) / 100));
+    var cautionFee = Math.round(basePrice * (parseFloat(property.caution_fee_percent || 5) / 100));
+    var serviceCharge = parseFloat(property.service_charge || 0);
+    var regularBase = basePrice + agencyFee + agreementFee + cautionFee + serviceCharge;
+    var escrowFee = Math.min(Math.round(regularBase * escrowRate), escrowCap);
+    var grandTotal = regularBase + escrowFee;
+
+    console.log('Fee breakdown - property:', propertyId, '| base:', basePrice, '| escrow rate:', escrowRate, '| escrow fee:', escrowFee, '| total:', grandTotal);
+
+    res.json({
+      property_id: propertyId,
+      title: property.title,
+      base_price: basePrice,
+      agency_fee: agencyFee,
+      agency_fee_percent: parseFloat(property.agency_fee_percent || 5),
+      agreement_fee: agreementFee,
+      agreement_fee_percent: parseFloat(property.agreement_fee_percent || 5),
+      caution_fee: cautionFee,
+      caution_fee_percent: parseFloat(property.caution_fee_percent || 5),
+      service_charge: serviceCharge,
+      escrow_rate: escrowRate,
+      escrow_cap: escrowCap,
+      escrow_fee: escrowFee,
+      escrow_label: 'GetHome Escrow Fee (' + (escrowRate * 100).toFixed(2) + '%)',
+      regular_base: regularBase,
+      grand_total: grandTotal,
+    });
+  } catch(err) {
+    console.error('Fee breakdown error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
