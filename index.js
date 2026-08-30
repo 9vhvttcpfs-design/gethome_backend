@@ -2204,11 +2204,47 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
       byMonth[key].sa_commission = Math.round(byMonth[key].revenue * (saRate / 100));
     });
 
+    // All agents with sa_earnings this month - ALL tiers including unlimited (no tier filter)
+    const { data: saAgentEarnings } = await serviceClient
+      .from('sa_earnings')
+      .select('agent_id, commission_amount, commission_rate, subscription_amount, payment_reference, is_paid, created_at')
+      .eq('sa_id', saId)
+      .eq('month_year', getBillingMonth())
+      .order('created_at', { ascending: false });
+
+    var earningAgentIds = [...new Set((saAgentEarnings || []).map(function(e) { return e.agent_id; }).filter(Boolean))];
+    var agentProfileMap = {};
+    if (earningAgentIds.length > 0) {
+      const { data: agentProfs } = await serviceClient
+        .from('profiles')
+        .select('id, email, full_name, subscription_tier, is_unlimited')
+        .in('id', earningAgentIds);
+      (agentProfs || []).forEach(function(p) { agentProfileMap[p.id] = p; });
+    }
+
+    var subscriptionList = (saAgentEarnings || []).map(function(e) {
+      var prof = agentProfileMap[e.agent_id] || {};
+      return {
+        agent_id: e.agent_id,
+        agent_email: prof.email || e.agent_id,
+        agent_name: prof.full_name || null,
+        subscription_tier: prof.is_unlimited ? 'unlimited' : (prof.subscription_tier || 'premium'),
+        commission_amount: parseFloat(e.commission_amount || 0),
+        commission_rate: e.commission_rate,
+        subscription_amount: parseFloat(e.subscription_amount || 0),
+        payment_reference: e.payment_reference,
+        is_paid: e.is_paid,
+        plan_type: (e.payment_reference || '').includes('unlimited') ? 'unlimited' : 'subscription',
+      };
+    });
+
     res.json({
       agents: agents || [],
       total_revenue: totalRevenue,
       sa_commission: saCommission,
       by_month: Object.values(byMonth).sort(function(a, b) { return b.month.localeCompare(a.month); }),
+      subscriptions: subscriptionList,
+      total: subscriptionList.length,
     });
   } catch (err) {
     console.error('SA subscriptions error:', err.message);
@@ -2463,6 +2499,15 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     // Current billing month, for this month's earnings from gha_earnings
     var billingMonth = getBillingMonth();
 
+    // Get ALL unpaid GHA earnings this month - includes premium, agency AND unlimited.
+    // No filter on subscription_amount or tier.
+    const { data: unpaidGhaEarnings } = await adminClient
+      .from('gha_earnings')
+      .select('commission_amount, subscription_amount, commission_rate, agent_id, agent_email, payment_reference, created_at')
+      .eq('gha_id', ghaId)
+      .eq('month_year', billingMonth)
+      .eq('is_paid', false);
+
     // Run remaining queries in parallel
     const [allEarningsResult, inspectionsResult, ghaInfoResult, soldResult, activeResult, confirmedInspResult, pendingInspResult, doneInspResult] = await Promise.all([
       adminClient
@@ -2542,6 +2587,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     var totalPaid = allEarnings.filter(function(e) { return e.is_paid; }).reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
+    var totalPaidOut = totalPaid;
     var totalPending = allEarnings.filter(function(e) { return !e.is_paid; }).reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
@@ -2550,12 +2596,15 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     var monthEarnings = allEarnings.filter(function(e) { return e.month_year === billingMonth; });
     // Dashboard should only ever show what's still owed, not what's already been paid out.
     var unpaidMonthEarnings = monthEarnings.filter(function(e) { return !e.is_paid; });
-    var monthlyCommission = unpaidMonthEarnings.reduce(function(sum, e) {
+    // Pending = unpaid earnings for the billing month, from the dedicated unfiltered query
+    // (premium + agency + unlimited).
+    var pendingCommission = (unpaidGhaEarnings || []).reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
+    var monthlyCommission = pendingCommission;
     var isPaid = monthEarnings.length > 0 && monthEarnings.every(function(e) { return e.is_paid; });
     console.log('GHA overview earnings - total ever:', totalEverEarned, '| paid:', totalPaid, '| pending:', totalPending);
-    console.log('GHA pending commission:', monthlyCommission, '| unpaid rows:', unpaidMonthEarnings.length, '| total rows:', monthEarnings.length);
+    console.log('GHA overview earnings - pending:', pendingCommission, '| total:', totalEverEarned, '| paid:', totalPaidOut, '| rows:', (unpaidGhaEarnings||[]).length);
     console.log('GHA overview inspections - confirmed:', confirmedInspResult.count, '| pending:', pendingInspResult.count, '| done:', doneInspResult.count);
 
     var ghaInfo = ghaInfoResult.data;
@@ -3068,21 +3117,41 @@ app.get('/api/sa/overview', async (req, res) => {
     // SA commission this month from sa_earnings table
     var billingMonth = getBillingMonth();
 
-    const { data: saEarnings } = await adminClient
+    // Get ALL unpaid earnings for current billing month (all plan types incl. unlimited)
+    const { data: unpaidEarnings } = await adminClient
       .from('sa_earnings')
-      .select('commission_amount, is_paid')
+      .select('commission_amount, subscription_amount, commission_rate, agent_id, payment_reference, created_at')
       .eq('sa_id', session.staff_id)
-      .eq('month_year', billingMonth);
+      .eq('month_year', billingMonth)
+      .eq('is_paid', false);
 
-    // Dashboard should only ever show what's still owed, not what's already been paid out.
-    var unpaidSaEarnings = (saEarnings || []).filter(function(e) { return !e.is_paid; });
-    var monthlyEarnings = unpaidSaEarnings.reduce(function(sum, e) {
+    // Get ALL earnings ever for total stats
+    const { data: allEarnings } = await adminClient
+      .from('sa_earnings')
+      .select('commission_amount, subscription_amount, is_paid, month_year')
+      .eq('sa_id', session.staff_id);
+
+    var pendingCommission = (unpaidEarnings || []).reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
     }, 0);
 
-    var earningsPaid = (saEarnings || []).length > 0 &&
-      (saEarnings || []).every(function(e) { return e.is_paid; });
-    console.log('SA pending commission:', monthlyEarnings, '| unpaid rows:', unpaidSaEarnings.length, '| total rows:', (saEarnings || []).length);
+    var totalEverEarned = (allEarnings || []).reduce(function(sum, e) {
+      return sum + parseFloat(e.commission_amount || 0);
+    }, 0);
+
+    var totalPaidOut = (allEarnings || [])
+      .filter(function(e) { return e.is_paid; })
+      .reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+
+    var totalAgents = new Set((unpaidEarnings || []).map(function(e) { return e.agent_id; })).size;
+
+    // Dashboard should only ever show what's still owed, not what's already been paid out.
+    var monthlyEarnings = pendingCommission;
+
+    var monthEarnings = (allEarnings || []).filter(function(e) { return e.month_year === billingMonth; });
+    var earningsPaid = monthEarnings.length > 0 && monthEarnings.every(function(e) { return e.is_paid; });
+
+    console.log('SA overview - pending:', pendingCommission, '| total earned:', totalEverEarned, '| paid out:', totalPaidOut, '| agents:', totalAgents, '| rows:', (unpaidEarnings||[]).length);
 
     // Pending agents awaiting approval
     const { count: pendingCount } = await adminClient
@@ -3116,6 +3185,12 @@ app.get('/api/sa/overview', async (req, res) => {
       total_commission: totalCommission,
       commission_rate: commissionRate,
       monthly_earnings: monthlyEarnings,
+      pending_commission: pendingCommission,
+      monthly_commission: pendingCommission,
+      total_ever_earned: totalEverEarned,
+      total_paid_out: totalPaidOut,
+      paid_out: totalPaidOut,
+      total_agents_this_month: totalAgents,
       earnings_paid: earningsPaid,
       pending_agents: pendingCount || 0,
       inspections_confirmed: inspConfirmed || 0,
