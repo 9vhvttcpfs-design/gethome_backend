@@ -5587,6 +5587,134 @@ setInterval(function() {
     https.get(url + '/', function(r){ console.log('Keep-alive ping:', r.statusCode); }).on('error', function(){});
   } catch(e) {}
 }, 14 * 60 * 1000);
+
+// Hourly earnings recovery job - backfills earnings only for subscription
+// payments that actually landed in the current billing month but whose webhook
+// dropped the earnings row. See the safety guards note below.
+async function recoverMissingEarnings() {
+  try {
+    var currentMonth = getBillingMonth();
+    console.log('=== EARNINGS RECOVERY JOB START ===', currentMonth);
+
+    // Only find agents whose subscription_start falls in the current billing month
+    // This ensures we only create earnings for payments that actually happened this month
+    //
+    // KNOWN LIMITATION: getBillingMonth() rolls to next month on the 28th.
+    // Payments made Aug 28-31 get month_year='2026-09' from the webhook,
+    // but subscription_start is still in August — outside the Sep window.
+    // These end-of-month payments are NOT auto-recovered by this job.
+    // Manual backfill via SQL is required for those edge cases.
+    // This is intentional: under-recovery is safer than fabricating commissions.
+    var monthStart = currentMonth + '-01T00:00:00.000Z';
+    var nextMonth = new Date(currentMonth + '-01T00:00:00.000Z');
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    var monthEnd = nextMonth.toISOString();
+
+    const { data: activeAgents, error: activeErr } = await adminClient
+      .from('profiles')
+      .select('id, email, gha_id, sa_id, subscription_tier, subscription_amount, is_unlimited, subscription_status, subscription_start, subscription_end')
+      .eq('role', 'agent')
+      .eq('subscription_status', 'active')
+      .gt('subscription_amount', 0)
+      .not('gha_id', 'is', null)
+      .eq('is_unlimited', false) // unlimited handled by its own flow
+      .gte('subscription_start', monthStart)
+      .lt('subscription_start', monthEnd); // only paid THIS month
+
+    if (activeErr) {
+      console.error('Recovery: activeAgents query failed:', activeErr.message);
+      return;
+    }
+
+    console.log('Recovery: agents who paid this month:', (activeAgents || []).length);
+    var recovered = 0;
+
+    for (var agent of (activeAgents || [])) {
+      // Use subscription_start date to build a stable reference
+      // matching what the webhook would have used via txRef pattern
+      var recoveryRef = 'recovery_' + currentMonth + '_' + agent.id;
+
+      // Check if ANY earnings row exists for this agent this month
+      // (could be from webhook with real txRef OR a previous recovery run)
+      const { data: existingGha } = await adminClient
+        .from('gha_earnings')
+        .select('id')
+        .eq('gha_id', agent.gha_id)
+        .eq('agent_id', agent.id)
+        .eq('month_year', currentMonth)
+        .limit(1)
+        .maybeSingle();
+
+      if (existingGha) {
+        // Webhook already created earnings — skip
+        continue;
+      }
+
+      // No earnings found — webhook must have dropped — recover
+      var ghaRate = await getStaffCommissionRate(agent.gha_id, 'GHA');
+      var ghaComm = Math.round(parseFloat(agent.subscription_amount) * (ghaRate / 100));
+
+      const { error: ghaErr } = await adminClient.from('gha_earnings').upsert([{
+        gha_id: agent.gha_id,
+        agent_id: agent.id,
+        agent_email: agent.email,
+        subscription_amount: parseFloat(agent.subscription_amount),
+        commission_rate: ghaRate,
+        commission_amount: ghaComm,
+        month_year: currentMonth,
+        payment_reference: recoveryRef,
+        is_paid: false,
+      }], { onConflict: 'gha_id,agent_id,payment_reference' });
+
+      if (ghaErr) {
+        console.error('Recovery GHA failed for:', agent.email, ghaErr.message);
+      } else {
+        console.log('Recovery GHA earnings created:', agent.email, '| commission:', ghaComm);
+        recovered++;
+      }
+
+      if (agent.sa_id) {
+        const { data: existingSa } = await adminClient
+          .from('sa_earnings')
+          .select('id')
+          .eq('sa_id', agent.sa_id)
+          .eq('agent_id', agent.id)
+          .eq('month_year', currentMonth)
+          .limit(1)
+          .maybeSingle();
+
+        if (!existingSa) {
+          var saRate = await getStaffCommissionRate(agent.sa_id, 'SA');
+          var saComm = Math.round(parseFloat(agent.subscription_amount) * (saRate / 100));
+
+          const { error: saErr } = await adminClient.from('sa_earnings').upsert([{
+            sa_id: agent.sa_id,
+            gha_id: agent.gha_id,
+            agent_id: agent.id,
+            subscription_amount: parseFloat(agent.subscription_amount),
+            commission_rate: saRate,
+            commission_amount: saComm,
+            month_year: currentMonth,
+            payment_reference: recoveryRef,
+            is_paid: false,
+          }], { onConflict: 'sa_id,agent_id,payment_reference' });
+
+          if (saErr) console.error('Recovery SA failed for:', agent.email, saErr.message);
+          else console.log('Recovery SA earnings created:', agent.email, '| commission:', saComm);
+        }
+      }
+    }
+
+    console.log('=== EARNINGS RECOVERY COMPLETE === recovered:', recovered);
+    if (recovered > 0) await generateMonthlySnapshot(currentMonth);
+  } catch(err) {
+    console.error('Earnings recovery job error:', err.message);
+  }
+}
+
+// Run 5 minutes after startup (give webhook time to fire first) then every hour
+setTimeout(recoverMissingEarnings, 5 * 60 * 1000);
+setInterval(recoverMissingEarnings, 60 * 60 * 1000);
 // ──────────────────────────────────────────────────────────
 // AUTH
 // ──────────────────────────────────────────────────────────
@@ -7403,6 +7531,12 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
       const agentId = metaAgentId;
       const tier = metaTier;
 
+      console.log('=== SUBSCRIPTION WEBHOOK START ===');
+      console.log('agentId:', agentId, '| tier:', tier, '| amount:', amount);
+      if (!agentId || !tier) {
+        console.error('CRITICAL: subscription webhook missing agentId or tier - earnings cannot be created. meta:', JSON.stringify(verifiedMeta));
+      }
+
       if (agentId && tier) {
         const tierDurations = { premium: 30, agency: 30 };
         const daysToAdd = tierDurations[tier] || 30;
@@ -7446,11 +7580,22 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           console.log('Agent subscription updated:', agentId, tier, subscriptionEnd);
 
           // Get agent's GHA and SA for earnings calculation
-          const { data: agentProfile } = await adminClient
+          const { data: agentProfile, error: agentProfileErr } = await adminClient
             .from('profiles')
             .select('gha_id, sa_id, gha_code, full_name, email')
             .eq('id', agentId)
             .single();
+
+          console.log('=== SUBSCRIPTION EARNINGS START ===');
+          console.log('agentId:', agentId);
+          console.log('amount:', amount);
+          console.log('tier:', tier);
+          console.log('agentProfile:', JSON.stringify(agentProfile));
+          console.log('agentProfile fetch error:', JSON.stringify(agentProfileErr));
+          console.log('GHA ID:', agentProfile?.gha_id, '| SA ID:', agentProfile?.sa_id);
+          if (!agentProfile?.gha_id && !agentProfile?.sa_id) {
+            console.error('CRITICAL: No GHA or SA linked to agent - subscription earnings cannot be created. Agent:', agentId);
+          }
 
           const monthYear = getBillingMonth();
 
@@ -7498,6 +7643,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               is_read: false,
             }]);
             if (ghaNotifErr) console.error('GHA notification failed (non-blocking):', ghaNotifErr.message);
+          } else {
+            console.error('No gha_id for agent:', agentId, '- no GHA subscription earnings created');
           }
 
           // Create SA earnings row
@@ -7526,7 +7673,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               is_read: false,
             }]);
             if (saNotifErr) console.error('SA notification failed (non-blocking):', saNotifErr.message);
+          } else {
+            console.error('No sa_id for agent:', agentId, '- no SA subscription earnings created');
           }
+
+          console.log('=== SUBSCRIPTION EARNINGS COMPLETE === ref:', paymentRef, '| month:', monthYear);
 
           // Keep the monthly snapshot current after these earnings rows
           await generateMonthlySnapshot(monthYear);
