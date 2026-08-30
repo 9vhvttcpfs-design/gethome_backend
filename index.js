@@ -2799,8 +2799,13 @@ app.get('/api/gha/inspections', verifyStaffToken, async (req, res) => {
     if (error) throw error;
 
     var visibleInspections = (inspections || []).filter(function(i) {
-      // Hide confirmed - SA has verified, GHA's job is done
-      if (i.status === 'confirmed') return false;
+      // Keep confirmed inspections so GHA can see their completed work
+      // Only hide confirmed inspections older than 30 days to reduce clutter
+      if (i.status === 'confirmed') {
+        var confirmedDate = i.sa_confirmed_at ? new Date(i.sa_confirmed_at) : null;
+        if (confirmedDate && (Date.now() - confirmedDate.getTime()) > 30 * 24 * 60 * 60 * 1000) return false;
+        return true; // show recent confirmed
+      }
       // Hide done inspections GHA manually cleared
       if (i.status === 'done' && i.cleared_by_gha === true) return false;
       return true;
@@ -12085,7 +12090,8 @@ app.post('/api/admin/mark-inspection-payment-paid', async (req, res) => {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { gha_id, month, amount, inspection_count } = req.body;
+    const { gha_id, amount, inspection_count } = req.body;
+    var month = req.body.month_year || req.body.month;
     if (!gha_id || !month) return res.status(400).json({ error: 'gha_id and month required' });
 
     var now = new Date().toISOString();
