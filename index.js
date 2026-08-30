@@ -8174,6 +8174,20 @@ app.get('/api/admin/monthly-history', async (req, res) => {
     var ghaCodeMap = {};
     (ghas || []).forEach(function(g) { ghaCodeMap[g.id] = { gha_code: g.gha_code, gha_name: g.full_name }; });
 
+    // Get listing counts for all agents
+    var listingCountMap = {};
+    if (snapAgentIds.length > 0) {
+      const { data: listings } = await adminClient
+        .from('properties')
+        .select('created_by')
+        .in('created_by', snapAgentIds)
+        .or('is_deleted.eq.false,is_deleted.is.null');
+
+      (listings || []).forEach(function(l) {
+        listingCountMap[l.created_by] = (listingCountMap[l.created_by] || 0) + 1;
+      });
+    }
+
     var agentSnapshots = (allGhaEarnings || []).map(function(e) {
       var prof = snapAgentMap[e.agent_id] || {};
       var ghaInfo = ghaCodeMap[e.gha_id] || {};
@@ -8186,6 +8200,7 @@ app.get('/api/admin/monthly-history', async (req, res) => {
         gha_id: e.gha_id,
         gha_code: ghaInfo.gha_code || '—',
         gha_name: ghaInfo.gha_name || '—',
+        listing_count: listingCountMap[e.agent_id] || 0,
         commission_amount: parseFloat(e.commission_amount || 0),
         subscription_amount: parseFloat(e.subscription_amount || 0),
         commission_rate: e.commission_rate,
@@ -9333,6 +9348,9 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         fee_per_inspection: inspFee,
         inspection_payment: inspPayment,
         inspection_paid: inspPayRecord?.payment_status === 'paid',
+        // Scoped to THIS GHA only: no outstanding commission and no outstanding
+        // inspection payment for the month.
+        is_fully_paid: (totalCommission + inspPayment) <= 0,
         total_due: totalCommission + inspPayment,
       };
     }));
@@ -9548,6 +9566,21 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     const { data: payment } = await paymentQuery.single();
     if (!payment) return res.status(404).json({ error: 'Payment record not found' });
 
+    // For SA: bail before touching any record if there is no unpaid commission
+    // for this specific SA in this month.
+    if ((staff_type || payment.staff_type) === 'SA') {
+      const { data: saUnpaidRows } = await adminClient
+        .from('sa_earnings')
+        .select('id')
+        .eq('sa_id', staff_id)
+        .eq('month_year', month_year)
+        .eq('is_paid', false);
+
+      if (!saUnpaidRows || saUnpaidRows.length === 0) {
+        return res.status(404).json({ error: 'No unpaid commission found for this SA for ' + month_year });
+      }
+    }
+
     const now = new Date().toISOString();
     const { error: updateErr } = await adminClient.from('staff_payments').upsert([{
       staff_id: staff_id,
@@ -9557,7 +9590,7 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
       paid_at: now,
       paid_by: admin.id,
       updated_at: now,
-    }], { onConflict: 'staff_id,month_year' });
+    }], { onConflict: 'staff_id,staff_type,month_year' });
 
     if (updateErr) return res.status(500).json({ error: updateErr.message });
 
@@ -12071,14 +12104,14 @@ app.post('/api/admin/mark-inspection-payment-paid', async (req, res) => {
         paid_at: now,
         paid_by: admin.id,
         updated_at: now,
-      }], { onConflict: 'staff_id,month_year' });
+      }], { onConflict: 'staff_id,staff_type,month_year' });
 
     if (payErr) {
       console.error('Staff payment record error:', payErr.message);
-      return res.status(500).json({ error: payErr.message });
+      return res.status(500).json({ error: 'Failed to record payment: ' + payErr.message });
     }
 
-    console.log('Inspection payment marked paid - GHA:', gha_id, '| month:', month, '| amount:', amount);
+    console.log('Inspection payment marked paid - gha_id:', gha_id, '| amount:', amount, '| month:', month);
     res.json({ success: true, message: 'Inspection payment marked as paid' });
   } catch(err) {
     console.error('Mark inspection payment paid error:', err.message);
