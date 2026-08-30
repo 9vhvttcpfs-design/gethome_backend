@@ -9316,7 +9316,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
 
       const { data: confirmedInsp } = await adminClient
         .from('inspections')
-        .select('id, sa_confirmed_at, property_address, customer_name')
+        .select('id, created_at, sa_confirmed_at, property_address, customer_name')
         .eq('gha_id', gha.id)
         .eq('status', 'confirmed')
         .gte('created_at', month + '-01')
@@ -9324,18 +9324,37 @@ app.get('/api/admin/staff-payments', async (req, res) => {
 
       const { data: inspPayRecord } = await adminClient
         .from('staff_payments')
-        .select('payment_status, paid_at, inspection_payment')
+        .select('payment_status, paid_at, inspection_payment, inspection_status, inspection_paid_at')
         .eq('staff_id', gha.id)
         .eq('staff_type', 'GHA')
         .eq('month_year', month)
         .maybeSingle();
 
-      var inspCount = (confirmedInsp || []).length;
+      // Once an inspection payment has been marked paid, inspections confirmed
+      // BEFORE it are settled - inspections confirmed AFTER it are still owed.
+      // Use the inspection-specific paid_at, NOT the shared commission paid_at,
+      // so marking commission paid does not hide unpaid inspections (and fall
+      // back to the legacy shared columns for rows written before the split).
+      var lastInspPaidAt = inspPayRecord?.inspection_status === 'paid'
+        ? (inspPayRecord.inspection_paid_at || null)
+        : (inspPayRecord?.payment_status === 'paid' ? (inspPayRecord.paid_at || null) : null);
+      var paidInspections = [];
+      var unpaidInspections = [];
+      (confirmedInsp || []).forEach(function(insp) {
+        var confirmedAt = insp.sa_confirmed_at || insp.created_at || '';
+        if (lastInspPaidAt && confirmedAt && confirmedAt < lastInspPaidAt) {
+          paidInspections.push(insp);
+        } else {
+          unpaidInspections.push(insp);
+        }
+      });
+
+      var inspCount = unpaidInspections.length;
       var inspFee = await getInspectionFeeForCount(inspCount);
-      var inspPayment = inspPayRecord?.payment_status === 'paid' ? 0 : inspCount * inspFee;
+      var inspPayment = inspCount * inspFee;
       var totalCommission = (unpaidComm || []).reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
 
-      console.log('GHA', gha.gha_code, '| unpaid commission:', totalCommission, '| inspections:', inspCount, '| insp payment:', inspPayment);
+      console.log('GHA', gha.gha_code, '| total confirmed:', (confirmedInsp || []).length, '| already paid:', paidInspections.length, '| unpaid:', inspCount, '| unpaid commission:', totalCommission, '| insp payment:', inspPayment);
 
       return {
         gha_id: gha.id,
@@ -9350,9 +9369,13 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         unpaid_commission: totalCommission,
         commission_rows: unpaidComm || [],
         confirmed_inspections: inspCount,
+        total_inspections_this_month: (confirmedInsp || []).length,
+        already_paid_inspections: paidInspections.length,
         fee_per_inspection: inspFee,
         inspection_payment: inspPayment,
-        inspection_paid: inspPayRecord?.payment_status === 'paid',
+        // Only "fully paid" for inspections once an inspection payment exists AND
+        // nothing new has been confirmed since it.
+        inspection_paid: (inspPayRecord?.inspection_status === 'paid' || inspPayRecord?.payment_status === 'paid') && inspCount === 0,
         // Scoped to THIS GHA only: no outstanding commission and no outstanding
         // inspection payment for the month.
         is_fully_paid: (totalCommission + inspPayment) <= 0,
@@ -9561,19 +9584,18 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     // Accept `month` as an alias for `month_year` for callers using either name.
     const { staff_id, staff_type, payment_notes } = req.body;
     const month_year = req.body.month_year || req.body.month;
-    if (!staff_id || !month_year) return res.status(400).json({ error: 'staff_id and month_year are required' });
+    if (!staff_id || !staff_type || !month_year) {
+      return res.status(400).json({ error: 'staff_id, staff_type and month_year are required' });
+    }
 
-    // staff_id alone is ambiguous (GHA and SA ids are separate sequences and can
-    // collide), so filter by staff_type when the caller provides it.
-    var paymentQuery = adminClient.from('staff_payments')
-      .select('*').eq('staff_id', staff_id).eq('month_year', month_year);
-    if (staff_type) paymentQuery = paymentQuery.eq('staff_type', staff_type);
-    const { data: payment } = await paymentQuery.single();
-    if (!payment) return res.status(404).json({ error: 'Payment record not found' });
+    // No pre-existing staff_payments row is required. This endpoint records a
+    // manual payment straight from the per-agent earnings rows and upserts the
+    // staff_payments record below (creating it if it does not exist yet).
+    var totalPaid = 0;
 
     // For SA: bail before touching any record if there is no unpaid commission
     // for this specific SA in this month.
-    if ((staff_type || payment.staff_type) === 'SA') {
+    if (staff_type === 'SA') {
       const { data: saUnpaidRows } = await adminClient
         .from('sa_earnings')
         .select('id')
@@ -9587,21 +9609,11 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     }
 
     const now = new Date().toISOString();
-    const { error: updateErr } = await adminClient.from('staff_payments').upsert([{
-      staff_id: staff_id,
-      staff_type: staff_type || payment.staff_type,
-      month_year: month_year,
-      payment_status: 'paid',
-      paid_at: now,
-      paid_by: admin.id,
-      updated_at: now,
-    }], { onConflict: 'staff_id,staff_type,month_year' });
 
-    if (updateErr) return res.status(500).json({ error: updateErr.message });
-
-    // Mark ALL earnings for this staff member this month as paid, so the
-    // per-agent earnings rows stay in sync with the staff_payments record.
-    if (payment.staff_type === 'GHA') {
+    // Mark ALL earnings for this staff member this month as paid first, so the
+    // per-agent earnings rows stay in sync with the staff_payments record and
+    // we know the commission total before writing it.
+    if (staff_type === 'GHA') {
       // Mark ALL unpaid rows for this GHA this month as paid
       const { data: markedRows, error: ghaPayErr } = await adminClient
         .from('gha_earnings')
@@ -9617,12 +9629,12 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
 
       if (ghaPayErr) return res.status(500).json({ error: ghaPayErr.message });
 
-      var totalPaid = (markedRows || []).reduce(function(sum, r) {
+      totalPaid = (markedRows || []).reduce(function(sum, r) {
         return sum + parseFloat(r.commission_amount || 0);
       }, 0);
 
       console.log('GHA marked paid:', staff_id, '| month:', month_year, '| rows:', (markedRows || []).length, '| total:', totalPaid);
-    } else if (payment.staff_type === 'SA') {
+    } else if (staff_type === 'SA') {
       // Mark ALL unpaid rows for this SA this month as paid
       const { data: markedRows, error: saPayErr } = await adminClient
         .from('sa_earnings')
@@ -9638,20 +9650,40 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
 
       if (saPayErr) return res.status(500).json({ error: saPayErr.message });
 
-      var totalPaid = (markedRows || []).reduce(function(sum, r) {
+      totalPaid = (markedRows || []).reduce(function(sum, r) {
         return sum + parseFloat(r.commission_amount || 0);
       }, 0);
 
       console.log('SA marked paid:', staff_id, '| month:', month_year, '| rows:', (markedRows || []).length, '| total:', totalPaid);
     }
 
+    // Record the commission payment on the shared staff_payments row. Write the
+    // commission_* fields only - do NOT touch inspection_* here, those are owned
+    // by /api/admin/mark-inspection-payment-paid. payment_status/paid_at are the
+    // legacy shared columns kept in sync for older callers.
+    const { error: updateErr } = await adminClient.from('staff_payments').upsert([{
+      staff_id: staff_id,
+      staff_type: staff_type,
+      month_year: month_year,
+      commission_amount: totalPaid,
+      commission_status: 'paid',
+      commission_paid_at: now,
+      commission_paid_by: admin.id,
+      payment_status: 'paid',
+      paid_at: now,
+      paid_by: admin.id,
+      updated_at: now,
+    }], { onConflict: 'staff_id,staff_type,month_year' });
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
     // Notify staff member
     const { error: notifErr } = await adminClient.from('notifications').insert([{
-      recipient_type: payment.staff_type,
+      recipient_type: staff_type,
       recipient_id: staff_id,
       type: 'payment_received',
       title: 'Payment Received',
-      message: 'Your payment of NGN ' + parseFloat(payment.total_payment).toLocaleString() + ' for ' + month_year + ' has been processed. Thank you for your service!',
+      message: 'Your payment of NGN ' + totalPaid.toLocaleString() + ' for ' + month_year + ' has been processed. Thank you for your service!',
       is_read: false,
     }]);
     if (notifErr) console.error('Staff payment notification failed:', notifErr.message);
@@ -12096,7 +12128,9 @@ app.post('/api/admin/mark-inspection-payment-paid', async (req, res) => {
 
     var now = new Date().toISOString();
 
-    // Record in staff_payments table
+    // Record in staff_payments table. Write the inspection_* fields only - do NOT
+    // touch commission_* here, those are owned by /api/admin/mark-staff-paid.
+    // payment_status/paid_at are the legacy shared columns kept in sync.
     const { error: payErr } = await adminClient
       .from('staff_payments')
       .upsert([{
@@ -12105,7 +12139,9 @@ app.post('/api/admin/mark-inspection-payment-paid', async (req, res) => {
         month_year: month,
         inspection_count: inspection_count || 0,
         inspection_payment: parseFloat(amount || 0),
-        total_payment: parseFloat(amount || 0),
+        inspection_status: 'paid',
+        inspection_paid_at: now,
+        inspection_paid_by: admin.id,
         payment_status: 'paid',
         paid_at: now,
         paid_by: admin.id,
