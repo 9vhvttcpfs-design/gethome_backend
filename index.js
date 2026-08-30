@@ -241,21 +241,39 @@ async function getStaffCommissionRate(staffId, staffType) {
     var table = staffType === 'GHA' ? 'gha_agents' : 'service_agents';
     var settingKey = staffType === 'GHA' ? 'gha_commission_rate' : 'sa_commission_rate';
 
-    // Fetch both in parallel
     const [staffResult, globalResult] = await Promise.all([
-      adminClient.from(table).select('commission_rate, commission_rate_override').eq('id', staffId).single(),
-      adminClient.from('app_settings').select('setting_value').eq('setting_key', settingKey).single(),
+      adminClient.from(table)
+        .select('commission_rate, commission_rate_override')
+        .eq('id', staffId)
+        .single(),
+      adminClient.from('app_settings')
+        .select('setting_value')
+        .eq('setting_key', settingKey)
+        .single(),
     ]);
 
     var overrideRate = parseFloat(staffResult?.data?.commission_rate_override || 0);
     var individualRate = parseFloat(staffResult?.data?.commission_rate || 0);
     var globalRate = parseFloat(globalResult?.data?.setting_value || 5);
 
-    // commission_rate_override wins if explicitly set (> 0), then plain
-    // commission_rate, then the global setting
-    var effectiveRate = overrideRate > 0 ? overrideRate : (individualRate > 0 ? individualRate : globalRate);
+    var effectiveRate;
+    if (overrideRate > 0) {
+      // commission_rate_override set — use it
+      effectiveRate = overrideRate;
+    } else if (individualRate > 0 && individualRate !== globalRate) {
+      // Individual rate differs from global — use individual
+      effectiveRate = individualRate;
+    } else {
+      // Fall back to global
+      effectiveRate = globalRate;
+    }
 
-    console.log('Commission rate -', staffType, staffId, '| override:', overrideRate, '| individual:', individualRate, '| global:', globalRate, '| using:', effectiveRate);
+    console.log('Commission rate -', staffType, staffId,
+      '| override:', overrideRate,
+      '| individual:', individualRate,
+      '| global:', globalRate,
+      '| using:', effectiveRate);
+
     return effectiveRate;
   } catch(err) {
     console.error('getStaffCommissionRate error:', err.message);
