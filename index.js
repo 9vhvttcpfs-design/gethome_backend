@@ -4852,10 +4852,11 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
     console.log('Agent auto-approved on GHA assignment:', agent_id);
 
     // Step 1: Update agents table too (not just profiles)
-    await adminClient.from('agents').update({
+    const { error: agentsAssignErr } = await adminClient.from('agents').update({
       status: 'approved',
       gha_id: gha_id,
-    }).eq('id', agent_id).catch(e => console.error('Agents table update failed:', e.message));
+    }).eq('id', agent_id);
+    if (agentsAssignErr) console.error('Agents table update failed:', agentsAssignErr.message);
 
     // Step 2: Create earnings for any existing paid subscription
     try {
@@ -4918,14 +4919,15 @@ app.post('/api/admin/assign-agent-to-gha', async (req, res) => {
 
     // Step 3: Notify SA of the new agent assignment
     if (gha.sa_id) {
-      await adminClient.from('notifications').insert([{
+      const { error: saNotifErr } = await adminClient.from('notifications').insert([{
         recipient_type: 'SA',
         recipient_id: gha.sa_id,
         type: 'agent_assigned',
         title: 'Agent Assigned to Your GHA',
         message: 'Admin has assigned a new agent to ' + gha.gha_code + '. The agent is now approved and under your supervision.',
         is_read: false,
-      }]).catch(e => console.error('SA notification failed:', e.message));
+      }]);
+      if (saNotifErr) console.error('SA notification failed:', saNotifErr.message);
     }
 
     res.json({ success: true, message: 'Agent assigned to ' + gha.gha_code, updated_agent: updated[0] });
@@ -7589,14 +7591,15 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           }
 
           // Also notify admin
-          await adminClient.from('notifications').insert([{
+          const { error: adminFeaturedNotifErr } = await adminClient.from('notifications').insert([{
             recipient_type: 'ADMIN',
             recipient_id: 'admin',
             type: 'featured_payment_received',
             title: 'Featured Listing Payment Received',
             message: 'Property "' + (updatedProp?.title || 'Property #' + featuredPropertyId) + '" has been featured. Amount: NGN ' + featuredAmount.toLocaleString(),
             is_read: false,
-          }]).catch(e => console.error('Admin featured notification failed:', e.message));
+          }]);
+          if (adminFeaturedNotifErr) console.error('Admin featured notification failed:', adminFeaturedNotifErr.message);
         }
       } else {
         console.error('Featured payment received but no property_id in meta:', JSON.stringify(verifiedMeta));
@@ -7688,10 +7691,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         }
 
         // Update agents table
-        await adminClient.from('agents').update({
+        const { error: agentsUpdateErr } = await adminClient.from('agents').update({
           unlimited_listings: true,
           unlimited_expires_at: expiryISO,
-        }).eq('id', unlimitedAgentId).catch(e => console.error('Agents unlimited update:', e.message));
+        }).eq('id', unlimitedAgentId);
+        if (agentsUpdateErr) console.error('Agents unlimited update:', agentsUpdateErr.message);
 
         // Get agent's GHA and SA for commission
         const { data: agentProfile } = await adminClient
@@ -7764,7 +7768,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         await generateMonthlySnapshot(monthYear);
 
         // Notify agent
-        await adminClient.from('notifications').insert([{
+        const { error: unlimitedNotifErr } = await adminClient.from('notifications').insert([{
           recipient_type: 'AGENT',
           recipient_id: unlimitedAgentId,
           type: 'unlimited_plan_activated',
@@ -7772,7 +7776,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           message: 'Your Unlimited Plan is now active! Upload unlimited listings until ' +
             expiryDate.toLocaleDateString('en-NG', { day: 'numeric', month: 'long', year: 'numeric' }) + '.',
           is_read: false,
-        }]).catch(e => console.error('Unlimited notification failed:', e.message));
+        }]);
+        if (unlimitedNotifErr) console.error('Unlimited notification failed:', unlimitedNotifErr.message);
 
         console.log('Unlimited plan activated for agent:', unlimitedAgentId, '| expires:', expiryISO);
 
@@ -7846,24 +7851,24 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
         // Find the pending inspection record pre-created at payment initialization
         // (matched by fee_payment_reference) so we update it instead of creating a duplicate.
-        const { data: existingInsp } = await adminClient
+        const { data: existingInsp, error: existingInspErr } = await adminClient
           .from('inspections')
           .select('id, customer_id')
           .eq('fee_payment_reference', txRef)
-          .maybeSingle()
-          .catch(e => { console.error('Existing inspection lookup failed:', e.message); return { data: null }; });
+          .maybeSingle();
+        if (existingInspErr) console.error('Existing inspection lookup failed:', existingInspErr.message);
 
         var newInspection = null;
         if (existingInsp?.id) {
-          const { data: updatedInsp } = await adminClient.from('inspections').update({
+          const { data: updatedInsp, error: updatedInspErr } = await adminClient.from('inspections').update({
             status: 'pending',
             fee_payment_amount: inspFeeAmount,
             fee_paid_at: new Date().toISOString(),
             fee_payment_status: 'paid',
             assigned_by_sa: inspSaId || null,
             customer_id: inspCustomerId || existingInsp.customer_id || null,
-          }).eq('id', existingInsp.id).select().single()
-            .catch(e => { console.error('Inspection record update failed:', e.message); return { data: null }; });
+          }).eq('id', existingInsp.id).select().single();
+          if (updatedInspErr) console.error('Inspection record update failed:', updatedInspErr.message);
           newInspection = updatedInsp;
           if (newInspection?.id) console.log('Pending inspection record updated to paid:', newInspection.id);
         } else {
@@ -7881,19 +7886,19 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             .maybeSingle();
 
           if (existingWebhookInsp) {
-            const { data: updatedInsp2 } = await adminClient.from('inspections').update({
+            const { data: updatedInsp2, error: updatedInsp2Err } = await adminClient.from('inspections').update({
               fee_payment_amount: inspFeeAmount,
               fee_payment_status: 'paid',
               fee_paid_at: new Date().toISOString(),
               fee_payment_reference: txRef,
               assigned_by_sa: inspSaId || null,
               customer_id: inspCustomerId || null,
-            }).eq('id', existingWebhookInsp.id).select().single()
-              .catch(e => { console.error('Existing inspection (by customer+property) update failed:', e.message); return { data: null }; });
+            }).eq('id', existingWebhookInsp.id).select().single();
+            if (updatedInsp2Err) console.error('Existing inspection (by customer+property) update failed:', updatedInsp2Err.message);
             newInspection = updatedInsp2;
             if (newInspection?.id) console.log('Updated existing inspection with fee paid:', newInspection.id);
           } else {
-            const { data: insertedInsp } = await adminClient.from('inspections').insert([{
+            const { data: insertedInsp, error: insertedInspErr } = await adminClient.from('inspections').insert([{
               property_id: inspPropertyId,
               customer_email: inspCustomerEmail,
               customer_name: inspCustomerName,
@@ -7907,7 +7912,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               fee_payment_reference: txRef,
               assigned_by_sa: inspSaId || null,
               customer_id: inspCustomerId || null,
-            }]).select().single().catch(e => { console.error('Inspection record creation failed:', e.message); return { data: null }; });
+            }]).select().single();
+            if (insertedInspErr) console.error('Inspection record creation failed:', insertedInspErr.message);
             newInspection = insertedInsp;
             if (newInspection?.id) console.log('Inspection record created:', newInspection.id);
           }
@@ -7926,7 +7932,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
         // Notify SA with WhatsApp link
         if (inspSaId) {
-          await adminClient.from('notifications').insert([{
+          const { error: saInspNotifErr } = await adminClient.from('notifications').insert([{
             recipient_type: 'SA',
             recipient_id: inspSaId,
             type: 'inspection_fee_paid',
@@ -7940,11 +7946,12 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               customer_name: inspCustomerName,
               customer_phone: inspCustomerPhone,
             }),
-          }]).catch(e => console.error('SA inspection fee notification failed:', e.message));
+          }]);
+          if (saInspNotifErr) console.error('SA inspection fee notification failed:', saInspNotifErr.message);
         }
 
         // Also notify admin
-        await adminClient.from('notifications').insert([{
+        const { error: adminInspNotifErr } = await adminClient.from('notifications').insert([{
           recipient_type: 'ADMIN',
           recipient_id: 'admin',
           type: 'inspection_fee_paid',
@@ -7952,7 +7959,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           message: (inspCustomerName || inspCustomerEmail) + ' paid inspection fee for ' + (inspProp.title || 'property'),
           is_read: false,
           meta: JSON.stringify({ whatsapp_link: waLink, property_id: inspPropertyId }),
-        }]).catch(e => console.error('Admin inspection fee notification failed:', e.message));
+        }]);
+        if (adminInspNotifErr) console.error('Admin inspection fee notification failed:', adminInspNotifErr.message);
 
         console.log('Inspection fee payment processed - WhatsApp notification created for SA');
       }
@@ -11517,14 +11525,15 @@ app.post('/api/admin/update-listing-price', async (req, res) => {
       }
 
       if (notifySaId) {
-        await adminClient.from('notifications').insert([{
+        const { error: priceNotifErr } = await adminClient.from('notifications').insert([{
           recipient_type: 'SA',
           recipient_id: notifySaId,
           type: 'price_updated',
           title: 'Listing Price Updated',
           message: 'The price for listing "' + property.title + '" has been updated to NGN ' + parseFloat(new_price).toLocaleString() + (reason ? '. Reason: ' + reason : '.'),
           is_read: false,
-        }]).catch(e => console.error('Price update notification failed:', e.message));
+        }]);
+        if (priceNotifErr) console.error('Price update notification failed:', priceNotifErr.message);
       }
     }
 
@@ -11767,14 +11776,15 @@ app.post('/api/admin/deactivate-unlimited', async (req, res) => {
     }).eq('id', prof.id);
 
     // Notify agent
-    await adminClient.from('notifications').insert([{
+    const { error: deactivateNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'AGENT',
       recipient_id: prof.id,
       type: 'unlimited_deactivated',
       title: 'Unlimited Plan Deactivated',
       message: 'Your Unlimited Plan has been deactivated by admin. Please contact support for more information.',
       is_read: false,
-    }]).catch(e => console.error('Deactivation notification failed:', e.message));
+    }]);
+    if (deactivateNotifErr) console.error('Deactivation notification failed:', deactivateNotifErr.message);
 
     console.log('Admin deactivated unlimited for:', agent_email);
     res.json({ success: true, message: 'Unlimited plan deactivated for ' + agent_email });
