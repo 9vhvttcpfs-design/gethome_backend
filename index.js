@@ -237,6 +237,7 @@ async function getInspectionFeeForCount(confirmedCount) {
 // commission_rate column (gha_agents/service_agents) - then falls back to the
 // global rate in app_settings, then to a safe 5% default.
 async function getStaffCommissionRate(staffId, staffType) {
+  console.log('getStaffCommissionRate called - staffId:', staffId, '| staffType:', staffType);
   try {
     var table = staffType === 'GHA' ? 'gha_agents' : 'service_agents';
     var settingKey = staffType === 'GHA' ? 'gha_commission_rate' : 'sa_commission_rate';
@@ -7431,6 +7432,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             ghaId ? getStaffCommissionRate(ghaId, 'GHA') : Promise.resolve(0),
             saId ? getStaffCommissionRate(saId, 'SA') : Promise.resolve(0),
           ]);
+          console.log('GHA rate returned for', ghaId, ':', ghaCommissionRate);
+          console.log('SA rate returned for', saId, ':', saCommissionRate);
 
           var ghaCommission = Math.round(amount * (ghaCommissionRate / 100));
           var saCommission = Math.round(amount * (saCommissionRate / 100));
@@ -7684,6 +7687,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         // GHA commission
         if (agentProfile?.gha_id) {
           var ghaRate = await getStaffCommissionRate(agentProfile.gha_id, 'GHA');
+          console.log('GHA rate returned for', agentProfile.gha_id, ':', ghaRate);
           var ghaCommission = Math.round(unlimitedAmount * (ghaRate / 100));
           console.log('Creating GHA earnings - gha_id:', agentProfile.gha_id, '| rate:', ghaRate, '| commission:', ghaCommission, '| ref:', unlimitedRef);
           const { error: ghaErr } = await adminClient.from('gha_earnings').upsert([{
@@ -7707,6 +7711,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         // SA commission
         if (agentProfile?.sa_id) {
           var saRate = await getStaffCommissionRate(agentProfile.sa_id, 'SA');
+          console.log('SA rate returned for', agentProfile.sa_id, ':', saRate);
           var saCommission = Math.round(unlimitedAmount * (saRate / 100));
           console.log('Creating SA earnings - sa_id:', agentProfile.sa_id, '| rate:', saRate, '| commission:', saCommission, '| ref:', unlimitedRef);
           const { error: saErr } = await adminClient.from('sa_earnings').upsert([{
