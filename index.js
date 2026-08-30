@@ -1628,83 +1628,50 @@ app.get('/api/sa/my-agents', async (req, res) => {
   }
 });
 
-// GET /api/sa/pending-agents
 app.get('/api/sa/pending-agents', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
-      .select('*').eq('token', token).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    // Get SA location for matching
-    const { data: saRecord } = await adminClient
-      .from('service_agents').select('location, sa_code').eq('id', session.staff_id).single();
-    const saLocation = (saRecord?.location || '').toLowerCase().trim();
-    const saKeywords = saLocation.split(/[\s,]+/).map(w => w.trim()).filter(w => w.length > 2);
-
-    console.log('SA', saRecord?.sa_code, 'fetching pending agents for location:', saLocation);
-
-    // PART 1: Unclaimed agents (sa_id IS NULL) matching this SA's city - these are NEW pending agents
+    // PART 1: Unclaimed pending agents - filter by status in DB not JS
     const { data: unclaimedAgents } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, is_unlimited, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, created_at, subscription_tier, subscription_amount, is_unlimited, agent_type, agency_name')
       .eq('role', 'agent')
       .is('sa_id', null)
+      .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review'])
       .order('created_at', { ascending: false });
 
-    // Filter unclaimed agents by city match (relaxed)
-    const matchedUnclaimed = (unclaimedAgents || []).filter(function(a) {
-      if (saKeywords.length === 0) return true; // no SA location set - show all
-      const agentCity = (a.city || '').toLowerCase();
-      const agentAddr = (a.office_address || '').toLowerCase();
-      const agentText = agentCity + ' ' + agentAddr;
-      const hasNoLocation = !agentCity && !agentAddr;
-      const matches = saKeywords.some(function(kw) { return agentText.includes(kw); });
-      return matches || hasNoLocation;
-    });
-
-    // PART 2: Agents ALREADY assigned to this SA (after SA claimed them) - these are in later stages
+    // PART 2: Agents assigned to this SA that are still pending
     const { data: claimedAgents } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, gha_verified, subscription_tier, subscription_end, is_unlimited, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, created_at, subscription_tier, subscription_amount, is_unlimited, agent_type, agency_name')
       .eq('role', 'agent')
       .eq('sa_id', session.staff_id)
+      .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review'])
       .order('created_at', { ascending: false });
 
-    console.log('Unclaimed matched:', matchedUnclaimed.length, '| Claimed by this SA:', (claimedAgents || []).length);
-
-    const pendingStatuses = ['pending', 'pending_sa_review', 'awaiting_review'];
-
-    // Pending = unclaimed agents in this SA's area, status pending
-    const pending = matchedUnclaimed.filter(function(a) {
-      return pendingStatuses.includes(a.status) || !a.status;
+    // Combine and deduplicate
+    var allPending = [];
+    var seen = {};
+    [...(unclaimedAgents || []), ...(claimedAgents || [])].forEach(function(a) {
+      if (!seen[a.id]) { seen[a.id] = true; allPending.push(a); }
     });
 
-    // GHA inspection = already claimed by this SA and sent to a GHA
-    const ghaInspection = (claimedAgents || []).filter(function(a) {
-      return a.status === 'pending_gha_inspection';
-    });
-
-    // Approved = claimed by this SA and approved
-    const approved = (claimedAgents || []).filter(function(a) {
-      return a.status === 'approved';
-    });
-
-    // Flag agents who have paid (unlimited plan or any non-free subscription tier)
-    // so the SA can see a payment badge and prioritize approving them.
-    const withPaidBadge = function(agent) {
-      return Object.assign({}, agent, {
-        has_paid: !!(agent.subscription_tier && agent.subscription_tier !== 'free') || agent.is_unlimited === true,
+    // Add has_paid flag for SA to prioritize
+    var enriched = allPending.map(function(a) {
+      return Object.assign({}, a, {
+        has_paid: !!(a.subscription_tier && a.subscription_tier !== 'free') || a.is_unlimited === true,
       });
-    };
-
-    res.json({
-      pending: pending.map(withPaidBadge),
-      pending_gha_inspection: ghaInspection.map(withPaidBadge),
-      approved: approved.map(withPaidBadge),
     });
-  } catch (err) {
-    console.error('Pending agents exception:', err.message);
+
+    console.log('SA pending agents:', enriched.length, '| unclaimed:', (unclaimedAgents||[]).length, '| claimed:', (claimedAgents||[]).length);
+    res.json(enriched);
+  } catch(err) {
+    console.error('SA pending agents error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
