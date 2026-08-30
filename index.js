@@ -2539,8 +2539,7 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
         .from('inspections')
         .select('id', { count: 'exact', head: true })
         .eq('gha_id', ghaId)
-        .eq('status', 'confirmed')
-        .eq('inspection_type', 'customer'),
+        .eq('status', 'confirmed'),
 
       adminClient
         .from('gha_agents')
@@ -3200,6 +3199,19 @@ app.get('/api/sa/overview', async (req, res) => {
       .in('status', ['pending', 'assigned'])
       .eq('inspection_type', 'customer');
 
+    // Confirmed inspections scoped to the current billing month (inspections_confirmed above is all-time).
+    const { data: saMonthInspections } = await adminClient
+      .from('inspections')
+      .select('id, sa_confirmed_at, created_at')
+      .eq('assigned_by_sa', session.staff_id)
+      .eq('status', 'confirmed');
+    var inspConfirmedThisMonth = (saMonthInspections || []).filter(function(i) {
+      var d = i.sa_confirmed_at || i.created_at;
+      return d && d.substring(0, 7) === billingMonth;
+    }).length;
+
+    console.log('SA overview - pending agents:', pendingCount || 0, '| expired subs:', expiredAgents.length, '| confirmed inspections this month:', inspConfirmedThisMonth);
+
     res.json({
       total_agents: agents.length,
       active_subscriptions: activeAgents.length,
@@ -3218,6 +3230,7 @@ app.get('/api/sa/overview', async (req, res) => {
       earnings_paid: earningsPaid,
       pending_agents: pendingCount || 0,
       inspections_confirmed: inspConfirmed || 0,
+      confirmed_inspections_this_month: inspConfirmedThisMonth,
       inspections_pending: inspPending || 0,
       billing_month: billingMonth,
     });
@@ -4313,7 +4326,7 @@ app.post('/api/sa/create-inspection', async (req, res) => {
       await sendCustomerEmail(
         gha.email,
         'New Inspection Assigned - GetHome',
-        `Hello ${gha.full_name},\n\nA new inspection has been assigned to you.\n\nCustomer: ${customer_name}\nEmail: ${customer_email}\nPhone: ${customer_phone || 'Not provided'}\nAddress: ${property_address || 'TBD'}\nDate: ${inspection_date ? new Date(inspection_date).toLocaleString() : 'TBD'}\nType: ${inspection_type || 'Physical'}\n\nPlease log in to your GHA dashboard to view details.\n\nGetHome Team`
+        `Hello ${gha.full_name},\n\nA new inspection has been assigned to you.\n\nCustomer: ${customer_name}\nEmail: ${customer_email}\nPhone: ${customer_phone || 'Not provided'}\nAddress: ${property_address || 'TBD'}\nDate: ${inspection_date ? new Date(inspection_date).toLocaleString() : 'TBD'}\nType: ${inspection_type || 'customer'}\n\nPlease log in to your GHA dashboard to view details.\n\nGetHome Team`
       );
     } catch(emailErr) { console.error('GHA notification email failed:', emailErr.message); }
 
@@ -8131,14 +8144,48 @@ app.get('/api/admin/monthly-history', async (req, res) => {
         .eq('month_year', month);
       var totalSaComm = (saEarn || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
 
-      // Get confirmed inspections
-      const { count: inspCount } = await adminClient
-        .from('inspections')
-        .select('id', { count: 'exact', head: true })
-        .eq('gha_id', gha.id)
-        .eq('status', 'confirmed')
-        .gte('sa_confirmed_at', month + '-01')
-        .lte('sa_confirmed_at', month + '-31');
+      // Count confirmed inspections for this month directly from the inspections
+      // table - NOT from staff_payments.inspection_count, which only holds the
+      // total that existed when a payment was last marked. Filter on the
+      // year-month prefix in JS so timestamps late on the last day still match
+      // and rows with a null sa_confirmed_at fall back to created_at.
+      const [confirmedInspRes, inspPayRes] = await Promise.all([
+        adminClient
+          .from('inspections')
+          .select('id, sa_confirmed_at, created_at')
+          .eq('gha_id', gha.id)
+          .eq('status', 'confirmed'),
+        adminClient
+          .from('staff_payments')
+          .select('payment_status, paid_at, inspection_status, inspection_paid_at, inspection_count')
+          .eq('staff_id', gha.id)
+          .eq('staff_type', 'GHA')
+          .eq('month_year', month)
+          .maybeSingle(),
+      ]);
+
+      var monthInspections = (confirmedInspRes.data || []).filter(function(i) {
+        var d = i.sa_confirmed_at || i.created_at;
+        return d && d.substring(0, 7) === month;
+      });
+      var inspCount = monthInspections.length;
+
+      // Split paid vs unpaid on the GHA's inspection_paid_at (legacy paid_at
+      // fallback), matching /api/admin/staff-payments and inspection-payments:
+      // inspections confirmed before the last inspection payment are settled.
+      var inspPayRecord = inspPayRes.data;
+      var lastInspPaidAt = inspPayRecord?.inspection_status === 'paid'
+        ? (inspPayRecord.inspection_paid_at || null)
+        : (inspPayRecord?.payment_status === 'paid' ? (inspPayRecord.paid_at || null) : null);
+      var inspPaidCount = lastInspPaidAt
+        ? monthInspections.filter(function(i) {
+            var d = i.sa_confirmed_at || i.created_at || '';
+            return d && d < lastInspPaidAt;
+          }).length
+        : 0;
+      var inspUnpaidCount = Math.max(0, inspCount - inspPaidCount);
+
+      console.log('GHA', gha.gha_code, '| month inspections:', inspCount, '| paid:', inspPaidCount, '| unpaid:', inspUnpaidCount);
 
       return {
         gha_id: gha.id,
@@ -8152,8 +8199,10 @@ app.get('/api/admin/monthly-history', async (req, res) => {
         gha_commission: totalGhaComm,
         total_sa_commission: totalSaComm,
         sa_commission: totalSaComm,
-        inspections_completed: inspCount || 0,
-        inspection_done: inspCount || 0,
+        inspections_completed: inspCount,
+        inspections_paid: inspPaidCount,
+        inspections_unpaid: inspUnpaidCount,
+        inspection_done: inspCount,
         total_agents: (ghaEarn || []).length,
         active_subscriptions: new Set((ghaEarn || []).map(function(e) { return e.agent_id; })).size,
         earnings: ghaEarn || [],
@@ -9198,7 +9247,6 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
         .from('inspections')
         .select('id, status, gha_done_at, sa_confirmed_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
-        .eq('inspection_type', 'customer')
         .eq('status', 'confirmed')  // CONFIRMED only - not done
         .gte('sa_confirmed_at', monthStart)
         .lt('sa_confirmed_at', monthEnd);
@@ -9465,20 +9513,34 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         monthInspections = allConfirmed || [];
       }
 
-      var count = monthInspections.length;
-      var fee = await getInspectionFeeForCount(count);
-      var totalPayment = count * fee;
-
-      console.log('GHA', gha.gha_code, '| this month:', count, '| fee:', fee, '| total:', totalPayment);
-
-      // Check if already paid this month
+      // Check what has already been paid for inspections this month.
       const { data: payRecord } = await adminClient
         .from('staff_payments')
-        .select('payment_status, paid_at')
+        .select('payment_status, paid_at, inspection_status, inspection_paid_at, inspection_count')
         .eq('staff_id', gha.id)
         .eq('staff_type', 'GHA')
         .eq('month_year', month)
         .maybeSingle();
+
+      // Inspections confirmed on or before the last inspection payment are
+      // settled; anything confirmed after it is still owed. Use the
+      // inspection-specific paid_at, falling back to the legacy shared column
+      // for rows written before the commission/inspection split.
+      var lastInspPaidAt = payRecord?.inspection_status === 'paid'
+        ? (payRecord.inspection_paid_at || null)
+        : (payRecord?.payment_status === 'paid' ? (payRecord.paid_at || null) : null);
+
+      var unpaidInspections = monthInspections.filter(function(i) {
+        if (!lastInspPaidAt) return true;
+        var d = i.sa_confirmed_at || i.created_at || '';
+        return d > lastInspPaidAt;
+      });
+
+      var count = unpaidInspections.length;
+      var fee = await getInspectionFeeForCount(count);
+      var totalPayment = count * fee;
+
+      console.log('GHA', gha.gha_code, '| month confirmed:', monthInspections.length, '| unpaid:', count, '| last insp paid at:', lastInspPaidAt);
 
       return {
         gha_id: gha.id,
@@ -9491,12 +9553,14 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         bank_code: gha.bank_code || null,
         has_bank_details: !!(gha.bank_name && gha.account_number && gha.account_name),
         confirmed_inspections: count,
+        total_inspections_month: monthInspections.length,
+        already_paid_count: monthInspections.length - count,
         all_time_confirmed: (allConfirmed || []).length,
         fee_per_inspection: fee,
         total_inspection_payment: totalPayment,
-        is_paid: payRecord?.payment_status === 'paid',
-        paid_at: payRecord?.paid_at || null,
-        inspections: monthInspections,
+        is_paid: (payRecord?.inspection_status === 'paid' || payRecord?.payment_status === 'paid') && count === 0,
+        paid_at: payRecord?.inspection_paid_at || payRecord?.paid_at || null,
+        inspections: unpaidInspections,
       };
     }));
 
