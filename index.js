@@ -7155,6 +7155,16 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
     console.log('Flutterwave webhook received - reference:', txRef, '| status:', status);
 
+    console.log('=== WEBHOOK RECEIVED ===');
+    console.log('status:', status);
+    console.log('amount:', amount);
+    console.log('customerEmail:', customerEmail);
+    console.log('txRef:', txRef);
+    console.log('paymentType:', paymentType);
+    console.log('metaAgentId:', metaAgentId);
+    console.log('verifiedMeta:', JSON.stringify(verifiedMeta).substring(0, 200));
+    console.log('========================');
+
     // Identify by tx_ref prefix first (most reliable)
     if (!paymentType && txRef) {
       // All our transactions start with 'GH-'
@@ -7765,6 +7775,14 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         }]).catch(e => console.error('Unlimited notification failed:', e.message));
 
         console.log('Unlimited plan activated for agent:', unlimitedAgentId, '| expires:', expiryISO);
+
+        console.log('=== UNLIMITED PLAN COMPLETE ===');
+        console.log('agentId:', unlimitedAgentId);
+        console.log('amount:', unlimitedAmount);
+        console.log('gha_id:', agentProfile?.gha_id);
+        console.log('sa_id:', agentProfile?.sa_id);
+        console.log('month:', monthYear);
+        console.log('================================');
       }
       console.log('=== UNLIMITED PLAN WEBHOOK END ===');
     }
