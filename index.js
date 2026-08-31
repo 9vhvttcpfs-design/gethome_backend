@@ -5576,8 +5576,10 @@ async function recoverMissingEarnings() {
     nextMonth.setMonth(nextMonth.getMonth() + 1);
     var monthEnd = nextMonth.toISOString();
 
-    // Find ALL agents with subscription_start this month
-    // regardless of subscription_status or tier
+    // Only recover agents with subscription_status 'active' or 'expired'
+    // and subscription_start within current billing month.
+    // Excludes cancelled/failed to avoid fabricating commissions.
+    // Does NOT recover unlimited agents (handled separately below).
     const { data: paidAgents, error: paidErr } = await adminClient
       .from('profiles')
       .select('id, email, gha_id, sa_id, subscription_tier, subscription_amount, subscription_status, subscription_start, is_unlimited')
@@ -5585,6 +5587,8 @@ async function recoverMissingEarnings() {
       .not('gha_id', 'is', null)
       .not('subscription_amount', 'is', null)
       .gt('subscription_amount', 0)
+      .in('subscription_status', ['active', 'expired']) // exclude cancelled/failed/pending
+      .eq('is_unlimited', false)
       .gte('subscription_start', monthStart)
       .lt('subscription_start', monthEnd);
 
