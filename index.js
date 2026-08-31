@@ -2154,19 +2154,23 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
     if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
     const saId = req.staffSession.staff_id;
 
+    // Remove subscription_status filter - show all agents who have earnings
+    // regardless of whether their subscription is currently active
     const { data: agents, error } = await serviceClient
       .from('profiles')
       .select('id, full_name, email, gha_id, subscription_tier, subscription_amount, subscription_start, subscription_end, subscription_status, is_unlimited, unlimited_listings, unlimited_expires_at')
       .eq('sa_id', saId)
       .eq('role', 'agent')
-      .eq('subscription_status', 'active');
+      .not('subscription_tier', 'eq', 'free'); // show any agent who has/had a plan
+
     if (error) throw error;
 
-    if ((agents || []).length === 0) return res.json({ agents: [], total_revenue: 0, sa_commission: 0, by_month: [] });
+    // Remove the early return entirely - let it proceed even with 0 agents
+    // because subscriptionList comes from sa_earnings not from agents
 
     const { data: saEarnings } = await serviceClient
       .from('sa_earnings')
-      .select('month_year, amount, is_paid')
+      .select('month_year, commission_amount, is_paid')
       .eq('sa_id', saId);
     const earningsMap = {};
     (saEarnings || []).forEach(function(e) { earningsMap[e.month_year] = e; });
@@ -2191,12 +2195,16 @@ app.get('/api/sa/subscriptions', verifyStaffToken, async (req, res) => {
     });
 
     // All agents with sa_earnings this month - ALL tiers including unlimited (no tier filter)
+    var selectedMonth = req.query.month || getBillingMonth();
+
     const { data: saAgentEarnings } = await serviceClient
       .from('sa_earnings')
-      .select('agent_id, commission_amount, commission_rate, subscription_amount, payment_reference, is_paid, created_at')
+      .select('agent_id, commission_amount, commission_rate, subscription_amount, payment_reference, is_paid, created_at, month_year')
       .eq('sa_id', saId)
-      .eq('month_year', getBillingMonth())
+      .eq('month_year', selectedMonth)
       .order('created_at', { ascending: false });
+
+    console.log('SA subscriptions - month:', selectedMonth, '| earnings rows:', (saAgentEarnings||[]).length);
 
     var earningAgentIds = [...new Set((saAgentEarnings || []).map(function(e) { return e.agent_id; }).filter(Boolean))];
     var agentProfileMap = {};
