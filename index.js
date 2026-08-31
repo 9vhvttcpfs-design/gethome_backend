@@ -12388,6 +12388,47 @@ app.get('/api/properties/:id/fee-breakdown', async (req, res) => {
   }
 });
 
+// GET /api/sa/gha-inspections - inspection counts for a specific GHA under this SA
+app.get('/api/sa/gha-inspections', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    var ghaId = req.query.gha_id;
+    if (!ghaId) return res.status(400).json({ error: 'gha_id required' });
+
+    // Verify GHA belongs to this SA
+    const { data: gha } = await adminClient
+      .from('gha_agents')
+      .select('id, sa_id')
+      .eq('id', ghaId)
+      .eq('sa_id', session.staff_id)
+      .maybeSingle();
+
+    if (!gha) return res.status(403).json({ error: 'GHA not under your supervision' });
+
+    const [pendingRes, doneRes, confirmedRes] = await Promise.all([
+      adminClient.from('inspections').select('id', { count: 'exact', head: true })
+        .eq('gha_id', ghaId).in('status', ['pending', 'assigned']),
+      adminClient.from('inspections').select('id', { count: 'exact', head: true })
+        .eq('gha_id', ghaId).eq('status', 'done'),
+      adminClient.from('inspections').select('id', { count: 'exact', head: true })
+        .eq('gha_id', ghaId).eq('status', 'confirmed'),
+    ]);
+
+    res.json({
+      pending: pendingRes.count || 0,
+      done: doneRes.count || 0,
+      confirmed: confirmedRes.count || 0,
+    });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
