@@ -7182,6 +7182,107 @@ app.post('/api/properties/:id/feature-payment', async (req, res) => {
   }
 });
 
+// Shared staff-earnings creator - called from BOTH the subscription and unlimited_plan
+// webhook branches so there is exactly one tested path for GHA/SA commission rows.
+// Every failure is logged with the Supabase error code; nothing fails silently.
+async function createStaffEarnings(agentId, paymentAmount, paymentReference, planType) {
+  try {
+    var monthYear = getBillingMonth();
+
+    // Fetch agent profile
+    const { data: agent, error: agentErr } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, gha_id, sa_id')
+      .eq('id', agentId)
+      .single();
+
+    if (agentErr) { console.error('createStaffEarnings: agent fetch failed:', agentErr.message); return; }
+    if (!agent) { console.error('createStaffEarnings: agent not found:', agentId); return; }
+    if (!agent.gha_id && !agent.sa_id) { console.error('createStaffEarnings: agent has no GHA or SA:', agentId); return; }
+
+    var ref = paymentReference || (planType + '_' + agentId + '_' + Date.now());
+    var planLabel = planType === 'unlimited_plan' ? 'Unlimited' : (planType || 'subscription');
+    console.log('createStaffEarnings - agent:', agent.email, '| amount:', paymentAmount, '| ref:', ref, '| month:', monthYear);
+
+    // GHA earnings
+    if (agent.gha_id) {
+      var ghaRate = await getStaffCommissionRate(agent.gha_id, 'GHA');
+      var ghaComm = Math.round(paymentAmount * (ghaRate / 100));
+
+      const { error: ghaErr } = await adminClient
+        .from('gha_earnings')
+        .upsert([{
+          gha_id: agent.gha_id,
+          agent_id: agentId,
+          agent_email: agent.email,
+          subscription_amount: paymentAmount,
+          commission_rate: ghaRate,
+          commission_amount: ghaComm,
+          month_year: monthYear,
+          payment_reference: ref,
+          is_paid: false,
+        }], { onConflict: 'gha_id,agent_id,payment_reference' });
+
+      if (ghaErr) {
+        console.error('createStaffEarnings: GHA upsert failed:', ghaErr.message, '| code:', ghaErr.code);
+      } else {
+        console.log('createStaffEarnings: GHA earnings saved - gha_id:', agent.gha_id, '| rate:', ghaRate + '%', '| commission: NGN ' + ghaComm);
+        const { error: ghaNotifErr } = await adminClient.from('notifications').insert([{
+          recipient_type: 'GHA',
+          recipient_id: agent.gha_id,
+          type: 'subscription_payment',
+          title: 'Agent Subscription Payment',
+          message: 'Agent ' + (agent.full_name || agent.email) + ' paid for ' + planLabel + ' plan. Your commission: NGN ' + ghaComm.toLocaleString(),
+          is_read: false,
+        }]);
+        if (ghaNotifErr) console.error('createStaffEarnings: GHA notification failed:', ghaNotifErr.message);
+      }
+    }
+
+    // SA earnings
+    if (agent.sa_id) {
+      var saRate = await getStaffCommissionRate(agent.sa_id, 'SA');
+      var saComm = Math.round(paymentAmount * (saRate / 100));
+
+      const { error: saErr } = await adminClient
+        .from('sa_earnings')
+        .upsert([{
+          sa_id: agent.sa_id,
+          gha_id: agent.gha_id || null,
+          agent_id: agentId,
+          subscription_amount: paymentAmount,
+          commission_rate: saRate,
+          commission_amount: saComm,
+          month_year: monthYear,
+          payment_reference: ref,
+          is_paid: false,
+        }], { onConflict: 'sa_id,agent_id,payment_reference' });
+
+      if (saErr) {
+        console.error('createStaffEarnings: SA upsert failed:', saErr.message, '| code:', saErr.code);
+      } else {
+        console.log('createStaffEarnings: SA earnings saved - sa_id:', agent.sa_id, '| rate:', saRate + '%', '| commission: NGN ' + saComm);
+        const { error: saNotifErr } = await adminClient.from('notifications').insert([{
+          recipient_type: 'SA',
+          recipient_id: agent.sa_id,
+          type: 'subscription_payment',
+          title: 'Agent Subscription Payment',
+          message: 'Agent ' + (agent.full_name || agent.email) + ' paid for ' + planLabel + ' plan. Your commission: NGN ' + saComm.toLocaleString(),
+          is_read: false,
+        }]);
+        if (saNotifErr) console.error('createStaffEarnings: SA notification failed:', saNotifErr.message);
+      }
+    }
+
+    // Update monthly snapshot
+    await generateMonthlySnapshot(monthYear);
+    console.log('createStaffEarnings: COMPLETE for', agent.email, '| month:', monthYear);
+
+  } catch(err) {
+    console.error('createStaffEarnings EXCEPTION:', err.message, err.stack);
+  }
+}
+
 app.post('/api/flutterwave/webhook', async (req, res) => {
   console.log('Flutterwave webhook received:', JSON.stringify(req.body).substring(0, 200));
   console.log('Webhook headers:', JSON.stringify(req.headers['verif-hash'] || req.headers['v-hash'] || 'no-hash'));
@@ -7546,108 +7647,10 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         } else {
           console.log('Agent subscription updated:', agentId, tier, subscriptionEnd);
 
-          // Get agent's GHA and SA for earnings calculation
-          const { data: agentProfile, error: agentProfileErr } = await adminClient
-            .from('profiles')
-            .select('gha_id, sa_id, gha_code, full_name, email')
-            .eq('id', agentId)
-            .single();
-
-          console.log('=== SUBSCRIPTION EARNINGS START ===');
-          console.log('agentId:', agentId);
-          console.log('amount:', amount);
-          console.log('tier:', tier);
-          console.log('agentProfile:', JSON.stringify(agentProfile));
-          console.log('agentProfile fetch error:', JSON.stringify(agentProfileErr));
-          console.log('GHA ID:', agentProfile?.gha_id, '| SA ID:', agentProfile?.sa_id);
-          if (!agentProfile?.gha_id && !agentProfile?.sa_id) {
-            console.error('CRITICAL: No GHA or SA linked to agent - subscription earnings cannot be created. Agent:', agentId);
-          }
-
-          const monthYear = getBillingMonth();
-
-          // Fetch dynamic commission rates (individual override first, else global setting)
-          var ghaId = agentProfile?.gha_id;
-          var saId = agentProfile?.sa_id;
-
-          var [ghaCommissionRate, saCommissionRate] = await Promise.all([
-            ghaId ? getStaffCommissionRate(ghaId, 'GHA') : Promise.resolve(0),
-            saId ? getStaffCommissionRate(saId, 'SA') : Promise.resolve(0),
-          ]);
-          console.log('GHA rate returned for', ghaId, ':', ghaCommissionRate);
-          console.log('SA rate returned for', saId, ':', saCommissionRate);
-
-          var ghaCommission = Math.round(amount * (ghaCommissionRate / 100));
-          var saCommission = Math.round(amount * (saCommissionRate / 100));
-
-          console.log('Commission rates - GHA:', ghaCommissionRate + '%', '=₦' + ghaCommission, '| SA:', saCommissionRate + '%', '=₦' + saCommission);
-
-          var paymentRef = txRef || (paymentType + '_' + customerEmail + '_' + Date.now());
-
-          // Create GHA earnings row
-          if (agentProfile?.gha_id) {
-            const { error: ghaEarnErr } = await adminClient.from('gha_earnings').upsert([{
-              gha_id: agentProfile.gha_id,
-              agent_id: agentId,
-              agent_email: agentProfile.email,
-              subscription_amount: amount,
-              commission_rate: ghaCommissionRate,
-              commission_amount: ghaCommission,
-              month_year: monthYear,
-              payment_reference: paymentRef,
-              is_paid: false,
-            }], { onConflict: 'gha_id,agent_id,payment_reference', ignoreDuplicates: false });
-            if (ghaEarnErr) console.error('GHA earnings upsert failed (non-blocking):', ghaEarnErr.message);
-            else console.log('GHA subscription earnings created - ref:', paymentRef, '| commission:', ghaCommission);
-
-            // Notify GHA
-            const { error: ghaNotifErr } = await adminClient.from('notifications').insert([{
-              recipient_type: 'GHA',
-              recipient_id: agentProfile.gha_id,
-              type: 'subscription_payment',
-              title: 'Agent Subscription Payment',
-              message: 'Agent ' + (agentProfile.full_name || agentProfile.email) + ' subscribed to ' + tier + ' plan. Your commission: NGN ' + ghaCommission.toLocaleString(),
-              is_read: false,
-            }]);
-            if (ghaNotifErr) console.error('GHA notification failed (non-blocking):', ghaNotifErr.message);
-          } else {
-            console.error('No gha_id for agent:', agentId, '- no GHA subscription earnings created');
-          }
-
-          // Create SA earnings row
-          if (agentProfile?.sa_id) {
-            const { error: saEarnErr } = await adminClient.from('sa_earnings').upsert([{
-              sa_id: agentProfile.sa_id,
-              gha_id: agentProfile.gha_id || null,
-              agent_id: agentId,
-              subscription_amount: amount,
-              commission_rate: saCommissionRate,
-              commission_amount: saCommission,
-              month_year: monthYear,
-              payment_reference: paymentRef,
-              is_paid: false,
-            }], { onConflict: 'sa_id,agent_id,payment_reference', ignoreDuplicates: false });
-            if (saEarnErr) console.error('SA earnings upsert failed (non-blocking):', saEarnErr.message);
-            else console.log('SA subscription earnings created - ref:', paymentRef, '| commission:', saCommission);
-
-            // Notify SA
-            const { error: saNotifErr } = await adminClient.from('notifications').insert([{
-              recipient_type: 'SA',
-              recipient_id: agentProfile.sa_id,
-              type: 'subscription_payment',
-              title: 'Agent Subscription Payment',
-              message: 'Agent ' + (agentProfile.full_name || agentProfile.email) + ' subscribed to ' + tier + ' plan. Your commission: NGN ' + saCommission.toLocaleString(),
-              is_read: false,
-            }]);
-            if (saNotifErr) console.error('SA notification failed (non-blocking):', saNotifErr.message);
-          } else {
-            console.error('No sa_id for agent:', agentId, '- no SA subscription earnings created');
-          }
-
-          console.log('=== SUBSCRIPTION EARNINGS COMPLETE === ref:', paymentRef, '| month:', monthYear);
-
-          // Keep the monthly snapshot current after these earnings rows
-          await generateMonthlySnapshot(monthYear);
+          // Create GHA/SA commission earnings via the shared, single-path helper.
+          console.log('=== SUBSCRIPTION EARNINGS START === agentId:', agentId, '| amount:', amount, '| tier:', tier);
+          await createStaffEarnings(agentId, amount, txRef, tier);
+          console.log('=== SUBSCRIPTION EARNINGS COMPLETE === agentId:', agentId);
         }
       }
     }
@@ -7832,58 +7835,11 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         }
 
         var monthYear = getBillingMonth();
-        var unlimitedRef = txRef || ('unlimited_' + unlimitedAgentId + '_' + Date.now());
 
-        // GHA commission
-        if (agentProfile?.gha_id) {
-          var ghaRate = await getStaffCommissionRate(agentProfile.gha_id, 'GHA');
-          console.log('GHA rate returned for', agentProfile.gha_id, ':', ghaRate);
-          var ghaCommission = Math.round(unlimitedAmount * (ghaRate / 100));
-          console.log('Creating GHA earnings - gha_id:', agentProfile.gha_id, '| rate:', ghaRate, '| commission:', ghaCommission, '| ref:', unlimitedRef);
-          const { error: ghaErr } = await adminClient.from('gha_earnings').upsert([{
-            gha_id: agentProfile.gha_id,
-            agent_id: unlimitedAgentId,
-            agent_email: agentProfile.email,
-            subscription_amount: unlimitedAmount,
-            commission_rate: ghaRate,
-            commission_amount: ghaCommission,
-            month_year: monthYear,
-            payment_reference: unlimitedRef,
-            is_paid: false,
-          }], { onConflict: 'gha_id,agent_id,payment_reference' });
-          console.log('GHA earnings result - error:', JSON.stringify(ghaErr), '| success:', !ghaErr);
-          if (ghaErr) console.error('GHA unlimited earnings FAILED:', ghaErr.message);
-          else console.log('GHA unlimited earnings saved successfully');
-        } else {
-          console.error('No gha_id found for agent:', unlimitedAgentId, '- no GHA commission created');
-        }
-
-        // SA commission
-        if (agentProfile?.sa_id) {
-          var saRate = await getStaffCommissionRate(agentProfile.sa_id, 'SA');
-          console.log('SA rate returned for', agentProfile.sa_id, ':', saRate);
-          var saCommission = Math.round(unlimitedAmount * (saRate / 100));
-          console.log('Creating SA earnings - sa_id:', agentProfile.sa_id, '| rate:', saRate, '| commission:', saCommission, '| ref:', unlimitedRef);
-          const { error: saErr } = await adminClient.from('sa_earnings').upsert([{
-            sa_id: agentProfile.sa_id,
-            gha_id: agentProfile.gha_id || null,
-            agent_id: unlimitedAgentId,
-            subscription_amount: unlimitedAmount,
-            commission_rate: saRate,
-            commission_amount: saCommission,
-            month_year: monthYear,
-            payment_reference: unlimitedRef,
-            is_paid: false,
-          }], { onConflict: 'sa_id,agent_id,payment_reference' });
-          console.log('SA earnings result - error:', JSON.stringify(saErr), '| success:', !saErr);
-          if (saErr) console.error('SA unlimited earnings FAILED:', saErr.message);
-          else console.log('SA unlimited earnings saved successfully');
-        } else {
-          console.error('No sa_id found for agent:', unlimitedAgentId, '- no SA commission created');
-        }
-
-        // Keep the monthly snapshot current after these earnings rows
-        await generateMonthlySnapshot(monthYear);
+        // Create GHA/SA commission earnings via the shared, single-path helper.
+        console.log('=== UNLIMITED EARNINGS START === agentId:', unlimitedAgentId, '| amount:', unlimitedAmount);
+        await createStaffEarnings(unlimitedAgentId, unlimitedAmount, txRef || ('unlimited_' + unlimitedAgentId + '_' + Date.now()), 'unlimited_plan');
+        console.log('=== UNLIMITED EARNINGS COMPLETE === agentId:', unlimitedAgentId);
 
         // Notify agent
         const { error: unlimitedNotifErr } = await adminClient.from('notifications').insert([{
