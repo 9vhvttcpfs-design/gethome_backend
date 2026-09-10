@@ -1636,39 +1636,80 @@ app.get('/api/sa/pending-agents', async (req, res) => {
       .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
 
-    // PART 1: Unclaimed pending agents - filter by status in DB not JS
-    const { data: unclaimedAgents } = await adminClient
-      .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, created_at, subscription_tier, subscription_amount, is_unlimited, agent_type, agency_name')
-      .eq('role', 'agent')
-      .is('sa_id', null)
-      .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review'])
-      .order('created_at', { ascending: false });
+    // Get SA's location and GHAs
+    const { data: saRecord } = await adminClient
+      .from('service_agents')
+      .select('location, sa_code')
+      .eq('id', session.staff_id)
+      .single();
 
-    // PART 2: Agents assigned to this SA that are still pending
-    const { data: claimedAgents } = await adminClient
+    const { data: saGhas } = await adminClient
+      .from('gha_agents')
+      .select('id')
+      .eq('sa_id', session.staff_id);
+    var ghaIds = (saGhas || []).map(function(g) { return g.id; });
+
+    // PART 1: Agents directly assigned to this SA - pending
+    const { data: directAgents } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, created_at, subscription_tier, subscription_amount, is_unlimited, agent_type, agency_name')
+      .select('id, email, full_name, phone, status, subscription_tier, subscription_amount, is_unlimited, gha_id, gha_code, city, office_address, agent_type, agency_name, created_at, nin_number, cac_number, requested_gha_code')
       .eq('role', 'agent')
       .eq('sa_id', session.staff_id)
-      .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review'])
-      .order('created_at', { ascending: false });
+      .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review']);
 
-    // Combine and deduplicate
-    var allPending = [];
+    // PART 2: Agents under this SA's GHAs - pending
+    var ghaAgents = [];
+    if (ghaIds.length > 0) {
+      const { data: ga } = await adminClient
+        .from('profiles')
+        .select('id, email, full_name, phone, status, subscription_tier, subscription_amount, is_unlimited, gha_id, gha_code, city, office_address, agent_type, agency_name, created_at, nin_number, cac_number, requested_gha_code')
+        .eq('role', 'agent')
+        .in('gha_id', ghaIds)
+        .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review']);
+      ghaAgents = ga || [];
+    }
+
+    // PART 3: Unassigned pending agents in SA's location
+    var locationAgents = [];
+    if (saRecord?.location) {
+      var locationWords = saRecord.location.toLowerCase().split(/[\s,]+/).filter(function(w) { return w.length > 2; });
+      if (locationWords.length > 0) {
+        var orConditions = locationWords.map(function(word) {
+          return 'office_address.ilike.%' + word + '%,city.ilike.%' + word + '%';
+        }).join(',');
+
+        const { data: locAgents } = await adminClient
+          .from('profiles')
+          .select('id, email, full_name, phone, status, subscription_tier, subscription_amount, is_unlimited, gha_id, gha_code, city, office_address, agent_type, agency_name, created_at, nin_number, cac_number, requested_gha_code')
+          .eq('role', 'agent')
+          .is('sa_id', null) // only unassigned
+          .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review'])
+          .or(orConditions + ',office_address.is.null,city.is.null');
+
+        locationAgents = locAgents || [];
+      }
+    }
+
+    // Merge and deduplicate - exclude approved agents
     var seen = {};
-    [...(unclaimedAgents || []), ...(claimedAgents || [])].forEach(function(a) {
-      if (!seen[a.id]) { seen[a.id] = true; allPending.push(a); }
-    });
+    var allPending = [...(directAgents || []), ...ghaAgents, ...locationAgents]
+      .filter(function(a) {
+        // Exclude if already approved by another SA
+        if (a.sa_id && a.sa_id !== session.staff_id) return false;
+        if (seen[a.id]) return false;
+        seen[a.id] = true;
+        return true;
+      });
 
-    // Add has_paid flag for SA to prioritize
+    // Add has_paid flag
     var enriched = allPending.map(function(a) {
       return Object.assign({}, a, {
         has_paid: !!(a.subscription_tier && a.subscription_tier !== 'free') || a.is_unlimited === true,
       });
     });
 
-    console.log('SA pending agents:', enriched.length, '| unclaimed:', (unclaimedAgents||[]).length, '| claimed:', (claimedAgents||[]).length);
+    console.log('SA pending agents - sa:', saRecord?.sa_code, '| location:', saRecord?.location, '| direct:', (directAgents||[]).length, '| gha:', ghaAgents.length, '| location:', locationAgents.length, '| total:', enriched.length);
+
     res.json(enriched);
   } catch(err) {
     console.error('SA pending agents error:', err.message);
@@ -1740,16 +1781,33 @@ app.post('/api/sa/reject-agent', async (req, res) => {
     const { agent_id, reason } = req.body;
     if (!agent_id) return res.status(400).json({ error: 'agent_id is required' });
 
-    const { error: updateErr } = await adminClient.from('profiles')
-      .update({ status: 'rejected' }).eq('id', agent_id).eq('sa_id', session.staff_id);
-    if (updateErr) return res.status(500).json({ error: updateErr.message });
+    const { data: agentProf } = await adminClient.from('profiles').select('email, full_name').eq('id', agent_id).single();
 
-    const { data: agent } = await adminClient.from('profiles').select('email, full_name').eq('id', agent_id).single();
+    const { data: saInfo } = await adminClient
+      .from('service_agents')
+      .select('sa_code, full_name')
+      .eq('id', session.staff_id)
+      .single();
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'ADMIN',
+      recipient_id: 'admin',
+      type: 'agent_rejected',
+      title: 'Agent Rejected by SA',
+      message: (saInfo?.sa_code || 'SA') + ' rejected agent ' + (agentProf?.email || agent_id) + (reason ? ': ' + reason : ''),
+      is_read: false,
+    }]);
+
+    // Update status to rejected
+    await adminClient.from('profiles')
+      .update({ status: 'rejected', rejection_reason: reason || null })
+      .eq('id', agent_id);
+
     try {
       await sendCustomerEmail(
-        agent?.email,
+        agentProf?.email,
         'GetHome Agent Application Update',
-        'Hello ' + (agent?.full_name || 'Agent') + ',\n\nYour agent application was not approved at this time' + (reason ? '. Reason: ' + reason : '.') + '\n\nContact us on WhatsApp for more information.\n\nGetHome Team'
+        'Hello ' + (agentProf?.full_name || 'Agent') + ',\n\nYour agent application was not approved at this time' + (reason ? '. Reason: ' + reason : '.') + '\n\nContact us on WhatsApp for more information.\n\nGetHome Team'
       );
     } catch(e) { console.error('Reject email failed:', e.message); }
 
@@ -1881,9 +1939,50 @@ app.post('/api/sa/assign-gha', verifyStaffToken, async (req, res) => {
 
     const { error } = await serviceClient
       .from('profiles')
-      .update({ gha_id })
+      .update({ gha_id, sa_id: saId, status: 'approved' })
       .eq('id', agent_id);
     if (error) throw error;
+
+    // Notify admin of SA assignment
+    const { data: agentProf } = await adminClient
+      .from('profiles')
+      .select('email, full_name, subscription_tier, subscription_amount, is_unlimited')
+      .eq('id', agent_id)
+      .single();
+
+    const { data: ghaInfo } = await adminClient
+      .from('gha_agents')
+      .select('gha_code, full_name, sa_id')
+      .eq('id', gha_id)
+      .single();
+
+    const { data: saInfo } = await adminClient
+      .from('service_agents')
+      .select('sa_code, full_name')
+      .eq('id', saId)
+      .single();
+
+    // Notify admin
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'ADMIN',
+      recipient_id: 'admin',
+      type: 'agent_assigned',
+      title: 'Agent Assigned by SA',
+      message: (saInfo?.sa_code || 'SA') + ' assigned ' + (agentProf?.full_name || agentProf?.email || 'agent') + ' to ' + (ghaInfo?.gha_code || 'GHA') + ' and approved their account.',
+      is_read: false,
+    }]);
+
+    // Create earnings if agent has paid subscription
+    if (agentProf?.subscription_amount > 0 && agentProf?.subscription_tier !== 'free') {
+      await createStaffEarnings(
+        agent_id,
+        parseFloat(agentProf.subscription_amount),
+        'sa_assign_' + agent_id + '_' + getBillingMonth(),
+        agentProf.is_unlimited ? 'unlimited_plan' : agentProf.subscription_tier
+      );
+    }
+
+    console.log('SA assigned agent - sa:', saInfo?.sa_code, '| agent:', agentProf?.email, '| gha:', ghaInfo?.gha_code);
 
     res.json({ success: true });
   } catch (err) {
