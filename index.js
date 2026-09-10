@@ -259,13 +259,13 @@ async function getStaffCommissionRate(staffId, staffType) {
 
     var effectiveRate;
     if (overrideRate > 0) {
-      // commission_rate_override set — use it
+      // Admin explicitly set commission_rate_override — use it
       effectiveRate = overrideRate;
-    } else if (individualRate > 0 && individualRate !== globalRate) {
-      // Individual rate differs from global — use individual
+    } else if (individualRate > 0) {
+      // Admin explicitly set an individual commission_rate — use it
       effectiveRate = individualRate;
     } else {
-      // Fall back to global
+      // No custom rate set — fall back to global
       effectiveRate = globalRate;
     }
 
