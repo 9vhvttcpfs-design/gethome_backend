@@ -1671,24 +1671,48 @@ app.get('/api/sa/pending-agents', async (req, res) => {
 
     // PART 3: Unassigned pending agents in SA's location
     var locationAgents = [];
-    if (saRecord?.location) {
-      var locationWords = saRecord.location.toLowerCase().split(/[\s,]+/).filter(function(w) { return w.length > 2; });
-      if (locationWords.length > 0) {
-        var orConditions = locationWords.map(function(word) {
-          return 'office_address.ilike.%' + word + '%,city.ilike.%' + word + '%';
-        }).join(',');
 
-        const { data: locAgents } = await adminClient
-          .from('profiles')
-          .select('id, email, full_name, phone, status, subscription_tier, subscription_amount, is_unlimited, gha_id, gha_code, city, office_address, agent_type, agency_name, created_at, nin_number, cac_number, requested_gha_code')
-          .eq('role', 'agent')
-          .is('sa_id', null) // only unassigned
-          .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review'])
-          .or(orConditions + ',office_address.is.null,city.is.null');
+    // Show ALL unassigned pending agents to SA
+    // SA can see and claim any unassigned agent regardless of location
+    // This is safer than missing agents due to location mismatch
+    const { data: allUnassigned } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, phone, status, subscription_tier, subscription_amount, is_unlimited, gha_id, gha_code, city, office_address, agent_type, agency_name, created_at, nin_number, cac_number, requested_gha_code, sa_id')
+      .eq('role', 'agent')
+      .is('sa_id', null)
+      .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review']);
 
-        locationAgents = locAgents || [];
-      }
+    // Filter in JS - match SA location words OR show agents with city in same state
+    locationAgents = (allUnassigned || []).filter(function(agent) {
+      var agentCity = (agent.city || '').toLowerCase().trim();
+      var agentAddress = (agent.office_address || '').toLowerCase().trim();
+      var agentText = agentCity + ' ' + agentAddress;
+      var saLoc = (saRecord?.location || '').toLowerCase().trim();
+      var saWords = saLoc.split(/[\s,]+/).filter(function(w) { return w.length > 2; });
+
+      // Direct match - SA location word in agent text
+      var directMatch = saWords.some(function(w) { return agentText.includes(w); });
+
+      // Reverse match - agent city word in SA location
+      var agentWords = agentCity.split(/[\s,]+/).filter(function(w) { return w.length > 2; });
+      var reverseMatch = agentWords.some(function(w) { return saLoc.includes(w); });
+
+      // No location - show to all SAs
+      var noLocation = !agent.city && !agent.office_address;
+
+      var matched = directMatch || reverseMatch || noLocation;
+      console.log('Agent:', agent.email, '| city:', agent.city, '| matched:', matched, '| directMatch:', directMatch, '| reverseMatch:', reverseMatch);
+      return matched;
+    });
+
+    // If no location match found show ALL unassigned to all SAs
+    // so no agent falls through the cracks
+    if (locationAgents.length === 0 && (allUnassigned||[]).length > 0) {
+      console.log('No location matches found - showing all unassigned to SA');
+      locationAgents = allUnassigned || [];
     }
+
+    console.log('Location agents final:', locationAgents.length);
 
     // Merge and deduplicate - exclude approved agents
     var seen = {};
@@ -12470,11 +12494,33 @@ app.get('/api/properties/:id/fee-breakdown', async (req, res) => {
     // Get property details
     const { data: property } = await adminClient
       .from('properties')
-      .select('id, title, location, rent, price, property_type, listing_type, agency_fee_percent, agreement_fee_percent, caution_fee_percent, service_charge, inspection_fee')
+      .select('id, title, location, rent, price, property_type, listing_type, agency_fee_percent, agreement_fee_percent, caution_fee_percent, service_charge, inspection_fee, created_by')
       .eq('id', propertyId)
       .single();
 
     if (!property) return res.status(404).json({ error: 'Property not found' });
+
+    // Get SA WhatsApp for this property's agent
+    var saWhatsapp = null;
+    var saName = null;
+    if (property?.created_by) {
+      const { data: agentProf } = await adminClient
+        .from('profiles')
+        .select('sa_id')
+        .eq('id', property.created_by)
+        .single();
+
+      if (agentProf?.sa_id) {
+        const { data: saData } = await adminClient
+          .from('service_agents')
+          .select('whatsapp, phone, full_name, sa_code')
+          .eq('id', agentProf.sa_id)
+          .single();
+        saWhatsapp = saData?.whatsapp || saData?.phone || null;
+        saName = saData?.full_name || null;
+        console.log('SA WhatsApp for property:', property.id, '| sa:', saData?.sa_code, '| whatsapp:', saWhatsapp);
+      }
+    }
 
     // Get escrow settings dynamically
     const [escrowRateSetting, escrowCapSetting] = await Promise.all([
@@ -12515,6 +12561,8 @@ app.get('/api/properties/:id/fee-breakdown', async (req, res) => {
       escrow_label: 'GetHome Escrow Fee (' + (escrowRate * 100).toFixed(2) + '%)',
       regular_base: regularBase,
       grand_total: grandTotal,
+      sa_whatsapp: saWhatsapp,
+      sa_name: saName,
     });
   } catch(err) {
     console.error('Fee breakdown error:', err.message);
