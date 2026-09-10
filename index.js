@@ -1708,7 +1708,25 @@ app.get('/api/sa/pending-agents', async (req, res) => {
       });
     });
 
-    console.log('SA pending agents - sa:', saRecord?.sa_code, '| location:', saRecord?.location, '| direct:', (directAgents||[]).length, '| gha:', ghaAgents.length, '| location:', locationAgents.length, '| total:', enriched.length);
+    console.log('SA pending agents - sa_id:', session.staff_id, '| location:', saRecord?.location);
+    console.log('Direct agents found:', (directAgents||[]).length);
+    console.log('GHA agents found:', ghaAgents.length);
+    console.log('Location agents found:', locationAgents.length);
+    console.log('Total after dedup:', enriched.length);
+
+    // Log the location words being searched
+    if (saRecord?.location) {
+      var locationWords = saRecord.location.toLowerCase().split(/[\s,]+/).filter(function(w) { return w.length > 2; });
+      console.log('Location words:', locationWords);
+    }
+
+    // Log all pending agents in DB for debugging
+    const { data: allPendingDebug } = await adminClient
+      .from('profiles')
+      .select('email, status, sa_id, city, office_address')
+      .eq('role', 'agent')
+      .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review']);
+    console.log('All pending agents in DB:', JSON.stringify(allPendingDebug));
 
     res.json(enriched);
   } catch(err) {
