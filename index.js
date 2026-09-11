@@ -1250,10 +1250,30 @@ async function verifyStaffToken(req, res, next) {
 // ──────────────────────────────────────────────────────────
 
 // POST /api/staff/login
+// Simple in-memory rate limiter for staff login - 5 attempts per 15 minutes per staff code.
+// Module-scoped (not inside the handler) so counts actually accumulate across requests.
+// Note: this is per-process state - it resets on deploy/restart and won't be shared
+// across multiple server instances if this ever runs behind a multi-instance/cluster setup.
+var staffLoginAttempts = {};
+var STAFF_LOGIN_RATE_LIMIT = 5;
+var STAFF_LOGIN_RATE_WINDOW = 15 * 60 * 1000;
+
 app.post('/api/staff/login', async (req, res) => {
   try {
     const { staffId, password, role } = req.body;
     if (!staffId || !password || !role) return res.status(400).json({ error: 'staffId, password, and role are required' });
+
+    var loginAttemptKey = staffId.toUpperCase().trim();
+    var loginAttemptNow = Date.now();
+    var recentAttempts = (staffLoginAttempts[loginAttemptKey] || []).filter(function(t) {
+      return loginAttemptNow - t < STAFF_LOGIN_RATE_WINDOW;
+    });
+    if (recentAttempts.length >= STAFF_LOGIN_RATE_LIMIT) {
+      staffLoginAttempts[loginAttemptKey] = recentAttempts;
+      return res.status(429).json({ error: 'Too many login attempts. Please wait 15 minutes and try again.' });
+    }
+    recentAttempts.push(loginAttemptNow);
+    staffLoginAttempts[loginAttemptKey] = recentAttempts;
 
     let table, codeField;
     if (role === 'SA') {
