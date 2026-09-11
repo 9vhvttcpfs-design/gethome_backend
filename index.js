@@ -7196,7 +7196,7 @@ app.post('/api/admin/assign-agent-gha', adminForceAssignHandler);
 // ──────────────────────────────────────────────────────────
 app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
   try {
-    const { amount, customer_email, customer_name, purpose, property_id } = req.body;
+    const { amount, customer_email, customer_name, customer_phone, purpose, property_id } = req.body;
     if (!amount || !customer_email) return res.status(400).json({ error: 'amount and customer_email are required' });
 
     const reference = 'GH-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
@@ -7216,7 +7216,7 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
         : paymentType === 'featured_listing'
         ? 'https://trygethome.online/?featured_return=true'
         : 'https://trygethome.online/?payment=complete',
-      customer: { email: customer_email, name: customer_name || customer_email },
+      customer: { email: customer_email, name: customer_name || customer_email, phone_number: customer_phone || '' },
       customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
     };
     flwPayload.meta = req.body.meta || {};
@@ -7679,11 +7679,20 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
     }
 
     if (status === 'successful') {
+      var depositorEmail = customerEmail || event?.data?.customer?.email || null;
+      var depositorName = event?.data?.customer?.name || null;
+      var depositorPhone = event?.data?.customer?.phone_number || null;
+
       const { error: updateErr } = await adminClient.from('properties').update({
         deposit_status: 'confirmed',
         deposit_confirmed: true,
+        deposit_date: new Date().toISOString(),
+        depositor_email: depositorEmail,
+        depositor_name: depositorName,
+        depositor_phone: depositorPhone,
       }).eq('deposit_reference', txRef);
       if (updateErr) console.error('Deposit confirm update failed (non-blocking):', updateErr.message);
+      else console.log('Deposit confirmed - ref:', txRef, '| amount:', amount, '| customer:', depositorEmail);
 
       const { data: property } = await adminClient.from('properties')
         .select('id, title, location, created_by').eq('deposit_reference', txRef).single();
