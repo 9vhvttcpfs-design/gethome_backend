@@ -7216,7 +7216,7 @@ app.post('/api/flutterwave/initialize-transaction', async (req, res) => {
         : paymentType === 'featured_listing'
         ? 'https://trygethome.online/?featured_return=true'
         : 'https://trygethome.online/?payment=complete',
-      customer: { email: customer_email, name: customer_name || customer_email, phone_number: customer_phone || '' },
+      customer: { email: customer_email, name: customer_name || customer_email, phonenumber: customer_phone || '' },
       customizations: { title: 'GetHome', description: purpose || 'GetHome Payment' },
     };
     flwPayload.meta = req.body.meta || {};
