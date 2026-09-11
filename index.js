@@ -10068,6 +10068,8 @@ app.post('/api/sa/update-bank-details', async (req, res) => {
         account_number: account_number.trim(),
         account_name: account_name.trim(),
         bank_code: bank_code || null,
+        bank_updated_at: new Date().toISOString(),
+        bank_updated_by: session.staff_id,
       })
       .eq('id', session.staff_id)
       .select('id, sa_code, full_name, bank_name, account_number, account_name')
@@ -10106,6 +10108,8 @@ app.post('/api/gha/update-bank-details', async (req, res) => {
         account_number: account_number.trim(),
         account_name: account_name.trim(),
         bank_code: bank_code || null,
+        bank_updated_at: new Date().toISOString(),
+        bank_updated_by: session.staff_id,
       })
       .eq('id', session.staff_id)
       .select('id, gha_code, full_name, bank_name, account_number, account_name')
