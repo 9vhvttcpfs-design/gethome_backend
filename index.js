@@ -307,6 +307,25 @@ async function checkAndExpireUnlimitedPlans() {
     console.error('checkAndExpireUnlimitedPlans error:', err.message);
   }
 }
+// Force-expires any still-valid sessions for a staff member (SA or GHA) so a
+// deactivated/closed account can't keep using an already-issued token until it
+// naturally expires. staff_sessions rows are never deleted (cleanupExpiredSessions
+// keeps them for attendance history) - this only pulls expires_at into the past.
+async function expireStaffSessions(staffId, staffRole) {
+  if (!staffId) return;
+  try {
+    const { error } = await adminClient
+      .from('staff_sessions')
+      .update({ expires_at: new Date().toISOString() })
+      .eq('staff_id', staffId)
+      .eq('staff_role', staffRole)
+      .gt('expires_at', new Date().toISOString());
+    if (error) console.error('Failed to expire staff sessions:', staffId, '|', error.message);
+    else console.log('Sessions expired for deactivated staff:', staffId, '|', staffRole);
+  } catch (err) {
+    console.error('expireStaffSessions exception:', err.message);
+  }
+}
 // Send SMS via Termii
 // Add TERMII_API_KEY and TERMII_SENDER_ID to Render env vars
 async function sendSMS(phone, message) {
@@ -3739,10 +3758,12 @@ app.post('/api/admin/deactivate-sa', async (req, res) => {
 
     const { error: saErr } = await serviceClient.from('service_agents').update({ status: 'inactive' }).eq('id', sa_id);
     if (saErr) throw saErr;
+    await expireStaffSessions(sa_id, 'SA');
 
     const { data: deactivatedGhas, error: ghaErr } = await serviceClient
       .from('gha_agents').update({ status: 'inactive' }).eq('sa_id', sa_id).select('id, gha_code');
     if (ghaErr) throw ghaErr;
+    await Promise.all((deactivatedGhas || []).map(function(g) { return expireStaffSessions(g.id, 'GHA'); }));
 
     if (sa?.email) {
       setImmediate(async function() {
@@ -3816,6 +3837,7 @@ app.post('/api/admin/deactivate-gha', async (req, res) => {
 
     const { error: ghaErr } = await serviceClient.from('gha_agents').update({ status: 'inactive' }).eq('id', gha_id);
     if (ghaErr) throw ghaErr;
+    await expireStaffSessions(gha_id, 'GHA');
 
     const { data: unassignedAgents, error: agentErr } = await serviceClient
       .from('profiles').update({ gha_id: null }).eq('gha_id', gha_id).select('id, full_name, email');
@@ -3940,6 +3962,7 @@ app.post('/api/admin/close-sa', async (req, res) => {
     const { error: saCloseErr } = await serviceClient
       .from('service_agents').update({ status: 'inactive' }).eq('id', sa_id);
     if (saCloseErr) throw saCloseErr;
+    await expireStaffSessions(sa_id, 'SA');
 
     setImmediate(async function () {
       try {
@@ -4006,6 +4029,7 @@ app.post('/api/admin/close-gha', async (req, res) => {
     const { error: ghaCloseErr } = await serviceClient
       .from('gha_agents').update({ status: 'inactive' }).eq('id', gha_id);
     if (ghaCloseErr) throw ghaCloseErr;
+    await expireStaffSessions(gha_id, 'GHA');
 
     setImmediate(async function () {
       try {
