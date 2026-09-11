@@ -12673,3 +12673,34 @@ async function cleanupExpiredSessions() {
 // Run once on startup then every 24 hours
 cleanupExpiredSessions();
 setInterval(cleanupExpiredSessions, SESSION_CLEANUP_INTERVAL);
+
+// Expire agent subscriptions (premium/agency) whose subscription_end has passed.
+// Unlimited plans are handled separately by checkAndExpireUnlimitedPlans above -
+// this only touches regular, non-unlimited agents so the two sweeps don't overlap.
+async function expireOldSubscriptions() {
+  try {
+    var now = new Date().toISOString();
+    const { data: expired, error } = await adminClient
+      .from('profiles')
+      .update({ subscription_status: 'expired' })
+      .eq('role', 'agent')
+      .eq('subscription_status', 'active')
+      .eq('is_unlimited', false)
+      .lt('subscription_end', now)
+      .select('id, email, subscription_end');
+
+    if (error) { console.error('Expire subscriptions error:', error.message); return; }
+    if ((expired || []).length > 0) {
+      console.log('Expired subscriptions:', (expired || []).length, 'agents');
+      (expired || []).forEach(function(a) {
+        console.log('Expired:', a.email, '| end was:', a.subscription_end);
+      });
+    }
+  } catch(err) {
+    console.error('expireOldSubscriptions exception:', err.message);
+  }
+}
+
+// Run daily at startup then every 24 hours
+setTimeout(expireOldSubscriptions, 60 * 1000); // 1 min after startup
+setInterval(expireOldSubscriptions, 24 * 60 * 60 * 1000);
