@@ -10520,6 +10520,7 @@ app.get('/api/admin/messages', async (req, res) => {
         subject: n.title,
         message: n.message,
         message_type: n.type,
+        meta: n.meta || null,
         is_read: !!(n.is_read || n.read),
         created_at: n.created_at,
         is_notification: true,
@@ -12800,17 +12801,102 @@ app.post('/api/properties/:id/report', async (req, res) => {
       reporterId = user?.id || null;
     }
 
+    // Fetch property details for the report (select * so a missing column can't break the lookup)
+    const { data: reportedProperty, error: propLookupErr } = await adminClient
+      .from('properties')
+      .select('*')
+      .eq('id', propertyId)
+      .maybeSingle();
+    if (propLookupErr) console.error('Report property lookup failed:', propLookupErr.message);
+
+    // Agent who listed it, plus their supervising SA (directly or via their GHA) for WhatsApp contact
+    var agentDetails = null;
+    var saDetails = null;
+    if (reportedProperty?.created_by) {
+      const { data: agentProf } = await adminClient
+        .from('profiles')
+        .select('*')
+        .eq('id', reportedProperty.created_by)
+        .maybeSingle();
+      agentDetails = agentProf;
+
+      var saId = agentProf?.sa_id || null;
+      if (!saId && agentProf?.gha_id) {
+        const { data: gha } = await adminClient.from('gha_agents').select('sa_id').eq('id', agentProf.gha_id).maybeSingle();
+        saId = gha?.sa_id || null;
+      }
+      if (saId) {
+        const { data: saData } = await adminClient
+          .from('service_agents')
+          .select('*')
+          .eq('id', saId)
+          .maybeSingle();
+        saDetails = saData;
+      }
+    }
+
+    var propertyTitle = reportedProperty?.title || 'Unknown Property';
+    var propertyLocation = reportedProperty?.location || 'N/A';
+    var propertyCountry = reportedProperty?.country || null;
+    var propertyPrice = Number(reportedProperty?.rent || reportedProperty?.price || 0);
+    var propertyImage = (reportedProperty?.image_url && reportedProperty.image_url.trim())
+      || (Array.isArray(reportedProperty?.image_urls) && reportedProperty.image_urls.find(function(u) { return u && u.trim(); }))
+      || (Array.isArray(reportedProperty?.images) && reportedProperty.images[0])
+      || null;
+    var agentName = agentDetails?.full_name || 'Unknown Agent';
+    var agentEmail = agentDetails?.email || 'N/A';
+    var agentPhone = agentDetails?.phone || 'N/A';
+    var saWhatsApp = saDetails?.whatsapp_number ? String(saDetails.whatsapp_number).replace(/[^0-9]/g, '') : null;
+    var saLabel = saDetails ? ((saDetails.sa_code || '') + (saDetails.full_name ? ' — ' + saDetails.full_name : '')).trim() : null;
+
+    // Detailed report message (prices are stored in NGN)
+    var reportMessage = [
+      '🚨 PROPERTY REPORT',
+      '━━━━━━━━━━━━━━━━━━',
+      '🏠 Property: ' + propertyTitle,
+      '📍 Location: ' + propertyLocation + (propertyCountry ? ' (' + propertyCountry + ')' : ''),
+      '💰 Price: ₦' + propertyPrice.toLocaleString(),
+      '🔗 Property ID: ' + propertyId,
+      '',
+      '👤 Agent: ' + agentName,
+      '✉ Agent Email: ' + agentEmail,
+      '📞 Agent Phone: ' + agentPhone,
+      saLabel ? '🧑‍💼 Supervising SA: ' + saLabel : null,
+      saWhatsApp ? '💬 SA WhatsApp: https://wa.me/' + saWhatsApp : null,
+      '',
+      '⚠ Report Reason: ' + reason,
+      '👤 Reporter: ' + (reporterId || 'anonymous'),
+      '🕐 Reported at: ' + new Date().toLocaleString('en-NG', { timeZone: 'Africa/Lagos' }),
+      '',
+      '⏰ ACTION REQUIRED WITHIN 24 HOURS',
+    ].filter(function(line) { return line !== null; }).join('\n');
+
     // Notify admin (shows in the admin inbox via GET /api/admin/messages)
     const { error: reportNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'ADMIN',
       recipient_id: '00000000-0000-0000-0000-000000000000',
       type: 'property_reported',
-      title: 'Property Listing Reported',
-      message: 'Property ' + propertyId + ' reported. Reason: ' + reason + ' | Reporter: ' + (reporterId || 'anonymous'),
+      title: '🚨 Report: ' + propertyTitle + ' — Action Required',
+      message: reportMessage,
       is_read: false,
+      meta: JSON.stringify({
+        property_id: propertyId,
+        property_title: propertyTitle,
+        property_location: propertyLocation,
+        property_country: propertyCountry,
+        property_image: propertyImage,
+        property_price: propertyPrice,
+        agent_name: agentName,
+        agent_email: agentEmail,
+        agent_phone: agentPhone,
+        sa_label: saLabel,
+        sa_whatsapp: saWhatsApp,
+        reporter_id: reporterId,
+        reason: reason,
+      }),
     }]);
     if (reportNotifErr) console.error('Report notification failed:', reportNotifErr.message);
-    else console.log('Property report saved:', propertyId, '| reason:', reason);
+    else console.log('Property report saved:', propertyTitle, '| reason:', reason, '| agent:', agentEmail);
 
     res.json({ success: true });
   } catch(err) {
@@ -12919,6 +13005,60 @@ app.post('/api/auth/telegram', async (req, res) => {
     res.json({ success: true, user });
   } catch(err) {
     console.error('Telegram auth error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin removes a reported listing (soft delete, same as DELETE /api/properties/:id) and notifies the agent
+app.post('/api/admin/properties/:id/remove', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    var propertyId = req.params.id;
+    var reason = req.body.reason || 'Violated community guidelines';
+
+    const { data: prop, error: propErr } = await adminClient
+      .from('properties')
+      .select('id, title, created_by, is_deleted')
+      .eq('id', propertyId)
+      .maybeSingle();
+    if (propErr) return res.status(500).json({ error: propErr.message });
+    if (!prop) return res.status(404).json({ error: 'Property not found' });
+    if (prop.is_deleted) return res.status(409).json({ error: 'This listing has already been removed' });
+
+    // Null out property_id on related inspections (preserve inspection records)
+    const { error: inspErr } = await adminClient
+      .from('inspections')
+      .update({ property_id: null })
+      .eq('property_id', propertyId);
+    if (inspErr) console.error('Inspection property_id clear failed:', inspErr.message);
+
+    const { error: deleteErr } = await adminClient.from('properties')
+      .update({
+        is_deleted: true,
+        deleted_at: new Date().toISOString(),
+        deleted_by: admin.id,
+      })
+      .eq('id', propertyId);
+    if (deleteErr) return res.status(500).json({ error: deleteErr.message });
+
+    if (prop.created_by) {
+      const { error: agentNotifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'AGENT',
+        recipient_id: prop.created_by,
+        type: 'listing_removed',
+        title: 'Your Listing Has Been Removed',
+        message: 'Your property listing "' + (prop.title || 'Property') + '" has been removed for violating GetHome community guidelines. Reason: ' + reason + '. Contact support@trygethome.online if you believe this is an error.',
+        is_read: false,
+      }]);
+      if (agentNotifErr) console.error('Listing removed notification failed:', agentNotifErr.message);
+    }
+
+    console.log('Property removed by admin:', propertyId, '| reason:', reason, '| admin:', admin.id);
+    res.json({ success: true });
+  } catch(err) {
+    console.error('Admin remove property error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
