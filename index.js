@@ -12742,6 +12742,101 @@ app.post('/api/customer/delete-account', async (req, res) => {
   }
 });
 
+// Report a property listing
+app.post('/api/properties/:id/report', async (req, res) => {
+  try {
+    var propertyId = req.params.id;
+    var reason = req.body.reason || 'No reason provided';
+    var reporterToken = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    var reporterId = null;
+
+    if (reporterToken) {
+      const { data: { user } } = await adminClient.auth.getUser(reporterToken);
+      reporterId = user?.id || null;
+    }
+
+    // Notify admin immediately
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'ADMIN',
+      recipient_id: 'admin',
+      type: 'property_reported',
+      title: 'Property Listing Reported',
+      message: 'Property ' + propertyId + ' reported. Reason: ' + reason + '. Reporter: ' + (reporterId || 'anonymous'),
+      is_read: false,
+    }]);
+
+    // Log the report
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'ADMIN',
+      recipient_id: 'admin',
+      type: 'content_report',
+      title: 'Content Report — Action Required Within 24 Hours',
+      message: 'REPORT: Property ' + propertyId + ' | Reason: ' + reason + ' | Reporter ID: ' + (reporterId || 'anonymous') + ' | Reported at: ' + new Date().toISOString(),
+      is_read: false,
+    }]);
+
+    console.log('Property reported:', propertyId, '| reason:', reason, '| reporter:', reporterId);
+    res.json({ success: true });
+  } catch(err) {
+    res.json({ success: true }); // Always return success to prevent abuse fishing
+  }
+});
+
+// Block an agent
+app.post('/api/agents/:id/block', async (req, res) => {
+  try {
+    var agentId = req.params.id;
+    var token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'Login required to block agents' });
+
+    const { data: { user } } = await adminClient.auth.getUser(token);
+    if (!user) return res.status(401).json({ error: 'Invalid session' });
+
+    // Save block to database
+    const { error: blockErr } = await adminClient
+      .from('blocked_agents')
+      .upsert([{ user_id: user.id, agent_id: agentId }],
+        { onConflict: 'user_id,agent_id' });
+
+    if (blockErr) console.error('Block save error:', blockErr.message);
+
+    // Notify admin
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'ADMIN',
+      recipient_id: 'admin',
+      type: 'agent_blocked',
+      title: 'Agent Blocked by User',
+      message: 'User ' + user.email + ' blocked agent ' + agentId + '. Review agent content for policy violations.',
+      is_read: false,
+    }]);
+
+    console.log('Agent blocked:', agentId, '| by:', user.email);
+    res.json({ success: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get blocked agents list for current user
+app.get('/api/user/blocked-agents', async (req, res) => {
+  try {
+    var token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.json({ blocked: [] });
+
+    const { data: { user } } = await adminClient.auth.getUser(token);
+    if (!user) return res.json({ blocked: [] });
+
+    const { data: blocked } = await adminClient
+      .from('blocked_agents')
+      .select('agent_id')
+      .eq('user_id', user.id);
+
+    res.json({ blocked: (blocked || []).map(function(b) { return b.agent_id; }) });
+  } catch(err) {
+    res.json({ blocked: [] });
+  }
+});
+
 // ──────────────────────────────────────────────────────────
 // START SERVER
 // ──────────────────────────────────────────────────────────
