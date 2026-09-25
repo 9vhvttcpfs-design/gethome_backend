@@ -39,6 +39,11 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:3000',
+  // Capacitor native apps
+  'https://localhost',     // Android (androidScheme: https)
+  'capacitor://localhost', // iOS
+  'http://localhost',
+  'ionic://localhost',
 ];
 // ── CORS - must be before all routes ───────────────────
 app.use(cors({
