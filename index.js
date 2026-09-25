@@ -1877,7 +1877,7 @@ app.post('/api/sa/reject-agent', async (req, res) => {
 
     await adminClient.from('notifications').insert([{
       recipient_type: 'ADMIN',
-      recipient_id: 'admin',
+      recipient_id: '00000000-0000-0000-0000-000000000000',
       type: 'agent_rejected',
       title: 'Agent Rejected by SA',
       message: (saInfo?.sa_code || 'SA') + ' rejected agent ' + (agentProf?.email || agent_id) + (reason ? ': ' + reason : ''),
@@ -2051,7 +2051,7 @@ app.post('/api/sa/assign-gha', verifyStaffToken, async (req, res) => {
     // Notify admin
     await adminClient.from('notifications').insert([{
       recipient_type: 'ADMIN',
-      recipient_id: 'admin',
+      recipient_id: '00000000-0000-0000-0000-000000000000',
       type: 'agent_assigned',
       title: 'Agent Assigned by SA',
       message: (saInfo?.sa_code || 'SA') + ' assigned ' + (agentProf?.full_name || agentProf?.email || 'agent') + ' to ' + (ghaInfo?.gha_code || 'GHA') + ' and approved their account.',
@@ -7795,7 +7795,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         // Store in notifications with WhatsApp link so admin can tap to notify
         const { error: notifErr } = await adminClient.from('notifications').insert([{
           recipient_type: 'ADMIN',
-          recipient_id: 'admin',
+          recipient_id: '00000000-0000-0000-0000-000000000000',
           type: 'payment_received',
           title: 'Payment: ' + currency + ' ' + paymentAmount + ' — Tap to notify via WhatsApp',
           message: paymentMsg,
@@ -7930,7 +7930,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           // Also notify admin
           const { error: adminFeaturedNotifErr } = await adminClient.from('notifications').insert([{
             recipient_type: 'ADMIN',
-            recipient_id: 'admin',
+            recipient_id: '00000000-0000-0000-0000-000000000000',
             type: 'featured_payment_received',
             title: 'Featured Listing Payment Received',
             message: 'Property "' + (updatedProp?.title || 'Property #' + featuredPropertyId) + '" has been featured. Amount: NGN ' + featuredAmount.toLocaleString(),
@@ -8243,7 +8243,7 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
         // Also notify admin
         const { error: adminInspNotifErr } = await adminClient.from('notifications').insert([{
           recipient_type: 'ADMIN',
-          recipient_id: 'admin',
+          recipient_id: '00000000-0000-0000-0000-000000000000',
           type: 'inspection_fee_paid',
           title: 'Inspection Fee Paid: ₦' + inspFeeAmount.toLocaleString(),
           message: (inspCustomerName || inspCustomerEmail) + ' paid inspection fee for ' + (inspProp.title || 'property'),
@@ -12765,7 +12765,7 @@ app.post('/api/customer/delete-account', async (req, res) => {
     // 4. Notify admin
     await adminClient.from('notifications').insert([{
       recipient_type: 'ADMIN',
-      recipient_id: 'admin',
+      recipient_id: '00000000-0000-0000-0000-000000000000',
       type: 'account_deleted',
       title: 'Account Deletion Request',
       message: 'User ' + userEmail + ' has deleted their account. Data anonymized.',
@@ -12801,16 +12801,17 @@ app.post('/api/properties/:id/report', async (req, res) => {
     }
 
     // Notify admin (shows in the admin inbox via GET /api/admin/messages)
-    await adminClient.from('notifications').insert([{
+    const { error: reportNotifErr } = await adminClient.from('notifications').insert([{
       recipient_type: 'ADMIN',
-      recipient_id: 'admin',
-      type: 'content_report',
-      title: 'Content Report — Action Required Within 24 Hours',
-      message: 'REPORT: Property ' + propertyId + ' | Reason: ' + reason + ' | Reporter ID: ' + (reporterId || 'anonymous') + ' | Reported at: ' + new Date().toISOString(),
+      recipient_id: '00000000-0000-0000-0000-000000000000',
+      type: 'property_reported',
+      title: 'Property Listing Reported',
+      message: 'Property ' + propertyId + ' reported. Reason: ' + reason + ' | Reporter: ' + (reporterId || 'anonymous'),
       is_read: false,
     }]);
+    if (reportNotifErr) console.error('Report notification failed:', reportNotifErr.message);
+    else console.log('Property report saved:', propertyId, '| reason:', reason);
 
-    console.log('Property reported:', propertyId, '| reason:', reason, '| reporter:', reporterId);
     res.json({ success: true });
   } catch(err) {
     res.json({ success: true }); // Always return success to prevent abuse fishing
@@ -12838,7 +12839,7 @@ app.post('/api/agents/:id/block', async (req, res) => {
     // Notify admin
     await adminClient.from('notifications').insert([{
       recipient_type: 'ADMIN',
-      recipient_id: 'admin',
+      recipient_id: '00000000-0000-0000-0000-000000000000',
       type: 'agent_blocked',
       title: 'Agent Blocked by User',
       message: 'User ' + user.email + ' blocked agent ' + agentId + '. Review agent content for policy violations.',
