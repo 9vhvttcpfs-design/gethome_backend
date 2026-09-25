@@ -10500,6 +10500,36 @@ app.get('/api/admin/messages', async (req, res) => {
     console.log('Admin inbox query result - count:', (inbox || []).length, '| error:', inboxErr?.message);
     console.log('Raw inbox data:', JSON.stringify(inbox?.slice(0, 2)));
 
+    // Admin system notifications (property reports, account deletions, etc.) live in the
+    // notifications table - merge them into the inbox as read-only SYSTEM messages
+    const { data: adminNotifs, error: notifErr } = await adminClient
+      .from('notifications')
+      .select('*')
+      .eq('recipient_type', 'ADMIN')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (notifErr) console.error('Admin notifications query error:', notifErr.message);
+
+    var notifAsMessages = (adminNotifs || []).map(function(n) {
+      return {
+        id: 'notif-' + n.id,
+        sender_type: 'SYSTEM',
+        sender_name: 'GetHome System',
+        sender_code: 'SYSTEM',
+        recipient_type: 'ADMIN',
+        subject: n.title,
+        message: n.message,
+        message_type: n.type,
+        is_read: !!(n.is_read || n.read),
+        created_at: n.created_at,
+        is_notification: true,
+      };
+    });
+
+    var mergedInbox = (inbox || []).concat(notifAsMessages)
+      .sort(function(a, b) { return new Date(b.created_at) - new Date(a.created_at); })
+      .slice(0, 100);
+
     const { data: sent } = await adminClient
       .from('staff_messages')
       .select('*')
@@ -10508,9 +10538,9 @@ app.get('/api/admin/messages', async (req, res) => {
       .limit(100);
 
     res.json({
-      inbox: inbox || [],
+      inbox: mergedInbox,
       sent: sent || [],
-      unread_count: (inbox || []).filter(function(m) { return !m.is_read; }).length,
+      unread_count: mergedInbox.filter(function(m) { return !m.is_read; }).length,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -10637,7 +10667,13 @@ app.post('/api/admin/mark-message-read', async (req, res) => {
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
     const { message_id } = req.body;
-    if (message_id) {
+    if (message_id && String(message_id).indexOf('notif-') === 0) {
+      // System notification merged into the inbox by GET /api/admin/messages
+      await adminClient.from('notifications')
+        .update({ is_read: true })
+        .eq('id', String(message_id).slice('notif-'.length))
+        .eq('recipient_type', 'ADMIN');
+    } else if (message_id) {
       await adminClient.from('staff_messages')
         .update({ is_read: true, read_at: new Date().toISOString() })
         .eq('id', message_id)
@@ -10645,6 +10681,10 @@ app.post('/api/admin/mark-message-read', async (req, res) => {
     } else {
       await adminClient.from('staff_messages')
         .update({ is_read: true, read_at: new Date().toISOString() })
+        .eq('recipient_type', 'ADMIN')
+        .eq('is_read', false);
+      await adminClient.from('notifications')
+        .update({ is_read: true })
         .eq('recipient_type', 'ADMIN')
         .eq('is_read', false);
     }
@@ -12760,17 +12800,7 @@ app.post('/api/properties/:id/report', async (req, res) => {
       reporterId = user?.id || null;
     }
 
-    // Notify admin immediately
-    await adminClient.from('notifications').insert([{
-      recipient_type: 'ADMIN',
-      recipient_id: 'admin',
-      type: 'property_reported',
-      title: 'Property Listing Reported',
-      message: 'Property ' + propertyId + ' reported. Reason: ' + reason + '. Reporter: ' + (reporterId || 'anonymous'),
-      is_read: false,
-    }]);
-
-    // Log the report
+    // Notify admin (shows in the admin inbox via GET /api/admin/messages)
     await adminClient.from('notifications').insert([{
       recipient_type: 'ADMIN',
       recipient_id: 'admin',
@@ -12839,6 +12869,56 @@ app.get('/api/user/blocked-agents', async (req, res) => {
     res.json({ blocked: (blocked || []).map(function(b) { return b.agent_id; }) });
   } catch(err) {
     res.json({ blocked: [] });
+  }
+});
+
+const crypto = require('crypto');
+
+app.post('/api/auth/telegram', async (req, res) => {
+  try {
+    var { initData } = req.body;
+    if (!initData) return res.status(400).json({ error: 'initData required' });
+
+    // Validate Telegram initData
+    var botToken = process.env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) return res.status(500).json({ error: 'Bot token not configured' });
+
+    var params = new URLSearchParams(initData);
+    var hash = params.get('hash');
+    params.delete('hash');
+
+    // Sort params alphabetically
+    var dataCheckString = Array.from(params.entries())
+      .sort(function(a, b) { return a[0].localeCompare(b[0]); })
+      .map(function(e) { return e[0] + '=' + e[1]; })
+      .join('\n');
+
+    // Validate hash
+    var secretKey = crypto.createHmac('sha256', 'WebAppData')
+      .update(botToken).digest();
+    var expectedHash = crypto.createHmac('sha256', secretKey)
+      .update(dataCheckString).digest('hex');
+
+    if (!crypto.timingSafeEqual(
+      Buffer.from(expectedHash, 'hex'),
+      Buffer.from(hash, 'hex')
+    )) {
+      return res.status(401).json({ error: 'Invalid Telegram data' });
+    }
+
+    // Check data is not older than 24 hours
+    var authDate = parseInt(params.get('auth_date'));
+    if (Date.now() / 1000 - authDate > 86400) {
+      return res.status(401).json({ error: 'Telegram data expired' });
+    }
+
+    var user = JSON.parse(params.get('user') || '{}');
+    console.log('Telegram auth validated - user:', user.id, user.first_name);
+
+    res.json({ success: true, user });
+  } catch(err) {
+    console.error('Telegram auth error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
