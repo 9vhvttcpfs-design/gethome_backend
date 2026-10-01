@@ -7405,10 +7405,42 @@ async function createStaffEarnings(agentId, paymentAmount, paymentReference, pla
 
     if (agentErr) { console.error('createStaffEarnings: agent fetch failed:', agentErr.message); return; }
     if (!agent) { console.error('createStaffEarnings: agent not found:', agentId); return; }
-    if (!agent.gha_id && !agent.sa_id) { console.error('createStaffEarnings: agent has no GHA or SA:', agentId); return; }
-
     var ref = paymentReference || (planType + '_' + agentId + '_' + Date.now());
     var planLabel = planType === 'unlimited_plan' ? 'Unlimited' : (planType || 'subscription');
+
+    if (!agent.gha_id && !agent.sa_id) {
+      console.error('createStaffEarnings: agent has no GHA or SA:', agentId);
+
+      // Check if already notified for this payment reference (webhook retries and
+      // the recovery job can reach here more than once for the same payment)
+      const { data: existingAlert } = await adminClient
+        .from('notifications')
+        .select('id')
+        .eq('recipient_id', '00000000-0000-0000-0000-000000000000')
+        .eq('type', 'unassigned_agent_payment')
+        .ilike('message', '%(ref: ' + ref.replace(/[\\%_]/g, '\\$&') + ')%')
+        .limit(1)
+        .maybeSingle();
+
+      if (existingAlert) {
+        console.log('Unassigned agent alert already sent for ref:', ref);
+        return;
+      }
+
+      // Notify admin — unassigned agent paid, needs manual assignment
+      const { error: unassignedNotifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'ADMIN',
+        recipient_id: '00000000-0000-0000-0000-000000000000',
+        type: 'unassigned_agent_payment',
+        title: '⚠ Unassigned Agent Subscribed — Action Required',
+        message: 'Agent ' + (agent.email || agentId) + ' paid ₦' + parseFloat(paymentAmount).toLocaleString() + ' for ' + planLabel + ' (ref: ' + ref + ') but has no GHA or SA assigned. No commission was created. Assign this agent to ensure future commissions are tracked.',
+        is_read: false,
+      }]);
+      if (unassignedNotifErr) console.error('Unassigned agent notification failed:', unassignedNotifErr.message);
+      else console.log('Admin notified of unassigned agent payment:', agent.email);
+      return;
+    }
+
     console.log('createStaffEarnings - agent:', agent.email, '| amount:', paymentAmount, '| ref:', ref, '| month:', monthYear);
 
     // GHA earnings
@@ -13139,6 +13171,19 @@ async function expireOldSubscriptions() {
         console.log('Expired:', a.email, '| end was:', a.subscription_end);
       });
     }
+
+    // Notify each expired agent
+    for (var expiredAgent of (expired || [])) {
+      const { error: expiredNotifErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'AGENT',
+        recipient_id: expiredAgent.id,
+        type: 'subscription_expired',
+        title: 'Your Subscription Has Expired',
+        message: 'Your GetHome subscription has expired. Your listings are now hidden from potential clients. Renew at trygethome.online to reactivate.',
+        is_read: false,
+      }]);
+      if (expiredNotifErr) console.error('Expired subscription notification failed:', expiredAgent.email, '|', expiredNotifErr.message);
+    }
   } catch(err) {
     console.error('expireOldSubscriptions exception:', err.message);
   }
@@ -13147,3 +13192,62 @@ async function expireOldSubscriptions() {
 // Run daily at startup then every 24 hours
 setTimeout(expireOldSubscriptions, 60 * 1000); // 1 min after startup
 setInterval(expireOldSubscriptions, 24 * 60 * 60 * 1000);
+
+// Warn agents whose subscription ends within the next 3 days (at most one warning per day).
+// Same scope as expireOldSubscriptions - regular, non-unlimited agents only.
+async function notifyExpiringSubscriptions() {
+  try {
+    var now = new Date().toISOString();
+    var threeDaysFromNow = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Agents expiring in next 3 days
+    const { data: expiring, error } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, subscription_tier, subscription_end')
+      .eq('role', 'agent')
+      .eq('subscription_status', 'active')
+      .eq('is_unlimited', false)
+      .gt('subscription_end', now)
+      .lt('subscription_end', threeDaysFromNow);
+
+    if (error) { console.error('Expiring subscriptions fetch error:', error.message); return; }
+
+    var warned = 0;
+    for (var agent of (expiring || [])) {
+      var daysLeft = Math.ceil((new Date(agent.subscription_end) - Date.now()) / (1000 * 60 * 60 * 24));
+
+      // Check if we already sent a warning today
+      const { data: existing } = await adminClient
+        .from('notifications')
+        .select('id')
+        .eq('recipient_id', agent.id)
+        .eq('type', 'subscription_expiring')
+        .gte('created_at', now.slice(0, 10) + 'T00:00:00.000Z')
+        .limit(1)
+        .maybeSingle();
+
+      if (existing) continue; // Already notified today
+
+      const { error: warnErr } = await adminClient.from('notifications').insert([{
+        recipient_type: 'AGENT',
+        recipient_id: agent.id,
+        type: 'subscription_expiring',
+        title: 'Your Subscription Expires in ' + daysLeft + ' Day' + (daysLeft !== 1 ? 's' : ''),
+        message: 'Your GetHome ' + (agent.subscription_tier || 'Premium') + ' subscription expires in ' + daysLeft + ' day' + (daysLeft !== 1 ? 's' : '') + '. Renew now at trygethome.online to keep your listings active and visible to clients.',
+        is_read: false,
+      }]);
+      if (warnErr) { console.error('Expiry warning failed:', agent.email, '|', warnErr.message); continue; }
+
+      warned++;
+      console.log('Expiry warning sent to:', agent.email, '| days left:', daysLeft);
+    }
+
+    console.log('Expiry notifications sent:', warned, 'of', (expiring || []).length, 'expiring agents warned');
+  } catch(err) {
+    console.error('notifyExpiringSubscriptions error:', err.message);
+  }
+}
+
+// Run daily alongside expireOldSubscriptions
+setTimeout(notifyExpiringSubscriptions, 2 * 60 * 1000); // 2 min after startup
+setInterval(notifyExpiringSubscriptions, 24 * 60 * 60 * 1000);
