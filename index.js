@@ -6364,7 +6364,7 @@ app.get('/api/properties', async (req, res) => {
     if (agentIds.length > 0) {
       const { data: agentProfiles, error: profErr } = await adminClient
         .from('profiles')
-        .select('id, full_name, agency_name, agent_type, profile_photo_url, phone, sa_id')
+        .select('id, email, full_name, agency_name, agent_type, profile_photo_url, phone, sa_id, city, office_address')
         .in('id', agentIds);
       if (profErr) {
         console.error('Properties agent enrichment error:', profErr.message);
@@ -6376,19 +6376,49 @@ app.get('/api/properties', async (req, res) => {
     // Batch-enrich with each listing agent's assigned Service Agent (SA)
     // WhatsApp/phone so the customer-facing fee-breakdown "Make Enquiry" button
     // can open a chat with the SA that handles this property.
-    const saIds = [...new Set(Object.values(agentProfilesById).map(a => a.sa_id).filter(Boolean))];
+    // Agents with no direct sa_id are matched to an SA by location (city or
+    // office_address vs service_agents.location) and auto-assigned to it.
+    const agentList = Object.values(agentProfilesById);
+    const unassignedAgents = agentList.filter(a => !a.sa_id && (a.city || a.office_address));
+    const saIds = [...new Set(agentList.map(a => a.sa_id).filter(Boolean))];
     let saContactById = {};
-    if (saIds.length > 0) {
-      const { data: saRows, error: saErr } = await adminClient
+    if (saIds.length > 0 || unassignedAgents.length > 0) {
+      let saQuery = adminClient
         .from('service_agents')
-        .select('id, whatsapp, phone')
-        .in('id', saIds);
+        .select('id, sa_code, full_name, whatsapp, whatsapp_number, phone, location');
+      // Only need every SA when some agent has to be matched by location
+      if (unassignedAgents.length === 0) saQuery = saQuery.in('id', saIds);
+      const { data: saRows, error: saErr } = await saQuery;
       if (saErr) {
         console.error('Properties SA enrichment error:', saErr.message);
       } else {
-        saContactById = Object.fromEntries((saRows || []).map(s => [s.id, s.whatsapp || s.phone || null]));
+        const allSas = saRows || [];
+        saContactById = Object.fromEntries(allSas.map(s => [s.id, s.whatsapp_number || s.whatsapp || s.phone || null]));
+
+        for (const agent of unassignedAgents) {
+          var agentLocation = (agent.city || agent.office_address || '').toLowerCase().trim();
+          if (!agentLocation) continue;
+          var saForAgent = allSas.find(function(sa) {
+            var saLoc = (sa.location || '').toLowerCase().trim();
+            if (!saLoc) return false; // an empty location would match every agent
+            return saLoc.includes(agentLocation) || agentLocation.includes(saLoc);
+          }) || null;
+          if (!saForAgent) continue;
+          agent.sa_id = saForAgent.id;
+          const { error: assignErr } = await adminClient.from('profiles')
+            .update({ sa_id: saForAgent.id })
+            .eq('id', agent.id)
+            .is('sa_id', null);
+          if (assignErr) {
+            console.error('Auto-assign agent to SA failed:', agent.email, assignErr.message);
+          } else {
+            console.log('Auto-assigned agent to SA by location:', agent.email, '->', saForAgent.sa_code);
+          }
+        }
       }
     }
+    // Use SA WhatsApp for enquiries, fallback to GetHome number
+    const getHomeWhatsApp = process.env.GETHOME_WHATSAPP || '2349130649368';
 
     const out = data.map(p => {
       const rent    = parseFloat(p.rent)           || 0;
@@ -6407,7 +6437,7 @@ app.get('/api/properties', async (req, res) => {
         agent_display_name: displayName,
         agent_photo_url: agentProf?.profile_photo_url || null,
         agent_phone: agentProf?.phone || null,
-        sa_whatsapp: (agentProf && agentProf.sa_id) ? (saContactById[agentProf.sa_id] || null) : null,
+        sa_whatsapp: ((agentProf && agentProf.sa_id) ? saContactById[agentProf.sa_id] : null) || getHomeWhatsApp,
         agent_type: p.agent_type || agentProf?.agent_type || null,
       };
     });
@@ -6520,21 +6550,27 @@ app.post('/api/properties', async (req, res) => {
     // Fetch profile using the verified ID from token - never from request body
     const { data: profileData, error: profileErr } = await adminClient
       .from('profiles')
-      .select('id, role, status, verification_level, is_unlimited, unlimited_listings, full_name, agency_name, agent_type, nin_verified')
+      .select('id, role, status, verification_level, is_unlimited, unlimited_listings, full_name, agency_name, agent_type, nin_verified, sa_id, gha_id, email, city, office_address')
       .eq('id', agentId)
       .single();
 
-    console.log('Profile lookup result - status:', profileData?.status, '| error:', profileErr?.message);
+    // .single() reports "no rows" as error PGRST116 — treat that as not found, not a server failure
+    if (profileErr && profileErr.code !== 'PGRST116') {
+      console.error('Profile fetch error:', profileErr.message, '| agentId:', agentId);
+      return res.status(500).json({ error: 'Failed to fetch agent profile' });
+    }
 
-    if (profileErr || !profileData) {
-      console.error('Profile not found for agent:', agentId, profileErr?.message);
-      return res.status(403).json({ error: 'Agent profile not found. Please contact support.' });
+    if (!profileData) {
+      console.error('Profile not found for agentId:', agentId);
+      return res.status(404).json({ error: 'Agent profile not found' });
     }
 
     const isAdmin     = profileData.role === 'admin';
 
     // Approval check
-    if (!isAdmin && profileData.status !== 'approved') {
+    console.log('Upload check - agentId:', agentId, '| status:', profileData.status, '| isAdmin:', isAdmin);
+    var agentStatus = (profileData.status || '').toLowerCase().trim();
+    if (!isAdmin && agentStatus !== 'approved') {
       console.log('Agent not approved - status:', profileData.status, '| agent:', agentId);
       const statusMsg = profileData.status === 'disapproved'
         ? 'Your agent account has been suspended. Please contact admin.'
