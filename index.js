@@ -13160,46 +13160,94 @@ setInterval(function() {
   });
 }, 60 * 60 * 1000);
 
+// Add the same agent fields /api/properties returns (agent_display_name,
+// agent_photo_url, agent_phone, sa_whatsapp, agent_type) so the property modal
+// can render an AI-returned property directly.
+async function aiEnrichProperties(rows) {
+  var agentIds = [...new Set(rows.map(function(p) { return p.created_by; }).filter(Boolean))];
+  var agentsById = {};
+  var saContactById = {};
+  if (agentIds.length > 0) {
+    const { data: agents, error: agentErr } = await adminClient
+      .from('profiles')
+      .select('id, full_name, agency_name, agent_type, profile_photo_url, phone, sa_id')
+      .in('id', agentIds);
+    if (agentErr) console.error('AI property agent enrichment error:', agentErr.message);
+    agentsById = Object.fromEntries((agents || []).map(function(a) { return [a.id, a]; }));
+
+    var saIds = [...new Set(Object.values(agentsById).map(function(a) { return a.sa_id; }).filter(Boolean))];
+    if (saIds.length > 0) {
+      const { data: sas, error: saErr } = await adminClient
+        .from('service_agents')
+        .select('id, whatsapp, whatsapp_number, phone')
+        .in('id', saIds);
+      if (saErr) console.error('AI property SA enrichment error:', saErr.message);
+      saContactById = Object.fromEntries((sas || []).map(function(s) { return [s.id, s.whatsapp_number || s.whatsapp || s.phone || null]; }));
+    }
+  }
+  var getHomeWhatsApp = process.env.GETHOME_WHATSAPP || '2349130649368';
+  return rows.map(function(p) {
+    var rent    = parseFloat(p.rent)           || 0;
+    var agency  = parseFloat(p.agency_fee)     || 0;
+    var agree   = parseFloat(p.agreement_fee)  || 0;
+    var caution = parseFloat(p.caution_fee)    || 0;
+    var svc     = parseFloat(p.service_charge) || 0;
+    var agent = agentsById[p.created_by];
+    var displayName = p.agent_display_name || (agent
+      ? (agent.agent_type === 'agency' ? (agent.agency_name || 'Agency') : (agent.full_name || 'Agent'))
+      : null);
+    return Object.assign({}, p, {
+      rent: rent, agency_fee: agency, agreement_fee: agree, caution_fee: caution, service_charge: svc,
+      total_payment: rent + agency + agree + caution + svc,
+      agent_display_name: displayName,
+      agent_photo_url: (agent && agent.profile_photo_url) || null,
+      agent_phone: (agent && agent.phone) || null,
+      sa_whatsapp: ((agent && agent.sa_id) ? saContactById[agent.sa_id] : null) || getHomeWhatsApp,
+      agent_type: p.agent_type || (agent && agent.agent_type) || null,
+    });
+  });
+}
+
 // Search properties for AI
 async function aiSearchProperties(filters) {
   try {
+    // select('*') so every field the property modal/cards read (image_url,
+    // image_urls, video_url, purpose, fees, agent_id, ...) is present.
     var query = adminClient
       .from('properties')
-      .select('id, title, property_type, listing_type, location, city, state, rent, price, bedrooms, bathrooms, description, images, status, created_by, is_deleted, is_sold')
-      .eq('is_deleted', false)
-      .eq('is_sold', false)
-      .eq('status', 'active')
+      .select('*')
+      .or('is_deleted.eq.false,is_deleted.is.null')
+      .or('is_sold.eq.false,is_sold.is.null')
       .limit(5);
 
-    if (filters.purpose === 'rent') query = query.eq('listing_type', 'rent');
-    if (filters.purpose === 'buy') query = query.eq('listing_type', 'sale');
-    if (filters.purpose === 'shortlet') query = query.eq('listing_type', 'shortlet');
+    if (filters.purpose === 'rent') query = query.eq('purpose', 'rent');
+    if (filters.purpose === 'buy') query = query.eq('purpose', 'sale');
+    if (filters.purpose === 'shortlet') query = query.eq('purpose', 'shortlet');
     if (filters.bedrooms) query = query.eq('bedrooms', parseInt(filters.bedrooms));
     if (filters.location) query = query.ilike('location', '%' + filters.location + '%');
-    if (filters.city) query = query.ilike('city', '%' + filters.city + '%');
-    if (filters.property_type) query = query.ilike('property_type', '%' + filters.property_type + '%');
     if (filters.max_price) {
-      query = query.or('rent.lte.' + filters.max_price + ',price.lte.' + filters.max_price);
+      var mp = parseFloat(filters.max_price);
+      if (mp > 0) query = query.or('rent.lte.' + mp + ',price.lte.' + mp);
     }
 
-    const { data: properties } = await query;
+    const { data: properties, error: searchErr } = await query;
+    if (searchErr) console.error('AI property search query error:', searchErr.message);
 
     // If no exact match try relaxed search
     if (!properties || properties.length === 0) {
       var relaxedQuery = adminClient
         .from('properties')
-        .select('id, title, property_type, listing_type, location, city, state, rent, price, bedrooms, bathrooms, description, images, status, created_by, is_deleted, is_sold')
-        .eq('is_deleted', false)
-        .eq('is_sold', false)
-        .eq('status', 'active')
+        .select('*')
+        .or('is_deleted.eq.false,is_deleted.is.null')
+        .or('is_sold.eq.false,is_sold.is.null')
         .limit(5);
       if (filters.location) relaxedQuery = relaxedQuery.ilike('location', '%' + filters.location + '%');
-      if (filters.city) relaxedQuery = relaxedQuery.ilike('city', '%' + filters.city + '%');
-      const { data: relaxed } = await relaxedQuery;
-      return { properties: relaxed || [], isAlternative: true };
+      const { data: relaxed, error: relaxedErr } = await relaxedQuery;
+      if (relaxedErr) console.error('AI relaxed property search error:', relaxedErr.message);
+      return { properties: await aiEnrichProperties(relaxed || []), isAlternative: true };
     }
 
-    return { properties: properties || [], isAlternative: false };
+    return { properties: await aiEnrichProperties(properties), isAlternative: false };
   } catch(err) {
     console.error('AI property search error:', err.message);
     return { properties: [], isAlternative: false };
