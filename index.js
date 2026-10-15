@@ -13752,66 +13752,69 @@ app.get('/api/admin/gha-referrals', async (req, res) => {
     const { data: profile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
     if (!profile || profile.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
 
-    const { data, error } = await adminClient.rpc('get_gha_referral_stats');
-    if (error) {
-      // fallback to raw query if RPC not set up
-      const { data: raw, error: rawErr } = await adminClient
-        .from('profiles')
-        .select('referred_by_gha, created_at, role')
-        .not('referred_by_gha', 'is', null);
-      if (rawErr) return res.status(500).json({ error: rawErr.message });
+    const { from, to } = req.query;
 
-      const now = new Date();
-      const todayStr = now.toISOString().slice(0, 10);
-      const monthStr = now.toISOString().slice(0, 7);
+    const { data: raw, error: rawErr } = await adminClient
+      .from('profiles')
+      .select('referred_by_gha, created_at, role')
+      .not('referred_by_gha', 'is', null)
+      .gte('created_at', from ? new Date(from).toISOString() : '2000-01-01')
+      .lte('created_at', to ? new Date(to + 'T23:59:59').toISOString() : new Date().toISOString());
 
-      const stats = {};
-      for (const row of raw) {
-        const code = row.referred_by_gha;
-        if (!stats[code]) stats[code] = {
-          gha_code: code,
-          total: 0, today: 0, this_month: 0,
-          agents: 0, agents_today: 0, agents_month: 0,
-          customers: 0, customers_today: 0, customers_month: 0,
-        };
-        const isToday = row.created_at?.slice(0, 10) === todayStr;
-        const isMonth = row.created_at?.slice(0, 7) === monthStr;
-        const isAgent = row.role === 'agent';
+    if (rawErr) return res.status(500).json({ error: rawErr.message });
 
-        stats[code].total++;
-        if (isToday) stats[code].today++;
-        if (isMonth) stats[code].this_month++;
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const monthStr = now.toISOString().slice(0, 7);
 
-        if (isAgent) {
-          stats[code].agents++;
-          if (isToday) stats[code].agents_today++;
-          if (isMonth) stats[code].agents_month++;
-        } else {
-          stats[code].customers++;
-          if (isToday) stats[code].customers_today++;
-          if (isMonth) stats[code].customers_month++;
-        }
+    const stats = {};
+    for (const row of raw) {
+      const code = row.referred_by_gha;
+      if (!stats[code]) stats[code] = {
+        gha_code: code,
+        total: 0, today: 0, this_month: 0,
+        agents: 0, agents_today: 0, agents_month: 0,
+        customers: 0, customers_today: 0, customers_month: 0,
+      };
+      const isToday = row.created_at?.slice(0, 10) === todayStr;
+      const isMonth = row.created_at?.slice(0, 7) === monthStr;
+      const isAgent = row.role === 'agent';
+
+      stats[code].total++;
+      if (isToday) stats[code].today++;
+      if (isMonth) stats[code].this_month++;
+
+      if (isAgent) {
+        stats[code].agents++;
+        if (isToday) stats[code].agents_today++;
+        if (isMonth) stats[code].agents_month++;
+      } else {
+        stats[code].customers++;
+        if (isToday) stats[code].customers_today++;
+        if (isMonth) stats[code].customers_month++;
       }
-
-      // join with gha_agents for names
-      const codes = Object.keys(stats);
-      const { data: ghas } = await adminClient
-        .from('gha_agents')
-        .select('gha_code, full_name, phone')
-        .in('gha_code', codes);
-
-      const ghaMap = {};
-      for (const g of (ghas || [])) ghaMap[g.gha_code] = g;
-
-      const result = Object.values(stats).map(s => ({
-        ...s,
-        gha_name: ghaMap[s.gha_code]?.full_name || '—',
-        gha_phone: ghaMap[s.gha_code]?.phone || '—',
-      })).sort((a, b) => b.total - a.total);
-
-      return res.json({ referrals: result });
     }
-    return res.json({ referrals: data });
+
+    const codes = Object.keys(stats);
+    if (codes.length === 0) return res.json({ referrals: [] });
+
+    const { data: ghas } = await adminClient
+      .from('gha_agents')
+      .select('gha_code, full_name, phone')
+      .in('gha_code', codes);
+
+    const ghaMap = {};
+    for (const g of (ghas || [])) ghaMap[g.gha_code] = g;
+
+    const result = Object.values(stats).map(s => ({
+      ...s,
+      agents_total: s.agents,
+      customers_total: s.customers,
+      gha_name: ghaMap[s.gha_code]?.full_name || '—',
+      gha_phone: ghaMap[s.gha_code]?.phone || '—',
+    })).sort((a, b) => b.total - a.total);
+
+    return res.json({ referrals: result });
   } catch (e) {
     console.error('GHA referrals error:', e.message);
     res.status(500).json({ error: 'Server error' });
