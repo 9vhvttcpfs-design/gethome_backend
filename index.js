@@ -5894,6 +5894,7 @@ app.post('/api/admin/trigger-earnings-recovery', async (req, res) => {
 // ──────────────────────────────────────────────────────────
 app.post('/api/auth/signup', async (req, res) => {
   const { email, password } = req.body;
+  const refGha = req.body.referred_by_gha || null;
   if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
   if (password.length < 6)  return res.status(400).json({ error: "Password must be at least 6 characters." });
   // Block disposable emails
@@ -5953,7 +5954,11 @@ app.post('/api/auth/signup', async (req, res) => {
     if (finalUserId) {
       (async () => {
         const { error: profileErr } = await supabase.from('profiles')
-          .upsert([{ id: finalUserId, role: 'customer', status: 'approved', email: userEmail }], { onConflict: 'id' });
+          .upsert([{
+            id: finalUserId, role: 'customer', status: 'approved', email: userEmail,
+            referred_by_gha: refGha,
+            referral_source: refGha ? 'gha_referral' : 'direct',
+          }], { onConflict: 'id' });
         if (profileErr) console.error('Profile error (non-blocking):', profileErr.message);
         else console.log('Customer profile created for:', userEmail);
       })();
@@ -5993,6 +5998,7 @@ https://trygethome.online`
 // Agent registration - same as signup but sets role to 'agent'
 app.post('/api/auth/agent-register', async (req, res) => {
   const { email, password, fullName, phone, address, city, experience, specialty, nin, cac, about, requested_gha_code } = req.body;
+  const refGha = req.body.referred_by_gha || null;
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
   // Block disposable emails
@@ -6054,6 +6060,8 @@ app.post('/api/auth/agent-register', async (req, res) => {
         nin_number: nin || null,
         cac_number: cac || null,
         about: about || null,
+        referred_by_gha: refGha,
+        referral_source: refGha ? 'gha_referral' : 'direct',
       }], { onConflict: 'id' })
       .select();
 
@@ -13732,6 +13740,83 @@ app.get('/api/admin/ai-leads', async (req, res) => {
 // ============================================================
 // END GETHOME AI AGENT SERVICE
 // ============================================================
+
+// GHA Referral Stats
+app.get('/api/admin/gha-referrals', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) return res.status(401).json({ error: 'Unauthorized' });
+    const { data: profile } = await adminClient.from('profiles').select('role').eq('id', user.id).single();
+    if (!profile || profile.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+
+    const { data, error } = await adminClient.rpc('get_gha_referral_stats');
+    if (error) {
+      // fallback to raw query if RPC not set up
+      const { data: raw, error: rawErr } = await adminClient
+        .from('profiles')
+        .select('referred_by_gha, created_at, role')
+        .not('referred_by_gha', 'is', null);
+      if (rawErr) return res.status(500).json({ error: rawErr.message });
+
+      const now = new Date();
+      const todayStr = now.toISOString().slice(0, 10);
+      const monthStr = now.toISOString().slice(0, 7);
+
+      const stats = {};
+      for (const row of raw) {
+        const code = row.referred_by_gha;
+        if (!stats[code]) stats[code] = {
+          gha_code: code,
+          total: 0, today: 0, this_month: 0,
+          agents: 0, agents_today: 0, agents_month: 0,
+          customers: 0, customers_today: 0, customers_month: 0,
+        };
+        const isToday = row.created_at?.slice(0, 10) === todayStr;
+        const isMonth = row.created_at?.slice(0, 7) === monthStr;
+        const isAgent = row.role === 'agent';
+
+        stats[code].total++;
+        if (isToday) stats[code].today++;
+        if (isMonth) stats[code].this_month++;
+
+        if (isAgent) {
+          stats[code].agents++;
+          if (isToday) stats[code].agents_today++;
+          if (isMonth) stats[code].agents_month++;
+        } else {
+          stats[code].customers++;
+          if (isToday) stats[code].customers_today++;
+          if (isMonth) stats[code].customers_month++;
+        }
+      }
+
+      // join with gha_agents for names
+      const codes = Object.keys(stats);
+      const { data: ghas } = await adminClient
+        .from('gha_agents')
+        .select('gha_code, full_name, phone')
+        .in('gha_code', codes);
+
+      const ghaMap = {};
+      for (const g of (ghas || [])) ghaMap[g.gha_code] = g;
+
+      const result = Object.values(stats).map(s => ({
+        ...s,
+        gha_name: ghaMap[s.gha_code]?.full_name || '—',
+        gha_phone: ghaMap[s.gha_code]?.phone || '—',
+      })).sort((a, b) => b.total - a.total);
+
+      return res.json({ referrals: result });
+    }
+    return res.json({ referrals: data });
+  } catch (e) {
+    console.error('GHA referrals error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // ──────────────────────────────────────────────────────────
 // START SERVER
