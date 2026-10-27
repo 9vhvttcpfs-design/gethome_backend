@@ -636,6 +636,22 @@ app.get('/api/admin/verified-pending-agents', async (req, res) => {
   }
 });
 
+// profiles.referred_by_gha stores a GHA code; resolve it to the gha_agents row and link the agent
+async function linkReferredGha(agentId) {
+  try {
+    const { data: p } = await adminClient
+      .from('profiles').select('referred_by_gha, gha_id').eq('id', agentId).single();
+    if (!p?.referred_by_gha || p.gha_id) return;
+    const { data: gha } = await adminClient
+      .from('gha_agents').select('id, gha_code')
+      .eq('gha_code', String(p.referred_by_gha).trim().toUpperCase()).maybeSingle();
+    if (!gha) return;
+    await adminClient.from('profiles')
+      .update({ gha_id: gha.id, gha_code: gha.gha_code, gha_verified: true })
+      .eq('id', agentId);
+  } catch (e) { console.error('linkReferredGha error:', e.message); }
+}
+
 // Approve agent (admin only)
 app.post('/api/admin/approve-agent', async (req, res) => {
   try {
@@ -658,6 +674,7 @@ app.post('/api/admin/approve-agent', async (req, res) => {
       .eq('id', agentId)
       .eq('role', 'agent');
     if (error) throw error;
+    await linkReferredGha(agentId);
     console.log('Agent approved:', agentId);
     // Get agent email to notify them
     try {
@@ -1721,40 +1738,40 @@ app.get('/api/sa/pending-agents', async (req, res) => {
     // This is safer than missing agents due to location mismatch
     const { data: allUnassigned } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, subscription_tier, subscription_amount, is_unlimited, gha_id, gha_code, city, office_address, agent_type, agency_name, created_at, nin_number, cac_number, requested_gha_code, sa_id')
+      .select('id, email, full_name, phone, status, subscription_tier, subscription_amount, is_unlimited, gha_id, gha_code, city, state, office_address, agent_type, agency_name, created_at, nin_number, cac_number, requested_gha_code, sa_id')
       .eq('role', 'agent')
       .is('sa_id', null)
       .in('status', ['pending', 'pending_sa_review', 'pending_gha_inspection', 'awaiting_review']);
 
-    // Filter in JS - match SA location words OR show agents with city in same state
+    const { data: saLocRows } = await adminClient
+      .from('sa_locations')
+      .select('city, state')
+      .eq('sa_id', session.staff_id)
+      .eq('is_active', true);
+
+    var saLoc = (saRecord?.location || '').toLowerCase().trim();
+    var saWords = saLoc.split(/[\s,]+/).filter(function(w) { return w.length > 2; });
+
+    // Only unassigned agents inside this SA's area (state/city rows first, then keyword fallback)
     locationAgents = (allUnassigned || []).filter(function(agent) {
-      var agentCity = (agent.city || '').toLowerCase().trim();
-      var agentAddress = (agent.office_address || '').toLowerCase().trim();
-      var agentText = agentCity + ' ' + agentAddress;
-      var saLoc = (saRecord?.location || '').toLowerCase().trim();
-      var saWords = saLoc.split(/[\s,]+/).filter(function(w) { return w.length > 2; });
+      var city = (agent.city || '').toLowerCase().trim();
+      var addr = (agent.office_address || '').toLowerCase().trim();
+      var state = (agent.state || '').toLowerCase().trim();
+      if (!city && !addr) return false; // no location = don't show
 
-      // Direct match - SA location word in agent text
-      var directMatch = saWords.some(function(w) { return agentText.includes(w); });
-
-      // Reverse match - agent city word in SA location
-      var agentWords = agentCity.split(/[\s,]+/).filter(function(w) { return w.length > 2; });
-      var reverseMatch = agentWords.some(function(w) { return saLoc.includes(w); });
-
-      // No location - show to all SAs
-      var noLocation = !agent.city && !agent.office_address;
-
-      var matched = directMatch || reverseMatch || noLocation;
-      console.log('Agent:', agent.email, '| city:', agent.city, '| matched:', matched, '| directMatch:', directMatch, '| reverseMatch:', reverseMatch);
-      return matched;
+      if (saLocRows && saLocRows.length > 0) {
+        for (const loc of saLocRows) {
+          const locState = (loc.state || '').toLowerCase().trim();
+          const locCity = (loc.city || '').toLowerCase().trim();
+          if (state && locState && state === locState) return true;
+          if (city && locState && city.includes(locState)) return true;
+          if (locCity && city && city.includes(locCity)) return true;
+        }
+      }
+      // fallback keyword match
+      var agentText = city + ' ' + addr;
+      return saWords.some(function(w) { return agentText.includes(w); });
     });
-
-    // If no location match found show ALL unassigned to all SAs
-    // so no agent falls through the cracks
-    if (locationAgents.length === 0 && (allUnassigned||[]).length > 0) {
-      console.log('No location matches found - showing all unassigned to SA');
-      locationAgents = allUnassigned || [];
-    }
 
     console.log('Location agents final:', locationAgents.length);
 
@@ -1839,6 +1856,7 @@ app.post('/api/sa/approve-agent', async (req, res) => {
       })
       .eq('id', agent_id);
     if (updateErr) return res.status(500).json({ error: updateErr.message });
+    await linkReferredGha(agent_id);
     console.log('Agent approved successfully:', agent_id, '| by SA:', session.staff_id);
 
     try {
@@ -2132,16 +2150,11 @@ app.get('/api/sa/search-agent', async (req, res) => {
       .eq('id', session.staff_id)
       .single();
 
-    const saLocation = (saRecord?.location || '').toLowerCase().trim();
-
-    // Extract city keywords from SA location
-    // e.g. 'Wuse Abuja' -> ['wuse', 'abuja']
-    const saKeywords = saLocation
-      .split(/[\s,]+/)
-      .map(w => w.trim())
-      .filter(w => w.length > 2);
-
-    console.log('SA', saRecord?.sa_code, 'location:', saLocation, 'keywords:', saKeywords);
+    const { data: saLocations } = await adminClient
+      .from('sa_locations')
+      .select('city, state')
+      .eq('sa_id', session.staff_id)
+      .eq('is_active', true);
 
     const searchEmail = (req.query.email || '').trim().toLowerCase();
     if (!searchEmail) return res.status(400).json({ error: 'Email is required' });
@@ -2149,7 +2162,7 @@ app.get('/api/sa/search-agent', async (req, res) => {
     // Search by email with role=agent - NO status filter
     const { data: foundAgent, error: searchError } = await adminClient
       .from('profiles')
-      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, experience, specialty, nin_number, cac_number, about, requested_gha_code, created_at')
+      .select('id, email, full_name, phone, status, verification_level, gha_id, sa_id, gha_code, office_address, city, state, experience, specialty, nin_number, cac_number, about, requested_gha_code, created_at')
       .ilike('email', searchEmail)
       .eq('role', 'agent')
       .single();
@@ -2161,23 +2174,37 @@ app.get('/api/sa/search-agent', async (req, res) => {
       });
     }
 
-    // Location check - only enforce if SA has a location set
-    if (saKeywords.length > 0) {
+    // Location check - only enforce if the SA has any location configured
+    const saLoc = (saRecord?.location || '').toLowerCase().trim();
+    const saWords = saLoc.split(/[\s,]+/).filter(w => w.length > 2);
+    if (saWords.length > 0 || (saLocations && saLocations.length > 0)) {
       const agentCity = (foundAgent.city || '').toLowerCase().trim();
+      const agentState = (foundAgent.state || '').toLowerCase().trim();
       const agentAddress = (foundAgent.office_address || '').toLowerCase().trim();
-      const agentLocationText = agentCity + ' ' + agentAddress;
+      const agentHasNoLocation = !foundAgent.city && !foundAgent.office_address;
 
-      // Check if any SA keyword appears in agent location OR agent location appears in SA location
-      const locationMatch = saKeywords.some(function(keyword) {
-        return agentLocationText.includes(keyword) || saLocation.includes(agentCity);
-      });
+      let locationMatch = agentHasNoLocation; // no location = pass through
 
-      // Also allow if agent has no city set yet
-      const agentHasNoLocation = !agentCity && !agentAddress;
+      if (!locationMatch && saLocations && saLocations.length > 0) {
+        for (const loc of saLocations) {
+          const locState = (loc.state || '').toLowerCase().trim();
+          const locCity = (loc.city || '').toLowerCase().trim();
+          if (agentState && locState && agentState === locState) { locationMatch = true; break; }
+          if (agentCity && locState && agentCity.includes(locState)) { locationMatch = true; break; }
+          if (locCity && agentCity && agentCity.includes(locCity)) { locationMatch = true; break; }
+          if (locCity && agentAddress && agentAddress.includes(locCity)) { locationMatch = true; break; }
+        }
+      }
 
-      if (!locationMatch && !agentHasNoLocation) {
+      // Fallback: old keyword match on service_agents.location
+      if (!locationMatch && saWords.length > 0) {
+        const agentText = agentCity + ' ' + agentAddress;
+        locationMatch = saWords.some(w => agentText.includes(w) || (agentCity && saLoc.includes(agentCity)));
+      }
+
+      if (!locationMatch) {
         return res.status(400).json({
-          error: 'This agent is located in ' + (foundAgent.city || 'a different area') + ' and is outside your service area (' + saRecord?.location + '). Only agents in your area can be assigned to your GHAs.',
+          error: `This agent is located in ${foundAgent.city || 'a different area'} and is outside your service area (${saRecord?.location}). Only agents in your area can be assigned to your GHAs.`,
           location_mismatch: true,
           agent_city: foundAgent.city || 'Unknown',
           sa_location: saRecord?.location,
@@ -9551,14 +9578,18 @@ app.post('/api/admin/sa-add-location', async (req, res) => {
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
     const { sa_id, city, state } = req.body;
-    if (!sa_id || !city) return res.status(400).json({ error: 'sa_id and city are required' });
+    if (!sa_id || !state) return res.status(400).json({ error: 'SA and state are required' });
 
-    const { data, error } = await adminClient.from('sa_locations').upsert([{
-      sa_id,
-      city: city.trim(),
-      state: state ? state.trim() : null,
-      is_active: true,
-    }], { onConflict: 'sa_id,city' }).select().single();
+    const { data, error } = await adminClient
+      .from('sa_locations')
+      .upsert({
+        sa_id,
+        city: city ? city.trim() : null,
+        state: state.trim(),
+        is_active: true,
+      }, { onConflict: 'sa_id,state' })
+      .select()
+      .single();
 
     if (error) return res.status(500).json({ error: error.message });
 
