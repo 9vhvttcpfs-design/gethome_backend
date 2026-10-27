@@ -652,6 +652,25 @@ async function linkReferredGha(agentId) {
   } catch (e) { console.error('linkReferredGha error:', e.message); }
 }
 
+// Agent counts and revenue for one GHA in a month. Merges gha_earnings and sa_earnings so a
+// missing row in either table does not zero the figures; total_agents counts every agent linked to the GHA.
+async function buildGhaMonthStats(ghaId, ghaEarn, saEarn) {
+  const { count: linkedAgents } = await adminClient
+    .from('profiles')
+    .select('id', { count: 'exact', head: true })
+    .eq('role', 'agent')
+    .eq('gha_id', ghaId);
+  var paidAgentIds = new Set();
+  (ghaEarn || []).forEach(function(e) { if (e.agent_id) paidAgentIds.add(e.agent_id); });
+  (saEarn || []).forEach(function(e) { if (e.agent_id) paidAgentIds.add(e.agent_id); });
+  var revenueRows = (ghaEarn && ghaEarn.length > 0) ? ghaEarn : (saEarn || []);
+  return {
+    total_agents: Math.max(linkedAgents || 0, paidAgentIds.size),
+    active_subscriptions: paidAgentIds.size,
+    revenue: revenueRows.reduce(function(s, e) { return s + parseFloat(e.subscription_amount || 0); }, 0),
+  };
+}
+
 // Approve agent (admin only)
 app.post('/api/admin/approve-agent', async (req, res) => {
   try {
@@ -2121,6 +2140,62 @@ app.post('/api/sa/add-gha', verifyStaffToken, async (req, res) => {
     res.status(201).json(result);
   } catch (err) {
     console.error('SA add-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sa/search-agent-suggestions - partial email/name matches for the add-agent dropdown
+app.get('/api/sa/search-agent-suggestions', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+    const { data: session } = await adminClient.from('staff_sessions')
+      .select('*').eq('token', token).gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!session || session.staff_role !== 'SA') return res.status(403).json({ error: 'SA access required' });
+
+    const q = (req.query.q || '').trim().toLowerCase().replace(/[%,()]/g, '');
+    if (q.length < 2) return res.json({ agents: [] });
+
+    const { data: saRecord } = await adminClient.from('service_agents')
+      .select('location').eq('id', session.staff_id).single();
+    const { data: saLocations } = await adminClient.from('sa_locations')
+      .select('city, state').eq('sa_id', session.staff_id).eq('is_active', true);
+
+    const { data: found } = await adminClient
+      .from('profiles')
+      .select('id, email, full_name, status, gha_id, sa_id, gha_code, office_address, city, state')
+      .eq('role', 'agent')
+      .or('email.ilike.%' + q + '%,full_name.ilike.%' + q + '%')
+      .limit(30);
+
+    const saLoc = (saRecord?.location || '').toLowerCase().trim();
+    const saWords = saLoc.split(/[\s,]+/).filter(w => w.length > 2);
+    const hasArea = saWords.length > 0 || (saLocations && saLocations.length > 0);
+
+    const agents = (found || []).filter(function(a) {
+      if (a.gha_id && a.sa_id && a.sa_id !== session.staff_id) return false;
+      if (!hasArea) return true;
+      const city = (a.city || '').toLowerCase().trim();
+      const state = (a.state || '').toLowerCase().trim();
+      const addr = (a.office_address || '').toLowerCase().trim();
+      if (!city && !addr) return true;
+      for (const loc of (saLocations || [])) {
+        const locState = (loc.state || '').toLowerCase().trim();
+        const locCity = (loc.city || '').toLowerCase().trim();
+        if (state && locState && state === locState) return true;
+        if (city && locState && city.includes(locState)) return true;
+        if (locCity && city && city.includes(locCity)) return true;
+        if (locCity && addr && addr.includes(locCity)) return true;
+      }
+      return saWords.some(w => (city + ' ' + addr).includes(w));
+    }).slice(0, 8).map(function(a) {
+      return { id: a.id, email: a.email, full_name: a.full_name, status: a.status, city: a.city, gha_code: a.gha_code };
+    });
+
+    res.json({ agents });
+  } catch (err) {
+    console.error('Search agent suggestions exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -8558,9 +8633,11 @@ app.get('/api/admin/monthly-history', async (req, res) => {
       // Get SA commission for these agents
       const { data: saEarn } = await adminClient
         .from('sa_earnings')
-        .select('commission_amount, is_paid')
+        .select('agent_id, subscription_amount, commission_amount, is_paid')
         .eq('gha_id', gha.id)
         .eq('month_year', month);
+      var ghaStats = await buildGhaMonthStats(gha.id, ghaEarn, saEarn);
+      totalRev = ghaStats.revenue;
       var totalSaComm = (saEarn || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
 
       // Count confirmed inspections for this month directly from the inspections
@@ -8622,8 +8699,8 @@ app.get('/api/admin/monthly-history', async (req, res) => {
         inspections_paid: inspPaidCount,
         inspections_unpaid: inspUnpaidCount,
         inspection_done: inspCount,
-        total_agents: (ghaEarn || []).length,
-        active_subscriptions: new Set((ghaEarn || []).map(function(e) { return e.agent_id; })).size,
+        total_agents: ghaStats.total_agents,
+        active_subscriptions: ghaStats.active_subscriptions,
         earnings: ghaEarn || [],
       };
     }));
@@ -8845,12 +8922,13 @@ app.get('/api/sa/monthly-history', async (req, res) => {
       // SA commission for agents under this GHA
       const { data: saEarnForGha } = await adminClient
         .from('sa_earnings')
-        .select('commission_amount, is_paid')
+        .select('agent_id, subscription_amount, commission_amount, is_paid')
         .eq('sa_id', session.staff_id)
         .eq('gha_id', gha.id)
         .eq('month_year', month);
 
-      var totalRev = (ghaEarn || []).reduce(function(s, e) { return s + parseFloat(e.subscription_amount || 0); }, 0);
+      var ghaStats = await buildGhaMonthStats(gha.id, ghaEarn, saEarnForGha);
+      var totalRev = ghaStats.revenue;
       var totalGhaComm = (ghaEarn || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
       var totalSaComm = (saEarnForGha || []).reduce(function(s, e) { return s + parseFloat(e.commission_amount || 0); }, 0);
 
@@ -8874,8 +8952,9 @@ app.get('/api/sa/monthly-history', async (req, res) => {
         total_sa_commission: totalSaComm,
         sa_commission: totalSaComm,
         inspections_completed: inspCount || 0,
-        total_agents: new Set((ghaEarn || []).map(function(e) { return e.agent_id; })).size,
-        active_subscriptions: new Set((ghaEarn || []).map(function(e) { return e.agent_id; })).size,
+        inspections_done: inspCount || 0,
+        total_agents: ghaStats.total_agents,
+        active_subscriptions: ghaStats.active_subscriptions,
       };
     }));
 
@@ -11119,12 +11198,37 @@ app.get('/api/gha/my-referrals', async (req, res) => {
       .eq('gha_id', session.staff_id)
       .order('registered_at', { ascending: false });
 
-    const total = (referrals || []).length;
-    const approved = (referrals || []).filter(r => r.status === 'approved' || r.status === 'subscribed').length;
-    const subscribed = (referrals || []).filter(r => r.status === 'subscribed').length;
+    // Agents who signed up through the GHA's referral link are stored on profiles.referred_by_gha
+    const { data: ghaRow } = await adminClient.from('gha_agents').select('gha_code').eq('id', session.staff_id).maybeSingle();
+    var allReferrals = (referrals || []).slice();
+    if (ghaRow?.gha_code) {
+      const { data: linkAgents } = await adminClient
+        .from('profiles')
+        .select('id, email, full_name, status, subscription_tier, created_at')
+        .eq('role', 'agent')
+        .ilike('referred_by_gha', ghaRow.gha_code);
+      const known = new Set(allReferrals.map(r => r.referred_agent_id));
+      (linkAgents || []).forEach(function(p) {
+        if (known.has(p.id)) return;
+        var paid = p.subscription_tier && p.subscription_tier !== 'free';
+        allReferrals.push({
+          gha_id: session.staff_id,
+          gha_code: ghaRow.gha_code,
+          referred_agent_id: p.id,
+          referred_agent_email: p.email,
+          referred_agent_name: p.full_name,
+          status: paid ? 'subscribed' : (p.status === 'approved' ? 'approved' : 'registered'),
+          registered_at: p.created_at,
+        });
+      });
+    }
+
+    const total = allReferrals.length;
+    const approved = allReferrals.filter(r => r.status === 'approved' || r.status === 'subscribed').length;
+    const subscribed = allReferrals.filter(r => r.status === 'subscribed').length;
 
     res.json({
-      referrals: referrals || [],
+      referrals: allReferrals,
       stats: { total, approved, subscribed }
     });
   } catch (err) {
@@ -13800,7 +13904,7 @@ app.get('/api/admin/gha-referrals', async (req, res) => {
 
     const stats = {};
     for (const row of raw) {
-      const code = row.referred_by_gha;
+      const code = String(row.referred_by_gha).trim().toUpperCase();
       if (!stats[code]) stats[code] = {
         gha_code: code,
         total: 0, today: 0, this_month: 0,
