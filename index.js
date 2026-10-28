@@ -1508,7 +1508,12 @@ app.get('/api/gha/profile', async (req, res) => {
       .select('id', { count: 'exact', head: true })
       .eq('gha_id', session.staff_id);
 
-    const sa = ghaRecord.service_agents || {};
+    var sa = ghaRecord.service_agents || {};
+    if (!sa.sa_code && ghaRecord.sa_id) {
+      const { data: saRow } = await adminClient.from('service_agents')
+        .select('sa_code, full_name, email, phone, whatsapp_number').eq('id', ghaRecord.sa_id).maybeSingle();
+      if (saRow) sa = saRow;
+    }
     res.json({
       gha_code: ghaRecord.gha_code,
       full_name: ghaRecord.full_name,
@@ -4212,6 +4217,7 @@ app.post('/api/admin/reassign-gha', async (req, res) => {
     }
 
     console.log('GHA reassigned successfully. Updated rows:', updateData?.length || 'via RPC');
+    await addGhaLocationsToSa(newSaId, ghaId);
 
     const { data: gha } = await adminClient.from('gha_agents').select('gha_code, full_name').eq('id', ghaId).single();
     const { data: sa } = await adminClient.from('service_agents').select('sa_code, full_name').eq('id', newSaId).single();
@@ -5024,6 +5030,32 @@ https://trygethome.online`
   }
 });
 
+// Add states/cities to an SA's service area. One row per state (unique on sa_id,state); existing rows are kept.
+async function addSaLocations(saId, places) {
+  try {
+    var byState = {};
+    (places || []).forEach(function(p) {
+      var st = (p.state || '').trim();
+      if (!st) return;
+      var key = st.toLowerCase();
+      if (!byState[key]) byState[key] = { sa_id: saId, state: st, city: (p.city || '').trim() || null, is_active: true };
+    });
+    var rows = Object.values(byState);
+    if (!saId || rows.length === 0) return;
+    const { error } = await adminClient.from('sa_locations')
+      .upsert(rows, { onConflict: 'sa_id,state', ignoreDuplicates: true });
+    if (error) console.error('addSaLocations failed:', error.message);
+  } catch (e) { console.error('addSaLocations error:', e.message); }
+}
+
+// Add the GHA's own location and its agents' locations to the SA's service area
+async function addGhaLocationsToSa(saId, ghaId) {
+  const { data: gha } = await adminClient.from('gha_agents').select('*').eq('id', ghaId).maybeSingle();
+  const { data: ghaAgents } = await adminClient.from('profiles')
+    .select('state, city').eq('gha_id', ghaId).eq('role', 'agent');
+  await addSaLocations(saId, [{ state: gha?.state, city: gha?.city }].concat(ghaAgents || []));
+}
+
 // POST /api/admin/assign-gha-to-sa
 app.post('/api/admin/assign-gha-to-sa', async (req, res) => {
   try {
@@ -5050,6 +5082,8 @@ app.post('/api/admin/assign-gha-to-sa', async (req, res) => {
     const { error: agentErr } = await serviceClient
       .from('profiles').update({ sa_id }).eq('gha_id', gha_id);
     if (agentErr) throw agentErr;
+
+    await addGhaLocationsToSa(sa_id, gha_id);
 
     res.json({ success: true, message: 'GHA assigned to SA successfully' });
   } catch (err) {
@@ -6793,7 +6827,7 @@ app.post('/api/properties', async (req, res) => {
     if (agentId) {
       try {
         const { data: agentProfile } = await adminClient.from('profiles')
-          .select('sa_id, gha_id, full_name, email, gha_code').eq('id', agentId).single();
+          .select('sa_id, gha_id, full_name, email, gha_code, state, city').eq('id', agentId).single();
 
         // Find SA via direct assignment or via GHA
         var notifySaId = agentProfile?.sa_id;
@@ -6808,6 +6842,7 @@ app.post('/api/properties', async (req, res) => {
         }
 
         if (notifySaId) {
+          await addSaLocations(notifySaId, [{ state: agentProfile?.state, city: agentProfile?.city }]);
           const { error: notifErr } = await adminClient.from('notifications').insert([{
             recipient_type: 'SA',
             recipient_id: notifySaId,
