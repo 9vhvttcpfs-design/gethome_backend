@@ -286,6 +286,22 @@ async function getStaffCommissionRate(staffId, staffType) {
     return 5;
   }
 }
+// Effective end date for an agent's paid plan. Unlimited plans expire on
+// unlimited_expires_at, which can differ from subscription_end, so it wins when set.
+function getAgentPlanEnd(a) {
+  if ((a.is_unlimited || a.subscription_tier === 'unlimited') && a.unlimited_expires_at) {
+    return new Date(a.unlimited_expires_at);
+  }
+  return a.subscription_end ? new Date(a.subscription_end) : null;
+}
+function isAgentSubActive(a, now) {
+  var end = getAgentPlanEnd(a);
+  return a.subscription_status === 'active' && !!end && end > now;
+}
+function isAgentSubExpired(a, now) {
+  var end = getAgentPlanEnd(a);
+  return !!end && end <= now && !!a.subscription_tier && a.subscription_tier !== 'free';
+}
 // Revokes unlimited_listings for any agent whose unlimited_expires_at has passed.
 // Called on server startup, on an hourly interval, and defensively at the top
 // of the endpoints that read/report unlimited-plan status.
@@ -2770,17 +2786,10 @@ app.get('/api/gha/overview', verifyStaffToken, async (req, res) => {
     var now = new Date();
 
     // Active = subscription_status is active AND subscription_end is in the future
-    var activeAgents = agents.filter(function(a) {
-      return a.subscription_status === 'active' &&
-        a.subscription_end &&
-        new Date(a.subscription_end) > now;
-    });
+    var activeAgents = agents.filter(function(a) { return isAgentSubActive(a, now); });
 
     // Expired = had a paid plan but subscription_end is in the past
-    var expiredAgents = agents.filter(function(a) {
-      return a.subscription_end && new Date(a.subscription_end) <= now &&
-        a.subscription_tier && a.subscription_tier !== 'free';
-    });
+    var expiredAgents = agents.filter(function(a) { return isAgentSubExpired(a, now); });
 
     // Free = never subscribed
     var freeAgents = agents.filter(function(a) {
@@ -3364,7 +3373,7 @@ app.get('/api/sa/overview', async (req, res) => {
     // Get ALL agents under this SA (via direct sa_id OR via GHA under this SA)
     const { data: directAgents } = await adminClient
       .from('profiles')
-      .select('id, email, subscription_tier, subscription_status, subscription_end, subscription_amount, gha_id, gha_code')
+      .select('id, email, subscription_tier, subscription_status, subscription_end, subscription_amount, gha_id, gha_code, is_unlimited, unlimited_expires_at')
       .eq('sa_id', session.staff_id)
       .eq('role', 'agent');
 
@@ -3380,7 +3389,7 @@ app.get('/api/sa/overview', async (req, res) => {
     if (ghaIds.length > 0) {
       const { data: viaGha } = await adminClient
         .from('profiles')
-        .select('id, email, subscription_tier, subscription_status, subscription_end, subscription_amount, gha_id, gha_code')
+        .select('id, email, subscription_tier, subscription_status, subscription_end, subscription_amount, gha_id, gha_code, is_unlimited, unlimited_expires_at')
         .in('gha_id', ghaIds)
         .eq('role', 'agent');
       ghaAgents = viaGha || [];
@@ -3395,18 +3404,9 @@ app.get('/api/sa/overview', async (req, res) => {
 
     var now = new Date();
 
-    var activeAgents = agents.filter(function(a) {
-      return a.subscription_status === 'active' &&
-        a.subscription_end &&
-        new Date(a.subscription_end) > now;
-    });
+    var activeAgents = agents.filter(function(a) { return isAgentSubActive(a, now); });
 
-    var expiredAgents = agents.filter(function(a) {
-      return a.subscription_end &&
-        new Date(a.subscription_end) <= now &&
-        a.subscription_tier &&
-        a.subscription_tier !== 'free';
-    });
+    var expiredAgents = agents.filter(function(a) { return isAgentSubExpired(a, now); });
 
     // Total subscription revenue = sum of all agent subscription_amounts
     var totalRevenue = agents.reduce(function(sum, a) {
