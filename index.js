@@ -296,7 +296,7 @@ function getAgentPlanEnd(a) {
 }
 function isAgentSubActive(a, now) {
   var end = getAgentPlanEnd(a);
-  return a.subscription_status === 'active' && !!end && end > now;
+  return a.subscription_status === 'active' && !!a.subscription_tier && a.subscription_tier !== 'free' && !!end && end > now;
 }
 function isAgentSubExpired(a, now) {
   var end = getAgentPlanEnd(a);
@@ -3312,13 +3312,13 @@ app.get('/api/sa/earnings', async (req, res) => {
     const paidAt = isPaid ? earningsList[0]?.paid_at : null;
 
     // Active subscriptions = agents under this SA with active subscription_status
-    const { count: activeSubsCount } = await adminClient
+    const { data: saSubAgents } = await adminClient
       .from('profiles')
-      .select('id', { count: 'exact', head: true })
+      .select('id, subscription_tier, subscription_status, subscription_end, is_unlimited, unlimited_expires_at')
       .eq('sa_id', session.staff_id)
-      .eq('role', 'agent')
-      .eq('subscription_status', 'active')
-      .gt('subscription_end', new Date().toISOString());
+      .eq('role', 'agent');
+    var earningsNow = new Date();
+    const activeSubsCount = (saSubAgents || []).filter(function(a) { return isAgentSubActive(a, earningsNow); }).length;
 
     // Also get GHA breakdown for this SA
     const { data: ghaBreakdown } = await adminClient
@@ -3638,7 +3638,7 @@ app.get('/api/admin/all-sas', async (req, res) => {
       if (ghaIds.length > 0) {
         const { data: agentsUnderSa } = await serviceClient
           .from('profiles')
-          .select('id, subscription_tier, subscription_end, subscription_amount')
+          .select('id, subscription_tier, subscription_status, subscription_end, subscription_amount, is_unlimited, unlimited_expires_at')
           .in('gha_id', ghaIds)
           .eq('role', 'agent');
 
@@ -3654,12 +3654,9 @@ app.get('/api/admin/all-sas', async (req, res) => {
           totalListings = count || 0;
         }
 
-        activeSubscriptions = (agentsUnderSa || []).filter(function(a) {
-          return a.subscription_tier && a.subscription_tier !== 'free' && a.subscription_end && new Date(a.subscription_end) > new Date();
-        }).length;
-        expiredSubscriptions = (agentsUnderSa || []).filter(function(a) {
-          return a.subscription_end && new Date(a.subscription_end) < new Date();
-        }).length;
+        var listNow = new Date();
+        activeSubscriptions = (agentsUnderSa || []).filter(function(a) { return isAgentSubActive(a, listNow); }).length;
+        expiredSubscriptions = (agentsUnderSa || []).filter(function(a) { return isAgentSubExpired(a, listNow); }).length;
 
         monthlyEarnings = (agentsUnderSa || []).reduce(function(sum, p) {
           return sum + (parseFloat(p.subscription_amount) || 0) * saRate;
