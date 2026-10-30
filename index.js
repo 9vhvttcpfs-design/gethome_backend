@@ -687,12 +687,17 @@ app.post('/api/admin/approve-agent', async (req, res) => {
     const validTiers = ['basic', 'verified', 'premium'];
     const tier = validTiers.includes(verificationTier) ? verificationTier : 'basic';
     // Update status and verification level using adminClient to bypass RLS
-    const { error } = await adminClient
+    const { data: updatedRows, error } = await adminClient
       .from('profiles')
       .update({ status: 'approved', verification_level: tier })
+      .in('role', ['agent', 'agency'])
       .eq('id', agentId)
-      .eq('role', 'agent');
+      .select('id');
     if (error) throw error;
+    if (!updatedRows || updatedRows.length === 0) {
+      console.error('Approve agent matched no profile:', agentId);
+      return res.status(404).json({ error: 'Agent not found or role mismatch' });
+    }
     await linkReferredGha(agentId);
     console.log('Agent approved:', agentId);
     // Get agent email to notify them
@@ -754,8 +759,16 @@ app.post('/api/admin/disapprove-agent', async (req, res) => {
     if (profile?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { agentId } = req.body;
     if (!agentId) return res.status(400).json({ error: 'agentId required' });
-    const { error } = await adminClient.from('profiles').update({ status: 'disapproved' }).eq('id', agentId).eq('role', 'agent');
+    const { data: updatedRows, error } = await adminClient
+      .from('profiles')
+      .update({ status: 'disapproved' })
+      .in('role', ['agent', 'agency'])
+      .eq('id', agentId)
+      .select('id');
     if (error) throw error;
+    if (!updatedRows || updatedRows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found or role mismatch' });
+    }
     console.log('Agent disapproved:', agentId);
     res.json({ success: true, message: 'Agent disapproved. They can no longer upload listings.' });
   } catch (err) {
