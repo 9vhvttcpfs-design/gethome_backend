@@ -6718,7 +6718,7 @@ app.post('/api/properties', async (req, res) => {
       console.log('Agent not approved - status:', profileData.status, '| agent:', agentId);
       const statusMsg = profileData.status === 'disapproved'
         ? 'Your agent account has been suspended. Please contact admin.'
-        : 'Your agent account is pending approval. Please contact your Service Agent (SA) to approve your account before uploading listings.';
+        : 'Your account is pending approval. GetHome admin will review it shortly; you can upload listings once it is approved.';
       return res.status(403).json({ error: statusMsg, status: profileData.status });
     }
 
@@ -12697,7 +12697,7 @@ app.get('/api/customer/inspections', async (req, res) => {
       }
 
       // Priority 3: GetHome default
-      saWhatsapp = saWhatsapp || process.env.GETHOME_WHATSAPP || '2349139649368';
+      saWhatsapp = saWhatsapp || process.env.GETHOME_WHATSAPP || '2349130649368';
 
       console.log('Customer inspection SA:', insp.id, '|', saName, '| whatsapp:', saWhatsapp);
 
@@ -12855,20 +12855,30 @@ app.get('/api/properties/:id/fee-breakdown', async (req, res) => {
     if (property?.created_by) {
       const { data: agentProf } = await adminClient
         .from('profiles')
-        .select('sa_id')
+        .select('sa_id, gha_id')
         .eq('id', property.created_by)
-        .single();
+        .maybeSingle();
 
-      if (agentProf?.sa_id) {
+      var feeSaId = agentProf?.sa_id || null;
+      if (!feeSaId && agentProf?.gha_id) {
+        const { data: feeGha } = await adminClient.from('gha_agents').select('sa_id').eq('id', agentProf.gha_id).maybeSingle();
+        feeSaId = feeGha?.sa_id || null;
+      }
+      if (feeSaId) {
         const { data: saData } = await adminClient
           .from('service_agents')
-          .select('whatsapp, phone, full_name, sa_code')
-          .eq('id', agentProf.sa_id)
-          .single();
-        saWhatsapp = saData?.whatsapp || saData?.phone || null;
+          .select('whatsapp, whatsapp_number, phone, full_name, sa_code')
+          .eq('id', feeSaId)
+          .maybeSingle();
+        saWhatsapp = saData?.whatsapp_number || saData?.whatsapp || saData?.phone || null;
         saName = saData?.full_name || null;
         console.log('SA WhatsApp for property:', property.id, '| sa:', saData?.sa_code, '| whatsapp:', saWhatsapp);
       }
+    }
+    // No SA (or SA has no number): fall back to GetHome so enquiries still reach someone
+    if (!saWhatsapp) {
+      saWhatsapp = process.env.GETHOME_WHATSAPP || '2349130649368';
+      saName = saName || 'GetHome Team';
     }
 
     // Get escrow settings dynamically
