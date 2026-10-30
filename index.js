@@ -3318,7 +3318,10 @@ app.get('/api/sa/earnings', async (req, res) => {
       .eq('sa_id', session.staff_id)
       .eq('role', 'agent');
     var earningsNow = new Date();
-    const activeSubsCount = (saSubAgents || []).filter(function(a) { return isAgentSubActive(a, earningsNow); }).length;
+    var earningsMonthAgentIds = new Set(earningsList.map(function(e) { return e.agent_id; }));
+    const activeSubsCount = (saSubAgents || []).filter(function(a) {
+      return earningsMonthAgentIds.has(a.id) && isAgentSubActive(a, earningsNow);
+    }).length;
 
     // Also get GHA breakdown for this SA
     const { data: ghaBreakdown } = await adminClient
@@ -3431,8 +3434,14 @@ app.get('/api/sa/overview', async (req, res) => {
     // Get ALL earnings ever for total stats
     const { data: allEarnings } = await adminClient
       .from('sa_earnings')
-      .select('commission_amount, subscription_amount, is_paid, month_year')
+      .select('agent_id, commission_amount, subscription_amount, is_paid, month_year')
       .eq('sa_id', session.staff_id);
+
+    // Active subscriptions for this billing month only: agents with an earnings row this month who are still active.
+    var monthAgentIds = new Set((allEarnings || [])
+      .filter(function(e) { return e.month_year === billingMonth; })
+      .map(function(e) { return e.agent_id; }));
+    var activeThisMonth = activeAgents.filter(function(a) { return monthAgentIds.has(a.id); });
 
     var pendingCommission = (unpaidEarnings || []).reduce(function(sum, e) {
       return sum + parseFloat(e.commission_amount || 0);
@@ -3494,7 +3503,7 @@ app.get('/api/sa/overview', async (req, res) => {
 
     res.json({
       total_agents: agents.length,
-      active_subscriptions: activeAgents.length,
+      active_subscriptions: activeThisMonth.length,
       expired_subscriptions: expiredAgents.length,
       total_ghas: (saGhas || []).length,
       total_revenue: totalRevenue,
