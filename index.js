@@ -46,7 +46,7 @@ const allowedOrigins = [
   'ionic://localhost',
 ];
 // ── CORS - must be before all routes ───────────────────
-app.use(cors({
+const corsMiddleware = cors({
   origin: function(origin, callback) {
     // Allow requests with no origin (mobile, curl, Render health checks)
     if (!origin) return callback(null, true);
@@ -61,7 +61,15 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   exposedHeaders: ['Content-Range', 'X-Content-Range'],
   maxAge: 86400, // 24 hours preflight cache
-}));
+});
+// Same-origin requests (the /admin-tools page calling this server) skip the allowlist
+app.use(function(req, res, next) {
+  const origin = req.headers.origin;
+  if (origin && req.headers.host && /^https?:\/\/([^/]+)$/.test(origin) && origin.split('//')[1] === req.headers.host) {
+    return next();
+  }
+  return corsMiddleware(req, res, next);
+});
 // Handle OPTIONS preflight explicitly
 app.options('*', cors());
 app.use(express.json());
@@ -5894,6 +5902,193 @@ app.post('/api/sa/update-profile', verifyStaffToken, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('sa/update-profile error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /admin-tools - internal single-page tool for editing SA/GHA details.
+// Logs in via /api/auth/login (admin role required) and calls the admin endpoints.
+// All data is rendered with textContent / input.value (no innerHTML) to avoid XSS.
+const ADMIN_TOOLS_HTML = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>GetHome Admin Tools</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;padding:16px;color:#1a1a1a}
+.wrap{max-width:900px;margin:0 auto}
+.card{background:#fff;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+h1{font-size:20px}h2{font-size:16px;margin:0 0 10px}
+input{padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px;width:100%;box-sizing:border-box}
+button{padding:8px 14px;border:0;border-radius:6px;background:#0a7d4f;color:#fff;font-size:14px;cursor:pointer}
+button.sec{background:#666}
+.row{display:grid;grid-template-columns:1.2fr 1.4fr 1fr 1fr auto;gap:8px;align-items:center;padding:8px 0;border-top:1px solid #eee}
+.row .code{font-size:12px;color:#666}
+.msg{font-size:13px;margin-top:6px}.err{color:#b00020}.ok{color:#0a7d4f}
+.tabs button{margin-right:6px}.tabs button.active{background:#1a1a1a}
+@media(max-width:700px){.row{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+<h1>GetHome Admin Tools</h1>
+<div id="login" class="card">
+  <h2>Admin login</h2>
+  <p><input id="email" type="email" placeholder="Admin email" autocomplete="username"></p>
+  <p><input id="pw" type="password" placeholder="Password" autocomplete="current-password"></p>
+  <button id="loginBtn">Log in</button><div id="loginMsg" class="msg err"></div>
+</div>
+<div id="app" style="display:none">
+  <div class="card tabs">
+    <button id="tabSA" class="active">Service Agents</button>
+    <button id="tabGHA">GHAs</button>
+    <button id="logout" class="sec" style="float:right">Log out</button>
+    <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
+  </div>
+  <div class="card"><h2 id="listTitle"></h2><div id="list"></div><div id="listMsg" class="msg"></div></div>
+</div>
+<script>
+var token = null, mode = 'SA', items = [];
+function $(id){return document.getElementById(id);}
+function api(path, method, body){
+  return fetch(path,{method:method,headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:body?JSON.stringify(body):undefined})
+    .then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j;});});
+}
+$('loginBtn').onclick = function(){
+  $('loginMsg').textContent='';
+  fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('email').value.trim(),password:$('pw').value})})
+    .then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||'Login failed');return j;});})
+    .then(function(j){
+      if(!j.user||j.user.role!=='admin')throw new Error('Not an admin account');
+      token=j.token;$('pw').value='';$('login').style.display='none';$('app').style.display='block';load();
+    }).catch(function(e){$('loginMsg').textContent=e.message;});
+};
+$('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
+$('tabSA').onclick=function(){mode='SA';$('tabSA').className='active';$('tabGHA').className='';load();};
+$('tabGHA').onclick=function(){mode='GHA';$('tabGHA').className='active';$('tabSA').className='';load();};
+$('filter').oninput=render;
+function load(){
+  $('listTitle').textContent=mode==='SA'?'Service Agents':'GHAs';$('list').textContent='Loading...';
+  api(mode==='SA'?'/api/admin/all-sas':'/api/admin/all-ghas','GET').then(function(j){
+    items=Array.isArray(j)?j:(j.sas||j.ghas||j.data||[]);render();
+  }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
+}
+function mk(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+function render(){
+  var q=$('filter').value.trim().toLowerCase(),list=$('list');list.textContent='';
+  items.filter(function(it){
+    return !q||[it.full_name,it.email,it.phone,it.sa_code,it.gha_code].join(' ').toLowerCase().indexOf(q)>-1;
+  }).forEach(function(it){
+    var row=mk('div','row');
+    var name=mk('input');name.value=it.full_name||'';name.placeholder='Name';
+    var email=mk('input');email.value=it.email||'';email.placeholder='Email';
+    var phone=mk('input');phone.value=it.phone||'';phone.placeholder='Phone';
+    var pw=mk('input');pw.type='password';pw.placeholder='New password (optional)';pw.autocomplete='new-password';
+    var right=mk('div');var btn=mk('button',null,'Save');
+    var code=mk('div','code',it.sa_code||it.gha_code||'');var msg=mk('div','msg');
+    right.appendChild(btn);right.appendChild(code);right.appendChild(msg);
+    var first=mk('div');first.appendChild(name);
+    row.appendChild(first);row.appendChild(email);row.appendChild(phone);row.appendChild(pw);row.appendChild(right);
+    btn.onclick=function(){
+      var body={full_name:name.value,email:email.value,phone:phone.value};
+      if(pw.value)body.password=pw.value;
+      if(mode==='SA')body.sa_id=it.id;else body.gha_id=it.id;
+      btn.disabled=true;msg.textContent='';
+      api(mode==='SA'?'/api/admin/update-sa':'/api/admin/update-gha','POST',body).then(function(r){
+        it.full_name=r.full_name;it.email=r.email;it.phone=r.phone;pw.value='';
+        msg.className='msg ok';msg.textContent='Saved'+(body.password?' (password changed)':'');
+      }).catch(function(e){msg.className='msg err';msg.textContent=e.message;}).then(function(){btn.disabled=false;});
+    };
+    list.appendChild(row);
+  });
+  if(!list.children.length)list.textContent='No matches';
+}
+</script></div></body></html>`;
+app.get('/admin-tools', function(req, res) {
+  res.set('Cache-Control', 'no-store');
+  res.type('html').send(ADMIN_TOOLS_HTML);
+});
+
+// Shared helper: validate + apply a staff profile update (SA or GHA table).
+// Staff credentials live in service_agents / gha_agents as bcrypt password_hash
+// (see /api/staff/login), not in Supabase Auth, so password changes hash here.
+async function applyStaffUpdate(table, id, body, allowPassword, extraFilter) {
+  const updates = {};
+  if (body.full_name != null) {
+    const v = String(body.full_name).trim();
+    if (!v) return { status: 400, error: 'full_name cannot be empty' };
+    updates.full_name = v;
+  }
+  if (body.email != null) {
+    const v = String(body.email).trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return { status: 400, error: 'Invalid email' };
+    const { data: dup } = await serviceClient.from(table).select('id').ilike('email', v).neq('id', id).limit(1);
+    if (dup && dup.length) return { status: 409, error: 'Email already in use' };
+    updates.email = v;
+  }
+  if (body.phone != null) updates.phone = String(body.phone).trim();
+  if (allowPassword && body.password != null && body.password !== '') {
+    if (String(body.password).length < 6) return { status: 400, error: 'Password must be at least 6 characters' };
+    updates.password_hash = await bcrypt.hash(String(body.password), 10);
+  }
+  if (Object.keys(updates).length === 0) return { status: 400, error: 'No fields to update' };
+
+  let q = serviceClient.from(table).update(updates).eq('id', id);
+  if (extraFilter) q = q.eq(extraFilter.col, extraFilter.val);
+  const { data, error } = await q.select('*');
+  if (error) throw error;
+  if (!data || !data.length) return { status: 404, error: 'Not found' };
+  const row = Object.assign({}, data[0]);
+  delete row.password_hash;
+  delete row.gh_staff_token;
+  if (updates.password_hash) {
+    // Invalidate existing sessions so the old password's logins stop working
+    await serviceClient.from('staff_sessions').delete().eq('staff_id', id);
+  }
+  return { status: 200, row };
+}
+
+// POST /api/sa/update-gha - SA edits name/email/phone of a GHA under them
+app.post('/api/sa/update-gha', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'SA') return res.status(403).json({ error: 'SA access only' });
+    const { gha_id } = req.body;
+    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+    const r = await applyStaffUpdate('gha_agents', gha_id, req.body, false,
+      { col: 'sa_id', val: req.staffSession.staff_id });
+    if (r.error) return res.status(r.status).json({ error: r.status === 404 ? 'GHA not found under your account' : r.error });
+    res.json(r.row);
+  } catch (err) {
+    console.error('SA update-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/update-gha - admin edits any GHA (incl. password)
+app.post('/api/admin/update-gha', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { gha_id } = req.body;
+    if (!gha_id) return res.status(400).json({ error: 'gha_id is required' });
+    const r = await applyStaffUpdate('gha_agents', gha_id, req.body, true);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    res.json(r.row);
+  } catch (err) {
+    console.error('Admin update-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/update-sa - admin edits any SA (incl. password)
+app.post('/api/admin/update-sa', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { sa_id } = req.body;
+    if (!sa_id) return res.status(400).json({ error: 'sa_id is required' });
+    const r = await applyStaffUpdate('service_agents', sa_id, req.body, true);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    res.json(r.row);
+  } catch (err) {
+    console.error('Admin update-sa error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
