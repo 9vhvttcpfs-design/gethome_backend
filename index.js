@@ -6637,7 +6637,7 @@ app.post('/api/auth/login', async (req, res) => {
         }
       } else if (profile) {
         role         = profile.role         || 'customer';
-        status       = profile.status       || 'approved';
+        status       = String(profile.status || 'approved').toLowerCase().trim();
         is_unlimited = profile.is_unlimited || false;
         console.log(`Login: ${email} | role=${role} | status=${status} | unlimited=${is_unlimited}`);
       }
@@ -6688,8 +6688,15 @@ app.get('/api/auth/me', async (req, res) => {
         .eq('id', user.id)
         .single();
       if (profile?.role) role = profile.role;
+      if (profile?.status) status = String(profile.status).toLowerCase().trim();
+      is_unlimited = profile?.is_unlimited || false;
     } catch { /* profiles table not set up yet — safe default */ }
-    res.status(200).json({ user: { id: user.id, email: user.email, role } });
+    // Admins are always approved
+    if (role === 'admin') status = 'approved';
+    res.status(200).json({
+      user: { id: user.id, email: user.email, role, status, is_unlimited },
+      pendingAgent: role === 'agent' && status === 'pending',
+    });
   } catch (err) {
     console.error('/api/auth/me error:', err.message);
     res.status(500).json({ error: "Internal error fetching user profile." });
