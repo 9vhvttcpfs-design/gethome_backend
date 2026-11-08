@@ -214,37 +214,96 @@ async function notifyAgentsAboutCommission(enabled) {
     console.error('notifyAgentsAboutCommission error:', err.message);
   }
 }
-// Calculates GHA inspection payment based on dynamic tiers from app_settings,
-// falling back to the historical hardcoded tiers if no admin override exists.
-async function getInspectionFeeForCount(confirmedCount) {
+// Reads a single numeric value from app_settings (setting_value), with a default.
+async function getNumericSetting(key, fallback) {
   try {
-    const { data: tierSetting } = await adminClient
+    const { data } = await adminClient
       .from('app_settings')
-      .select('setting_json')
-      .eq('setting_key', 'inspection_fee_tiers')
-      .single();
-
-    var tiers = tierSetting?.setting_json || {
-      tier1: { min: 1, max: 10, fee: 1200 },
-      tier2: { min: 11, max: 20, fee: 1500 },
-      tier3: { min: 21, max: null, fee: 1700 },
-    };
-
-    var count = parseInt(confirmedCount) || 0;
-    if (count <= 0) return 0;
-
-    var fee = tiers.tier1.fee; // default
-    if (count >= tiers.tier3.min) fee = tiers.tier3.fee;
-    else if (count >= tiers.tier2.min) fee = tiers.tier2.fee;
-    else if (count >= tiers.tier1.min) fee = tiers.tier1.fee;
-
-    console.log('Inspection fee for count', count, ':', fee, 'per inspection');
-    return fee;
-  } catch(err) {
-    console.error('getInspectionFeeForCount error:', err.message);
-    return 1200; // safe fallback
+      .select('setting_value')
+      .eq('setting_key', key)
+      .maybeSingle();
+    var n = parseFloat(data?.setting_value);
+    return isNaN(n) ? fallback : n;
+  } catch (err) {
+    console.error('getNumericSetting error (' + key + '):', err.message);
+    return fallback;
   }
 }
+
+// Flat fee a customer pays (and the GHA earns) when a GHA accompanies an
+// inspection. Set by admin as 'gha_accompany_fee'. 0 when not configured.
+async function getGhaAccompanyFee() {
+  return getNumericSetting('gha_accompany_fee', 0);
+}
+
+// Kept for existing callers: the per-inspection fee is now one flat amount, so
+// the count only decides whether anything is owed at all.
+async function getInspectionFeeForCount(confirmedCount) {
+  var count = parseInt(confirmedCount) || 0;
+  if (count <= 0) return 0;
+  return getGhaAccompanyFee();
+}
+
+// GHA salary settings: full monthly salary, monthly target (subscribing agents)
+// and pay-per-agent (PPA) used when the target is missed.
+async function getGhaSalarySettings() {
+  const [salary, target, ppa] = await Promise.all([
+    getNumericSetting('gha_salary', 0),
+    getNumericSetting('gha_monthly_target', 25),
+    getNumericSetting('gha_ppa', 0),
+  ]);
+  return { salary: salary, target: target, ppa: ppa };
+}
+
+// Pure calculation: full salary when the target is met, otherwise
+// subscribing_agents x PPA. A GHA with 0 subscribing agents earns 0 salary.
+function calcGhaSalary(subscribingCount, s) {
+  var count = parseInt(subscribingCount) || 0;
+  if (count <= 0) return { earned: 0, target_met: false };
+  var targetMet = count >= (s.target || 0);
+  return { earned: targetMet ? s.salary : count * s.ppa, target_met: targetMet };
+}
+
+// Distinct agents who subscribed (have an earnings row) under this GHA in the month.
+async function countGhaSubscribingAgents(ghaId, month) {
+  const { data } = await adminClient
+    .from('gha_earnings')
+    .select('agent_id, agent_email')
+    .eq('gha_id', ghaId)
+    .eq('month_year', month);
+  var set = new Set();
+  (data || []).forEach(function(r) {
+    var key = r.agent_id || (r.agent_email ? String(r.agent_email).toLowerCase() : null);
+    if (key) set.add(key);
+  });
+  return set.size;
+}
+
+// Full salary picture for one GHA/month, net of any salary already paid.
+async function getGhaSalaryDue(ghaId, month, settings) {
+  var s = settings || await getGhaSalarySettings();
+  var subscribing = await countGhaSubscribingAgents(ghaId, month);
+  var calc = calcGhaSalary(subscribing, s);
+  const { data: rec } = await adminClient
+    .from('staff_payments')
+    .select('salary_amount')
+    .eq('staff_id', ghaId)
+    .eq('staff_type', 'GHA')
+    .eq('month_year', month)
+    .maybeSingle();
+  var alreadyPaid = parseFloat(rec?.salary_amount || 0);
+  return {
+    subscribing_agents: subscribing,
+    monthly_target: s.target,
+    full_salary: s.salary,
+    ppa: s.ppa,
+    target_met: calc.target_met,
+    salary_earned: calc.earned,
+    salary_paid: alreadyPaid,
+    salary_due: Math.max(0, calc.earned - alreadyPaid),
+  };
+}
+
 // Gets the current commission rate for a staff member: checks their individual
 // override first - commission_rate_override if explicitly set, else the plain
 // commission_rate column (gha_agents/service_agents) - then falls back to the
@@ -3036,49 +3095,322 @@ app.get('/api/gha/my-listings', verifyStaffToken, async (req, res) => {
       });
     });
 
-    res.json(enriched);
+    res.json(await attachVerificationStatus(enriched));
   } catch (err) {
     console.error('GHA my-listings error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/gha/verify-listing
-app.post('/api/gha/verify-listing', verifyStaffToken, async (req, res) => {
+// ============ LISTING VERIFICATION (media proof -> admin confirmation -> immediate payout) ============
+// GHAs and SAs submit photos/videos as proof of an on-site listing verification.
+// Admin reviews; on confirmation the listing is marked verified and the staff
+// member earns the admin-set verification fee, which admin pays right away
+// (unlike commission/salary, which are settled monthly).
+const verificationUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024, files: 8 },
+  fileFilter: function(req, file, cb) {
+    if (file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/')) cb(null, true);
+    else cb(new Error('Only photo or video files are allowed'));
+  },
+});
+
+// Verification fee earned per confirmed verification (admin-configurable).
+async function getVerificationFee(role) {
+  return getNumericSetting(role === 'SA' ? 'verification_fee_sa' : 'verification_fee_gha', 0);
+}
+
+// Can this GHA/SA verify this property? GHA: the listing agent is under them.
+// SA: the listing agent is assigned to the SA, or sits under one of the SA's GHAs.
+async function staffCanVerifyProperty(session, propertyId) {
+  const { data: prop } = await adminClient
+    .from('properties').select('id, title, created_by, gha_verified').eq('id', propertyId).maybeSingle();
+  if (!prop) return { ok: false, status: 404, error: 'Property not found' };
+  const { data: agent } = await adminClient
+    .from('profiles').select('id, sa_id, gha_id').eq('id', prop.created_by).maybeSingle();
+  if (!agent) return { ok: false, status: 403, error: 'Listing agent not found' };
+  if (session.staff_role === 'GHA') {
+    if (agent.gha_id !== session.staff_id) return { ok: false, status: 403, error: 'Property does not belong to an agent under your GHA' };
+  } else if (session.staff_role === 'SA') {
+    var allowed = agent.sa_id === session.staff_id;
+    if (!allowed && agent.gha_id) {
+      const { data: g } = await adminClient.from('gha_agents').select('sa_id').eq('id', agent.gha_id).maybeSingle();
+      allowed = g?.sa_id === session.staff_id;
+    }
+    if (!allowed) return { ok: false, status: 403, error: 'Property does not belong to an agent under your SA' };
+  } else {
+    return { ok: false, status: 403, error: 'GHA or SA access only' };
+  }
+  return { ok: true, prop: prop };
+}
+
+// Adds verification_status ('pending' | 'confirmed' | 'rejected' | null) to listing rows.
+async function attachVerificationStatus(listings) {
+  var ids = (listings || []).map(function(l) { return l.id; });
+  if (ids.length === 0) return listings;
+  const { data } = await adminClient
+    .from('listing_verifications')
+    .select('property_id, status, created_at')
+    .in('property_id', ids)
+    .order('created_at', { ascending: false });
+  var latest = {};
+  (data || []).forEach(function(v) { if (!latest[v.property_id]) latest[v.property_id] = v.status; });
+  return (listings || []).map(function(l) {
+    return Object.assign({}, l, { verification_status: latest[l.id] || null });
+  });
+}
+
+// POST /api/staff/submit-verification - GHA or SA uploads proof (multipart: property_id, notes, media[])
+app.post('/api/staff/submit-verification', verifyStaffToken, function(req, res, next) {
+  verificationUpload.array('media', 8)(req, res, function(err) {
+    if (err) return res.status(400).json({ error: err.message });
+    next();
+  });
+}, async (req, res) => {
   try {
-    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
-    const ghaId = req.staffSession.staff_id;
-
-    const { property_id } = req.body;
-    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
-
-    const { data: agentRows } = await serviceClient
-      .from('profiles')
-      .select('id')
-      .eq('gha_id', ghaId)
-      .eq('role', 'agent');
-    const agentIds = (agentRows || []).map(function(a) { return a.id; });
-
-    const { data: prop } = await serviceClient
-      .from('properties')
-      .select('id, created_by')
-      .eq('id', property_id)
-      .single();
-    if (!prop || !agentIds.includes(prop.created_by)) {
-      return res.status(403).json({ error: 'Property does not belong to an agent under your GHA' });
+    const session = req.staffSession;
+    const propertyId = req.body.property_id;
+    if (!propertyId) return res.status(400).json({ error: 'property_id is required' });
+    if (!req.files || req.files.length < 4) {
+      return res.status(400).json({ error: 'Upload at least 4 photos or videos as proof of verification' });
     }
 
-    const { error } = await serviceClient
-      .from('properties')
-      .update({ gha_verified: true, gha_verified_at: new Date().toISOString() })
-      .eq('id', property_id);
+    const check = await staffCanVerifyProperty(session, propertyId);
+    if (!check.ok) return res.status(check.status).json({ error: check.error });
+    if (check.prop.gha_verified) return res.status(400).json({ error: 'This listing is already verified' });
+
+    const { data: open } = await adminClient
+      .from('listing_verifications').select('id').eq('property_id', propertyId).eq('status', 'pending').limit(1).maybeSingle();
+    if (open) return res.status(400).json({ error: 'A verification for this listing is already awaiting admin review' });
+
+    var mediaUrls = [];
+    for (var i = 0; i < req.files.length; i++) {
+      var file = req.files[i];
+      var fileName = 'verifications/' + propertyId + '/' + Date.now() + '_' + i + '_' + file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+      const { data: up, error: upErr } = await serviceClient.storage
+        .from(BUCKET_NAME).upload(fileName, file.buffer, { contentType: file.mimetype, cacheControl: '3600', upsert: false });
+      if (upErr) return res.status(500).json({ error: 'Upload failed: ' + upErr.message });
+      mediaUrls.push(serviceClient.storage.from(BUCKET_NAME).getPublicUrl(up.path).data.publicUrl);
+    }
+
+    const { data: row, error } = await adminClient.from('listing_verifications').insert([{
+      property_id: parseInt(propertyId) || propertyId,
+      staff_id: session.staff_id,
+      staff_type: session.staff_role,
+      staff_code: session.staff_code || null,
+      media_urls: mediaUrls,
+      notes: (req.body.notes || '').toString().slice(0, 1000) || null,
+      status: 'pending',
+      payment_status: 'unpaid',
+    }]).select().single();
     if (error) throw error;
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: 'ADMIN',
+      recipient_id: '00000000-0000-0000-0000-000000000000',
+      type: 'verification_submitted',
+      title: 'Listing Verification Submitted',
+      message: (session.staff_code || session.staff_role) + ' submitted ' + mediaUrls.length + ' file(s) to verify "' + (check.prop.title || 'a listing') + '". Review it in the Verifications tab.',
+      is_read: false,
+    }]).then(function(r) { if (r.error) console.error('Verification admin notification failed:', r.error.message); });
+
+    console.log('Verification submitted:', row.id, '| property:', propertyId, '| by:', session.staff_role, session.staff_code);
+    res.json({ success: true, verification: row });
+  } catch (err) {
+    console.error('Submit verification error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/staff/my-verifications - GHA/SA's own submissions and earnings
+app.get('/api/staff/my-verifications', verifyStaffToken, async (req, res) => {
+  try {
+    const session = req.staffSession;
+    const { data, error } = await adminClient
+      .from('listing_verifications')
+      .select('id, property_id, status, fee_amount, payment_status, paid_at, rejection_reason, created_at, reviewed_at, properties(title, location)')
+      .eq('staff_id', session.staff_id)
+      .eq('staff_type', session.staff_role)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    var rows = data || [];
+    var sum = function(filter) {
+      return rows.filter(filter).reduce(function(t, r) { return t + parseFloat(r.fee_amount || 0); }, 0);
+    };
+    res.json({
+      verifications: rows,
+      confirmed_count: rows.filter(function(r) { return r.status === 'confirmed'; }).length,
+      total_earned: sum(function(r) { return r.status === 'confirmed'; }),
+      total_paid: sum(function(r) { return r.status === 'confirmed' && r.payment_status === 'paid'; }),
+      total_unpaid: sum(function(r) { return r.status === 'confirmed' && r.payment_status !== 'paid'; }),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/listing-verifications?status=pending|confirmed|rejected|all
+app.get('/api/admin/listing-verifications', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    var status = req.query.status || 'pending';
+    var q = adminClient
+      .from('listing_verifications')
+      .select('*, properties(title, location, created_by)')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (status !== 'all') q = q.eq('status', status);
+    const { data, error } = await q;
+    if (error) throw error;
+
+    // Attach staff names
+    var rows = data || [];
+    const [ghas, sas] = await Promise.all([
+      adminClient.from('gha_agents').select('id, full_name, gha_code, bank_name, account_number, account_name'),
+      adminClient.from('service_agents').select('id, full_name, sa_code, bank_name, account_number, account_name'),
+    ]);
+    var staffMap = {};
+    (ghas.data || []).forEach(function(g) { staffMap['GHA:' + g.id] = { name: g.full_name, code: g.gha_code, bank_name: g.bank_name, account_number: g.account_number, account_name: g.account_name }; });
+    (sas.data || []).forEach(function(s) { staffMap['SA:' + s.id] = { name: s.full_name, code: s.sa_code, bank_name: s.bank_name, account_number: s.account_number, account_name: s.account_name }; });
+    rows = rows.map(function(r) {
+      var st = staffMap[r.staff_type + ':' + r.staff_id] || {};
+      return Object.assign({}, r, {
+        staff_name: st.name || null, staff_code: st.code || r.staff_code || null,
+        bank_name: st.bank_name || null, account_number: st.account_number || null, account_name: st.account_name || null,
+      });
+    });
+    res.json({
+      verifications: rows,
+      fees: { gha: await getVerificationFee('GHA'), sa: await getVerificationFee('SA') },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/confirm-verification { id } - marks listing verified and credits the staff member
+app.post('/api/admin/confirm-verification', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'id is required' });
+
+    const { data: v } = await adminClient.from('listing_verifications').select('*').eq('id', id).maybeSingle();
+    if (!v) return res.status(404).json({ error: 'Verification not found' });
+    if (v.status !== 'pending') return res.status(400).json({ error: 'This verification was already ' + v.status });
+
+    var fee = await getVerificationFee(v.staff_type);
+    var now = new Date().toISOString();
+
+    const { error: updErr } = await adminClient.from('listing_verifications').update({
+      status: 'confirmed', fee_amount: fee, reviewed_at: now, reviewed_by: admin.id,
+    }).eq('id', id).eq('status', 'pending');
+    if (updErr) throw updErr;
+
+    await adminClient.from('properties').update({
+      gha_verified: true, gha_verified_at: now, gha_verified_by: v.staff_id,
+    }).eq('id', v.property_id);
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: v.staff_type,
+      recipient_id: v.staff_id,
+      type: 'verification_confirmed',
+      title: 'Verification Confirmed',
+      message: 'Your listing verification was confirmed' + (fee > 0 ? ' - you earned NGN ' + fee.toLocaleString() + ', payable shortly.' : '.'),
+      is_read: false,
+    }]).then(function(r) { if (r.error) console.error('Verification staff notification failed:', r.error.message); });
+
+    console.log('Verification confirmed:', id, '| fee:', fee, '| staff:', v.staff_type, v.staff_id);
+    res.json({ success: true, fee_amount: fee });
+  } catch (err) {
+    console.error('Confirm verification error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/reject-verification { id, reason }
+app.post('/api/admin/reject-verification', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { id, reason } = req.body;
+    if (!id) return res.status(400).json({ error: 'id is required' });
+    const { data: v } = await adminClient.from('listing_verifications').select('*').eq('id', id).maybeSingle();
+    if (!v) return res.status(404).json({ error: 'Verification not found' });
+    if (v.status !== 'pending') return res.status(400).json({ error: 'This verification was already ' + v.status });
+
+    await adminClient.from('listing_verifications').update({
+      status: 'rejected', rejection_reason: reason || null, reviewed_at: new Date().toISOString(), reviewed_by: admin.id,
+    }).eq('id', id).eq('status', 'pending');
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: v.staff_type, recipient_id: v.staff_id, type: 'verification_rejected',
+      title: 'Verification Rejected',
+      message: 'Your listing verification was rejected' + (reason ? ': ' + reason : '.') + ' You can submit new proof.',
+      is_read: false,
+    }]).then(function(r) { if (r.error) console.error('Verification reject notification failed:', r.error.message); });
 
     res.json({ success: true });
   } catch (err) {
-    console.error('GHA verify-listing error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// POST /api/admin/pay-verification { id } - record immediate payout for a confirmed verification
+app.post('/api/admin/pay-verification', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'id is required' });
+    const { data: v } = await adminClient.from('listing_verifications').select('*').eq('id', id).maybeSingle();
+    if (!v) return res.status(404).json({ error: 'Verification not found' });
+    if (v.status !== 'confirmed') return res.status(400).json({ error: 'Only confirmed verifications can be paid' });
+    if (v.payment_status === 'paid') return res.status(400).json({ error: 'Already paid' });
+    if (!(parseFloat(v.fee_amount) > 0)) return res.status(400).json({ error: 'No verification fee was set when this was confirmed' });
+
+    var now = new Date().toISOString();
+    const { error } = await adminClient.from('listing_verifications').update({
+      payment_status: 'paid', paid_at: now, paid_by: admin.id,
+    }).eq('id', id).neq('payment_status', 'paid');
+    if (error) throw error;
+
+    await adminClient.from('notifications').insert([{
+      recipient_type: v.staff_type, recipient_id: v.staff_id, type: 'payment_received',
+      title: 'Verification Payment Received',
+      message: 'You have been paid NGN ' + parseFloat(v.fee_amount).toLocaleString() + ' for verifying a listing.',
+      is_read: false,
+    }]).then(function(r) { if (r.error) console.error('Verification pay notification failed:', r.error.message); });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/mark-verified { property_id } - admin marks a listing verified directly (no staff earning)
+app.post('/api/admin/mark-verified', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const { property_id } = req.body;
+    if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+    const { error } = await adminClient.from('properties').update({
+      gha_verified: true, gha_verified_at: new Date().toISOString(),
+    }).eq('id', property_id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gha/verify-listing - retired: verification now needs proof media (see /api/staff/submit-verification)
+app.post('/api/gha/verify-listing', verifyStaffToken, async (req, res) => {
+  return res.status(400).json({ error: 'Upload photos or videos as proof to verify a listing. Admin confirms it.' });
 });
 
 // GET /api/gha/inspections
@@ -6870,6 +7202,7 @@ app.post('/api/upload-images', multiImageUpload.array('images', 10), async (req,
 });
 app.post('/api/properties', async (req, res) => {
   const { title, location, price, image_url, image_urls, video_url, description, bedrooms, bathrooms, purpose, rent, agency_fee, agreement_fee, caution_fee, service_charge, is_featured, cost_per_night, created_by } = req.body;
+  var agentInspectionFeeIn = Math.max(0, parseFloat(req.body.inspection_fee) || 0);
   if (!title || !location || !price) return res.status(400).json({ error: "title, location, and price are required." });
   try {
     // Strictly resolve agent identity from token only - never trust client-supplied IDs for auth
@@ -7027,6 +7360,9 @@ app.post('/api/properties', async (req, res) => {
       is_featured:    is_featured === true || is_featured === 'true' || false,
       purpose:        purpose                    || 'rent',
       cost_per_night: parseFloat(cost_per_night) || 0,
+      inspection_fee: agentInspectionFeeIn,
+      inspection_fee_set_by: agentInspectionFeeIn > 0 ? agentId : null,
+      inspection_fee_set_at: agentInspectionFeeIn > 0 ? new Date().toISOString() : null,
       created_by:     agentId,
     }]).select();
     if (error) {
@@ -7139,6 +7475,9 @@ app.put('/api/properties/:id', async (req, res) => {
         caution_fee:    parseFloat(caution_fee)    || 0,
         service_charge: parseFloat(service_charge) || 0,
         cost_per_night: parseFloat(cost_per_night) || 0,
+        ...(req.body.inspection_fee !== undefined && req.body.inspection_fee !== null
+          ? { inspection_fee: Math.max(0, parseFloat(req.body.inspection_fee) || 0), inspection_fee_set_at: new Date().toISOString() }
+          : {}),
       })
       .eq('id', id)
       .select();
@@ -8617,6 +8956,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               fee_payment_reference: txRef,
               assigned_by_sa: inspSaId || null,
               customer_id: inspCustomerId || null,
+              gha_accompanied: verifiedMeta?.gha_accompanied === true || verifiedMeta?.gha_accompanied === 'true',
+              gha_fee_amount: parseFloat(verifiedMeta?.gha_fee_amount || 0),
             }).eq('id', existingWebhookInsp.id).select().single();
             if (updatedInsp2Err) console.error('Existing inspection (by customer+property) update failed:', updatedInsp2Err.message);
             newInspection = updatedInsp2;
@@ -8636,6 +8977,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               fee_payment_reference: txRef,
               assigned_by_sa: inspSaId || null,
               customer_id: inspCustomerId || null,
+              gha_accompanied: verifiedMeta?.gha_accompanied === true || verifiedMeta?.gha_accompanied === 'true',
+              gha_fee_amount: parseFloat(verifiedMeta?.gha_fee_amount || 0),
             }]).select().single();
             if (insertedInspErr) console.error('Inspection record creation failed:', insertedInspErr.message);
             newInspection = insertedInsp;
@@ -8906,7 +9249,8 @@ app.get('/api/admin/monthly-history', async (req, res) => {
           .from('inspections')
           .select('id, sa_confirmed_at, created_at')
           .eq('gha_id', gha.id)
-          .eq('status', 'confirmed'),
+          .eq('status', 'confirmed')
+          .eq('gha_accompanied', true),
         adminClient
           .from('staff_payments')
           .select('payment_status, paid_at, inspection_status, inspection_paid_at, inspection_count')
@@ -9486,10 +9830,31 @@ app.get('/api/admin/staff-kpis', async (req, res) => {
       .from('gha_agents')
       .select('id, gha_code, full_name, status');
 
+    // Subscribing agents this month (distinct agents with an earnings row) per staff member
+    const [ghaSubRows, saSubRows, ghaTargetVal, saTargetVal] = await Promise.all([
+      adminClient.from('gha_earnings').select('gha_id, agent_id, agent_email').eq('month_year', month),
+      adminClient.from('sa_earnings').select('sa_id, agent_id').eq('month_year', month),
+      getNumericSetting('gha_monthly_target', 25),
+      getNumericSetting('sa_monthly_target', 0),
+    ]);
+    function countSubs(rows, idField) {
+      var map = {};
+      (rows || []).forEach(function(r) {
+        var key = r.agent_id || (r.agent_email ? String(r.agent_email).toLowerCase() : null);
+        if (!r[idField] || !key) return;
+        (map[r[idField]] = map[r[idField]] || new Set()).add(key);
+      });
+      return map;
+    }
+    var ghaSubMap = countSubs(ghaSubRows.data, 'gha_id');
+    var saSubMap = countSubs(saSubRows.data, 'sa_id');
+
     // Merge staff lists with their KPI data
     const saList = (sas || []).map(function(sa) {
       var kpi = (kpis || []).find(function(k) { return k.staff_id === sa.id; }) || {};
       return Object.assign({}, sa, {
+        subscribing_agents: saSubMap[sa.id] ? saSubMap[sa.id].size : 0,
+        monthly_target: saTargetVal,
         staff_type: 'SA',
         staff_code: sa.sa_code,
         staff_name: sa.full_name,
@@ -9508,6 +9873,8 @@ app.get('/api/admin/staff-kpis', async (req, res) => {
     const ghaList = (ghas || []).map(function(gha) {
       var kpi = (kpis || []).find(function(k) { return k.staff_id === gha.id; }) || {};
       return Object.assign({}, gha, {
+        subscribing_agents: ghaSubMap[gha.id] ? ghaSubMap[gha.id].size : 0,
+        monthly_target: ghaTargetVal,
         staff_type: 'GHA',
         staff_code: gha.gha_code,
         staff_name: gha.full_name,
@@ -10006,6 +10373,7 @@ app.get('/api/admin/gha-inspection-payments', async (req, res) => {
         .select('id, status, gha_done_at, sa_confirmed_at, customer_name, customer_email, customer_phone, property_address, property_id, inspection_type')
         .eq('gha_id', gha.id)
         .eq('status', 'confirmed')  // CONFIRMED only - not done
+        .eq('gha_accompanied', true)  // only GHA-accompanied inspections earn the GHA fee
         .gte('sa_confirmed_at', monthStart)
         .lt('sa_confirmed_at', monthEnd);
 
@@ -10112,6 +10480,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       .from('gha_agents')
       .select('id, gha_code, full_name, location, bank_name, account_number, account_name, bank_code, commission_rate, commission_rate_override, sa_id');
 
+    var ghaSalarySettings = await getGhaSalarySettings();
     var ghaPayments = await Promise.all((ghas || []).map(async function(gha) {
       const { data: unpaidComm } = await adminClient
         .from('gha_earnings')
@@ -10125,6 +10494,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         .select('id, created_at, sa_confirmed_at, property_address, customer_name')
         .eq('gha_id', gha.id)
         .eq('status', 'confirmed')
+        .eq('gha_accompanied', true)
         .gte('created_at', month + '-01')
         .lte('created_at', month + '-31');
 
@@ -10159,6 +10529,7 @@ app.get('/api/admin/staff-payments', async (req, res) => {
       var inspFee = await getInspectionFeeForCount(inspCount);
       var inspPayment = inspCount * inspFee;
       var totalCommission = (unpaidComm || []).reduce(function(sum, e) { return sum + parseFloat(e.commission_amount || 0); }, 0);
+      var salaryInfo = await getGhaSalaryDue(gha.id, month, ghaSalarySettings);
 
       console.log('GHA', gha.gha_code, '| total confirmed:', (confirmedInsp || []).length, '| already paid:', paidInspections.length, '| unpaid:', inspCount, '| unpaid commission:', totalCommission, '| insp payment:', inspPayment);
 
@@ -10179,13 +10550,21 @@ app.get('/api/admin/staff-payments', async (req, res) => {
         already_paid_inspections: paidInspections.length,
         fee_per_inspection: inspFee,
         inspection_payment: inspPayment,
+        subscribing_agents: salaryInfo.subscribing_agents,
+        monthly_target: salaryInfo.monthly_target,
+        target_met: salaryInfo.target_met,
+        full_salary: salaryInfo.full_salary,
+        ppa: salaryInfo.ppa,
+        salary_earned: salaryInfo.salary_earned,
+        salary_paid: salaryInfo.salary_paid,
+        salary_due: salaryInfo.salary_due,
         // Only "fully paid" for inspections once an inspection payment exists AND
         // nothing new has been confirmed since it.
         inspection_paid: (inspPayRecord?.inspection_status === 'paid' || inspPayRecord?.payment_status === 'paid') && inspCount === 0,
         // Scoped to THIS GHA only: no outstanding commission and no outstanding
         // inspection payment for the month.
-        is_fully_paid: (totalCommission + inspPayment) <= 0,
-        total_due: totalCommission + inspPayment,
+        is_fully_paid: (totalCommission + inspPayment + salaryInfo.salary_due) <= 0,
+        total_due: totalCommission + inspPayment + salaryInfo.salary_due,
       };
     }));
 
@@ -10227,6 +10606,19 @@ app.get('/api/admin/staff-payments', async (req, res) => {
   }
 });
 
+// GET /api/gha/salary-progress - GHA's monthly target, subscribing-agent count and salary on track
+app.get('/api/gha/salary-progress', verifyStaffToken, async (req, res) => {
+  try {
+    if (req.staffSession.staff_role !== 'GHA') return res.status(403).json({ error: 'GHA access only' });
+    var month = req.query.month || getBillingMonth();
+    var info = await getGhaSalaryDue(req.staffSession.staff_id, month);
+    res.json(Object.assign({ month: month }, info));
+  } catch (err) {
+    console.error('GHA salary progress error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/admin/inspection-payments - inspection fee breakdown per GHA for a month
 app.get('/api/admin/inspection-payments', async (req, res) => {
   try {
@@ -10256,7 +10648,8 @@ app.get('/api/admin/inspection-payments', async (req, res) => {
         .from('inspections')
         .select('id, created_at, sa_confirmed_at, property_address, customer_name, status, inspection_type')
         .eq('gha_id', gha.id)
-        .eq('status', 'confirmed');
+        .eq('status', 'confirmed')
+        .eq('gha_accompanied', true);
 
       console.log('GHA', gha.gha_code, '| confirmed inspections (all types):', (allConfirmed || []).length);
 
@@ -10405,6 +10798,10 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
 
     // Accept `month` as an alias for `month_year` for callers using either name.
     const { staff_id, staff_type, payment_notes } = req.body;
+    // GHA salary is paid explicitly: pay_salary adds it to this payment,
+    // salary_only pays just the salary and leaves commission untouched.
+    const salaryOnly = staff_type === 'GHA' && (req.body.salary_only === true || req.body.salary_only === 'true');
+    const paySalary = salaryOnly || (staff_type === 'GHA' && (req.body.pay_salary === true || req.body.pay_salary === 'true'));
     const month_year = req.body.month_year || req.body.month;
     if (!staff_id || !staff_type || !month_year) {
       return res.status(400).json({ error: 'staff_id, staff_type and month_year are required' });
@@ -10435,7 +10832,7 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
     // Mark ALL earnings for this staff member this month as paid first, so the
     // per-agent earnings rows stay in sync with the staff_payments record and
     // we know the commission total before writing it.
-    if (staff_type === 'GHA') {
+    if (staff_type === 'GHA' && !salaryOnly) {
       // Mark ALL unpaid rows for this GHA this month as paid
       const { data: markedRows, error: ghaPayErr } = await adminClient
         .from('gha_earnings')
@@ -10479,23 +10876,48 @@ app.post('/api/admin/mark-staff-paid', async (req, res) => {
       console.log('SA marked paid:', staff_id, '| month:', month_year, '| rows:', (markedRows || []).length, '| total:', totalPaid);
     }
 
+    // GHA salary: pay whatever salary is currently owed for the month (full
+    // salary if the target was met, otherwise subscribing agents x PPA), net of
+    // anything already paid. Recorded cumulatively in salary_amount.
+    var salaryFields = {};
+    var salaryPaidNow = 0;
+    if (paySalary) {
+      var salaryInfo = await getGhaSalaryDue(staff_id, month_year);
+      salaryPaidNow = salaryInfo.salary_due;
+      if (salaryPaidNow > 0) {
+        salaryFields = {
+          salary_amount: salaryInfo.salary_paid + salaryPaidNow,
+          salary_status: 'paid',
+          salary_paid_at: now,
+          salary_paid_by: admin.id,
+        };
+      }
+      console.log('GHA salary paid:', staff_id, '| month:', month_year, '| agents:', salaryInfo.subscribing_agents, '| target met:', salaryInfo.target_met, '| paid now:', salaryPaidNow);
+    }
+    totalPaid += salaryPaidNow;
+
     // Record the commission payment on the shared staff_payments row. Write the
     // commission_* fields only - do NOT touch inspection_* here, those are owned
     // by /api/admin/mark-inspection-payment-paid. payment_status/paid_at are the
     // legacy shared columns kept in sync for older callers.
-    const { error: updateErr } = await adminClient.from('staff_payments').upsert([{
-      staff_id: staff_id,
-      staff_type: staff_type,
-      month_year: month_year,
-      commission_amount: totalPaid,
+    var commissionFields = salaryOnly ? {} : {
+      commission_amount: totalPaid - salaryPaidNow,
       commission_status: 'paid',
       commission_paid_at: now,
       commission_paid_by: admin.id,
       payment_status: 'paid',
       paid_at: now,
       paid_by: admin.id,
+    };
+    if (salaryOnly && salaryPaidNow <= 0) {
+      return res.status(400).json({ error: 'No salary due for this GHA for ' + month_year });
+    }
+    const { error: updateErr } = await adminClient.from('staff_payments').upsert([Object.assign({
+      staff_id: staff_id,
+      staff_type: staff_type,
+      month_year: month_year,
       updated_at: now,
-    }], { onConflict: 'staff_id,staff_type,month_year' });
+    }, commissionFields, salaryFields)], { onConflict: 'staff_id,staff_type,month_year' });
 
     if (updateErr) return res.status(500).json({ error: updateErr.message });
 
@@ -11071,7 +11493,7 @@ app.get('/api/sa/my-listings', async (req, res) => {
       });
 
       console.log('Enrichment done - final count:', enriched.length);
-      res.json(enriched);
+      res.json(await attachVerificationStatus(enriched));
     } catch (innerErr) {
       console.error('SA listings INNER ERROR:', innerErr.message, innerErr.stack);
       res.status(500).json({ error: innerErr.message });
@@ -11158,6 +11580,8 @@ app.get('/api/admin/sent-messages', async (req, res) => {
 
 // POST /api/sa/set-inspection-fee
 app.post('/api/sa/set-inspection-fee', async (req, res) => {
+  // Retired: the inspection fee is now set by the listing agent at upload time.
+  return res.status(410).json({ error: 'Inspection fees are now set by the listing agent. This endpoint has been retired.' });
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     const { data: session } = await adminClient.from('staff_sessions')
@@ -11275,6 +11699,8 @@ app.get('/api/admin/inspection-fees', async (req, res) => {
 
 // POST /api/admin/set-inspection-fee - admin sets or adjusts inspection fee
 app.post('/api/admin/set-inspection-fee', async (req, res) => {
+  // Retired: the inspection fee is now set by the listing agent at upload time.
+  return res.status(410).json({ error: 'Inspection fees are now set by the listing agent. This endpoint has been retired.' });
   try {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
@@ -11847,7 +12273,12 @@ app.get('/api/settings', async (req, res) => {
       .select('setting_key, setting_value, setting_json');
 
     var result = {};
+    // Salary/PPA/targets are internal staff-pay settings: only admins get them.
+    var privateKeys = ['gha_salary', 'gha_ppa', 'gha_monthly_target', 'sa_monthly_target'];
+    var callerIsAdmin = false;
+    try { callerIsAdmin = !!(await verifyAdminToken(req)); } catch (e) { callerIsAdmin = false; }
     (settings || []).forEach(function(s) {
+      if (!callerIsAdmin && privateKeys.indexOf(s.setting_key) !== -1) return;
       result[s.setting_key] = s.setting_json || s.setting_value;
     });
 
@@ -12710,6 +13141,7 @@ app.post('/api/admin/fix-unlimited-earnings', async (req, res) => {
 app.post('/api/inspections/initialize-payment', async (req, res) => {
   try {
     const { property_id, customer_email, customer_name, customer_phone, sa_whatsapp } = req.body;
+    var ghaAccompanied = req.body.gha_accompanied === true || req.body.gha_accompanied === 'true';
     if (!property_id || !customer_email) {
       return res.status(400).json({ error: 'property_id and customer_email required' });
     }
@@ -12732,7 +13164,12 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
 
     if (!property) return res.status(404).json({ error: 'Property not found' });
 
-    var inspectionFee = parseFloat(property.inspection_fee || 0);
+    // Total = agent-set inspection fee (+ admin's flat GHA fee when the customer
+    // asks for a GHA to accompany them). Fee is computed server-side only.
+    var agentInspectionFee = parseFloat(property.inspection_fee || 0);
+    var ghaAccompanyFee = ghaAccompanied ? await getGhaAccompanyFee() : 0;
+    if (ghaAccompanied && ghaAccompanyFee <= 0) ghaAccompanied = false;
+    var inspectionFee = agentInspectionFee + ghaAccompanyFee;
     if (inspectionFee <= 0) {
       // No fee set - return flag to proceed directly to WhatsApp
       return res.json({ requires_payment: false, property });
@@ -12759,6 +13196,9 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
         customer_phone: customer_phone,
         sa_whatsapp: sa_whatsapp,
         customer_id: customerId,
+        gha_accompanied: ghaAccompanied,
+        gha_fee_amount: ghaAccompanyFee,
+        agent_inspection_fee: agentInspectionFee,
       },
     };
 
@@ -12789,6 +13229,8 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
         fee_payment_amount: inspectionFee,
         fee_payment_status: 'processing',
         fee_payment_reference: reference,
+        gha_accompanied: ghaAccompanied,
+        gha_fee_amount: ghaAccompanyFee,
         assigned_by_sa: null, // will be set when SA assigns
       };
 
@@ -12820,7 +13262,7 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
       if (existingFeeInsp) {
         // Update existing instead of creating new
         const { error: inspUpdateErr } = await adminClient.from('inspections')
-          .update({ fee_payment_status: 'processing', fee_payment_reference: reference })
+          .update({ fee_payment_status: 'processing', fee_payment_reference: reference, gha_accompanied: ghaAccompanied, gha_fee_amount: ghaAccompanyFee })
           .eq('id', existingFeeInsp.id);
 
         if (inspUpdateErr) console.error('Existing inspection fee update failed (non-blocking):', inspUpdateErr.message);
@@ -12843,6 +13285,9 @@ app.post('/api/inspections/initialize-payment', async (req, res) => {
       checkout_url: initData.data.link,
       reference,
       fee: inspectionFee,
+      agent_inspection_fee: agentInspectionFee,
+      gha_accompanied: ghaAccompanied,
+      gha_fee_amount: ghaAccompanyFee,
       property,
     });
   } catch(err) {
@@ -13121,6 +13566,7 @@ app.get('/api/properties/:id/fee-breakdown', async (req, res) => {
     var regularBase = basePrice + agencyFee + agreementFee + cautionFee + serviceCharge;
     var escrowFee = Math.min(Math.round(regularBase * escrowRate), escrowCap);
     var grandTotal = regularBase + escrowFee;
+    var ghaAccompanyFeeBd = await getGhaAccompanyFee();
 
     console.log('Fee breakdown - property:', propertyId, '| base:', basePrice, '| escrow rate:', escrowRate, '| escrow fee:', escrowFee, '| total:', grandTotal);
 
@@ -13141,6 +13587,8 @@ app.get('/api/properties/:id/fee-breakdown', async (req, res) => {
       escrow_label: 'GetHome Escrow Fee (' + (escrowRate * 100).toFixed(2) + '%)',
       regular_base: regularBase,
       grand_total: grandTotal,
+      agent_inspection_fee: parseFloat(property.inspection_fee || 0),
+      gha_accompany_fee: ghaAccompanyFeeBd,
       sa_whatsapp: saWhatsapp,
       sa_name: saName,
     });
