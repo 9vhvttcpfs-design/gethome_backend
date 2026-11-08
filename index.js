@@ -997,6 +997,43 @@ https://trygethome.online`
     res.status(500).json({ error: err.message });
   }
 });
+// POST /api/properties/:id/mark-sold - listing owner (or admin) marks their own listing sold
+app.post('/api/properties/:id/mark-sold', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    const { data: userData, error: authError } = await adminClient.auth.getUser(token);
+    const user = userData?.user;
+    if (authError || !user) return res.status(401).json({ error: 'Session expired. Please log in again.' });
+
+    const { data: property } = await adminClient.from('properties').select('*').eq('id', req.params.id).maybeSingle();
+    if (!property) return res.status(404).json({ error: 'Property not found' });
+
+    const { data: caller } = await adminClient.from('profiles').select('role').eq('id', user.id).maybeSingle();
+    if (property.created_by !== user.id && caller?.role !== 'admin') {
+      return res.status(403).json({ error: 'You can only mark your own listings as sold' });
+    }
+    if (property.is_sold) return res.status(400).json({ error: 'This listing is already marked as sold' });
+
+    var soldPrice = parseFloat(req.body.sold_price);
+    if (isNaN(soldPrice) || soldPrice <= 0) soldPrice = parseFloat(property.rent || property.price || 0);
+    var commission = Math.round((parseFloat(property.agency_fee) || 0) * 0.025);
+
+    const { data: updated, error: updateErr } = await adminClient.from('properties').update({
+      is_sold: true,
+      sold_at: new Date().toISOString(),
+      sold_price: soldPrice,
+      commission_amount: commission,
+    }).eq('id', req.params.id).select().single();
+    if (updateErr) throw updateErr;
+
+    console.log('Listing marked sold by owner:', req.params.id, '| by:', user.id, '| price:', soldPrice);
+    res.json({ success: true, property: updated, commission_amount: commission });
+  } catch (err) {
+    console.error('Agent mark-sold error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // ──────────────────────────────────────────────────────────
 // GET ALL TRANSACTIONS (admin only)
 // ──────────────────────────────────────────────────────────
@@ -3178,7 +3215,7 @@ app.post('/api/staff/submit-verification', verifyStaffToken, function(req, res, 
 
     const check = await staffCanVerifyProperty(session, propertyId);
     if (!check.ok) return res.status(check.status).json({ error: check.error });
-    if (check.prop.gha_verified) return res.status(400).json({ error: 'This listing is already verified' });
+    if (check.prop.gha_verified) return res.status(400).json({ error: 'This listing has already been verified, so it cannot be verified again' });
 
     const { data: open } = await adminClient
       .from('listing_verifications').select('id').eq('property_id', propertyId).eq('status', 'pending').limit(1).maybeSingle();
@@ -3302,6 +3339,16 @@ app.post('/api/admin/confirm-verification', async (req, res) => {
     if (!v) return res.status(404).json({ error: 'Verification not found' });
     if (v.status !== 'pending') return res.status(400).json({ error: 'This verification was already ' + v.status });
 
+    // A listing can only be verified once. If it was verified in the meantime
+    // (e.g. admin marked it directly), close this submission without a payout.
+    const { data: alreadyProp } = await adminClient.from('properties').select('gha_verified').eq('id', v.property_id).maybeSingle();
+    if (alreadyProp?.gha_verified) {
+      await adminClient.from('listing_verifications').update({
+        status: 'rejected', rejection_reason: 'Listing was already verified', reviewed_at: new Date().toISOString(), reviewed_by: admin.id,
+      }).eq('id', id).eq('status', 'pending');
+      return res.status(400).json({ error: 'This listing is already verified, so this submission was closed with no payout.' });
+    }
+
     var fee = await getVerificationFee(v.staff_type);
     var now = new Date().toISOString();
 
@@ -3398,10 +3445,16 @@ app.post('/api/admin/mark-verified', async (req, res) => {
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
     const { property_id } = req.body;
     if (!property_id) return res.status(400).json({ error: 'property_id is required' });
+    const { data: cur } = await adminClient.from('properties').select('gha_verified').eq('id', property_id).maybeSingle();
+    if (cur?.gha_verified) return res.status(400).json({ error: 'This listing is already verified' });
     const { error } = await adminClient.from('properties').update({
       gha_verified: true, gha_verified_at: new Date().toISOString(),
     }).eq('id', property_id);
     if (error) throw error;
+    // Any staff submission still pending is now moot - close it with no payout.
+    await adminClient.from('listing_verifications').update({
+      status: 'rejected', rejection_reason: 'Listing was verified by admin', reviewed_at: new Date().toISOString(), reviewed_by: admin.id,
+    }).eq('property_id', property_id).eq('status', 'pending');
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
