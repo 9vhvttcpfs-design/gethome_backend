@@ -8937,6 +8937,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
 
         // NOW send WhatsApp message to SA since payment confirmed
         var saWhatsapp = inspSaWhatsapp || process.env.GETHOME_WHATSAPP;
+        var inspGhaWanted = verifiedMeta?.gha_accompanied === true || verifiedMeta?.gha_accompanied === 'true';
+        var inspGhaFeePaid = parseFloat(verifiedMeta?.gha_fee_amount || 0);
         var propPrice = parseFloat(inspProp.rent || inspProp.price || 0);
         var waMsg = encodeURIComponent(
           'New Inspection Request — GetHome 🏠\n\n' +
@@ -8948,8 +8950,9 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
           'Email: ' + inspCustomerEmail + '\n' +
           'Phone: ' + inspCustomerPhone + '\n\n' +
           'Inspection Fee Paid: ₦' + inspFeeAmount.toLocaleString() + '\n' +
+          (inspGhaWanted ? 'GHA Accompaniment: YES - customer paid ₦' + inspGhaFeePaid.toLocaleString() + ' for a GHA to accompany them\n' : '') +
           'Reference: ' + txRef + '\n\n' +
-          'Please assign a GHA to conduct this inspection.'
+          'Please assign a GHA to conduct this inspection.' + (inspGhaWanted ? ' The customer requested GHA accompaniment, so book this inspection with a GHA.' : '')
         );
 
         var waLink = 'https://wa.me/' + formatWaNumber(saWhatsapp) + '?text=' + waMsg;
@@ -9056,8 +9059,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
             recipient_type: 'SA',
             recipient_id: inspSaId,
             type: 'inspection_fee_paid',
-            title: 'New Inspection Request — Fee Paid',
-            message: (inspCustomerName || inspCustomerEmail) + ' paid ₦' + inspFeeAmount.toLocaleString() + ' inspection fee for ' + (inspProp.title || 'property') + '. Assign a GHA to conduct this inspection.',
+            title: inspGhaWanted ? 'New Inspection Request — GHA Accompaniment Requested' : 'New Inspection Request — Fee Paid',
+            message: (inspCustomerName || inspCustomerEmail) + ' paid ₦' + inspFeeAmount.toLocaleString() + ' inspection fee for ' + (inspProp.title || 'property') + '.' + (inspGhaWanted ? ' The customer also selected GHA accompaniment (₦' + inspGhaFeePaid.toLocaleString() + ' of the total) — book this inspection with a GHA.' : ' Assign a GHA to conduct this inspection.'),
             is_read: false,
             meta: JSON.stringify({
               whatsapp_link: waLink,
@@ -9065,6 +9068,8 @@ app.post('/api/flutterwave/webhook', async (req, res) => {
               customer_email: inspCustomerEmail,
               customer_name: inspCustomerName,
               customer_phone: inspCustomerPhone,
+              gha_accompanied: inspGhaWanted,
+              gha_fee_amount: inspGhaFeePaid,
             }),
           }]);
           if (saInspNotifErr) console.error('SA inspection fee notification failed:', saInspNotifErr.message);
