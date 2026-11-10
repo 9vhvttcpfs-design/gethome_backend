@@ -14670,6 +14670,24 @@ app.get('/api/admin/gha-referrals', async (req, res) => {
 
     if (rawErr) return res.status(500).json({ error: rawErr.message });
 
+    // Backfill: signups made before the profile stored the code only have it in auth metadata.
+    try {
+      const { data: have } = await adminClient.from('profiles').select('id').not('referred_by_gha', 'is', null);
+      const haveIds = new Set((have || []).map(p => p.id));
+      const { data: ul } = await adminClient.auth.admin.listUsers({ perPage: 1000 });
+      for (const u of (ul?.users || [])) {
+        const code = u.user_metadata?.referred_by_gha;
+        if (!code || haveIds.has(u.id)) continue;
+        const code2 = String(code).trim().toUpperCase();
+        await adminClient.from('profiles').update({ referred_by_gha: code2 }).eq('id', u.id);
+        const created = u.created_at || new Date().toISOString();
+        const t = new Date(created).getTime();
+        const lo = from ? new Date(from).getTime() : 0;
+        const hi = to ? new Date(to + 'T23:59:59').getTime() : Date.now();
+        if (t >= lo && t <= hi) raw.push({ referred_by_gha: code2, created_at: created, role: u.user_metadata?.role || 'customer' });
+      }
+    } catch (be) { console.error('Referral backfill error:', be.message); }
+
     const now = new Date();
     const todayStr = now.toISOString().slice(0, 10);
     const monthStr = now.toISOString().slice(0, 7);
