@@ -6325,6 +6325,7 @@ button.sec{background:#666}
     <button id="tabSA" class="active">Service Agents</button>
     <button id="tabGHA">GHAs</button>
     <button id="tabNIN">NIN Verified Agents</button>
+    <button id="tabCAC">CAC Verified Agencies</button>
     <button id="logout" class="sec" style="float:right">Log out</button>
     <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
   </div>
@@ -6347,24 +6348,26 @@ $('loginBtn').onclick = function(){
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
 $('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';load();}
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';load();}
 $('tabSA').onclick=function(){setTab('SA');};
 $('tabGHA').onclick=function(){setTab('GHA');};
 $('tabNIN').onclick=function(){setTab('NIN');};
+$('tabCAC').onclick=function(){setTab('CAC');};
 $('filter').oninput=render;
 function load(){
-  $('listTitle').textContent=mode==='SA'?'Service Agents':(mode==='GHA'?'GHAs':'Agents with Prembly-verified NIN');
+  $('listTitle').textContent=mode==='SA'?'Service Agents':(mode==='GHA'?'GHAs':(mode==='CAC'?'Agencies (CAC)':'Agents with Prembly-verified NIN'));
   $('list').textContent='Loading...';$('listMsg').textContent='';
-  var path=mode==='SA'?'/api/admin/all-sas':(mode==='GHA'?'/api/admin/all-ghas':'/api/admin/nin-verified-agents');
+  var path=mode==='SA'?'/api/admin/all-sas':(mode==='GHA'?'/api/admin/all-ghas':(mode==='CAC'?'/api/admin/cac-verified-agencies':'/api/admin/nin-verified-agents'));
   api(path,'GET').then(function(j){
     items=Array.isArray(j)?j:(j.sas||j.ghas||j.agents||j.data||[]);render();
   }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
 function mk(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
 function downloadCsv(){
-  fetch('/api/admin/nin-verified-agents?format=csv',{headers:{'Authorization':'Bearer '+token}})
+  var csvPath=mode==='CAC'?'/api/admin/cac-verified-agencies':'/api/admin/nin-verified-agents';
+  fetch(csvPath+'?format=csv',{headers:{'Authorization':'Bearer '+token}})
     .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob();})
-    .then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='nin-verified-agents-'+new Date().toISOString().slice(0,10)+'.csv';document.body.appendChild(a);a.click();a.remove();})
+    .then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=(mode==='CAC'?'cac-verified-agencies-':'nin-verified-agents-')+new Date().toISOString().slice(0,10)+'.csv';document.body.appendChild(a);a.click();a.remove();})
     .catch(function(e){$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
 function verifyOne(it,btn,msg){
@@ -6414,7 +6417,30 @@ function renderNin(){
   wrap.appendChild(tbl);list.appendChild(wrap);
   if(!shown.length)list.appendChild(mk('div','msg','No matches'));
 }
+function renderCac(){
+  var q=$('filter').value.trim().toLowerCase(),list=$('list');list.textContent='';
+  var shown=items.filter(function(it){
+    return !q||[it.agency_name,it.full_name,it.cac_verified_name,it.email,it.phone,it.cac_number,it.cac_verification_ref].join(' ').toLowerCase().indexOf(q)>-1;
+  });
+  var bar=mk('div');var dl=mk('button',null,'Download CSV ('+items.length+')');dl.onclick=downloadCsv;
+  bar.appendChild(dl);bar.appendChild(mk('span','msg',' Showing '+shown.length+' of '+items.length));list.appendChild(bar);
+  var wrap=mk('div');wrap.style.overflowX='auto';
+  var tbl=mk('table');tbl.style.cssText='border-collapse:collapse;width:100%;font-size:13px;margin-top:10px';
+  var heads=['Verification','Agency name','Company name (CAC)','Contact','Email','Phone','RC/BN number','CAC status','Registered','Verified at','Prembly ref','Account status'];
+  var tr=mk('tr');heads.forEach(function(h){var th=mk('th',null,h);th.style.cssText='text-align:left;padding:6px;border-bottom:2px solid #ddd;white-space:nowrap';tr.appendChild(th);});
+  tbl.appendChild(tr);
+  shown.forEach(function(it){
+    var r=mk('tr');
+    [it.verification,it.agency_name,it.cac_verified_name,it.full_name,it.email,it.phone,it.cac_number,it.cac_verified_status,it.cac_registration_date,it.cac_verified_at?String(it.cac_verified_at).replace('T',' ').slice(0,19):'',it.cac_verification_ref,it.status].forEach(function(v){
+      var td=mk('td',null,v||'');td.style.cssText='padding:6px;border-bottom:1px solid #eee;white-space:nowrap';r.appendChild(td);
+    });
+    tbl.appendChild(r);
+  });
+  wrap.appendChild(tbl);list.appendChild(wrap);
+  if(!shown.length)list.appendChild(mk('div','msg','No matches'));
+}
 function render(){
+  if(mode==='CAC')return renderCac();
   if(mode==='NIN')return renderNin();
   var q=$('filter').value.trim().toLowerCase(),list=$('list');list.textContent='';
   items.filter(function(it){
@@ -6600,6 +6626,80 @@ app.get('/api/admin/nin-verified-agents', async (req, res) => {
     res.json({ count: rows.length, verified_count: rows.filter(r => r.verification === 'verified').length, agents: rows });
   } catch (err) {
     console.error('Admin nin-verified-agents error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/cac-verified-agencies - agencies (and any agent with a CAC number) with Prembly CAC status.
+app.get('/api/admin/cac-verified-agencies', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: profs, error: pErr } = await adminClient
+      .from('profiles')
+      .select('id, full_name, email, phone, status, agent_type, agency_name, cac_number, cac_verified, cac_verified_name, created_at')
+      .eq('role', 'agent')
+      .or('agent_type.eq.agency,cac_number.not.is.null,cac_verified.eq.true')
+      .order('created_at', { ascending: false });
+    if (pErr) throw pErr;
+
+    const keys = Array.from(new Set((profs || []).map(p => cacKey(p.cac_number)).filter(Boolean)));
+    const stored = {};
+    for (let i = 0; i < keys.length; i += 200) {
+      const { data: cv, error: cErr } = await adminClient.from('cac_verifications').select('*').in('cac_key', keys.slice(i, i + 200));
+      if (cErr && !/cac_verifications/.test(cErr.message || '')) throw cErr;
+      (cv || []).forEach(c => { stored[c.cac_key] = c; });
+    }
+    const ids = (profs || []).map(p => p.id);
+    const ag = {};
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data: a, error: aErr } = await adminClient.from('agents')
+        .select('id, cac_verified_status, cac_verification_ref').in('id', ids.slice(i, i + 200));
+      if (aErr) throw aErr;
+      (a || []).forEach(r => { ag[r.id] = r; });
+    }
+
+    const rows = (profs || []).map(p => {
+      const sv = stored[cacKey(p.cac_number)] || null;
+      const a = ag[p.id] || {};
+      const isVerified = p.cac_verified === true || !!sv;
+      return {
+        id: p.id,
+        verification: isVerified ? 'verified' : 'not verified',
+        agent_type: p.agent_type || '',
+        agency_name: p.agency_name || '',
+        cac_verified_name: (sv && sv.company_name) || p.cac_verified_name || '',
+        full_name: p.full_name || '',
+        email: p.email || '',
+        phone: p.phone || '',
+        cac_number: p.cac_number || '',
+        cac_verified_status: (sv && sv.company_status) || a.cac_verified_status || '',
+        cac_registration_date: (sv && sv.registration_date) || '',
+        cac_verified_at: (sv && sv.verified_at) || '',
+        cac_verification_ref: (sv && sv.reference) || a.cac_verification_ref || '',
+        status: p.status || '',
+        registered_at: p.created_at || ''
+      };
+    });
+
+    if (req.query.format === 'csv') {
+      const cols = ['verification', 'agent_type', 'agency_name', 'cac_verified_name', 'full_name', 'email', 'phone', 'cac_number', 'cac_verified_status', 'cac_registration_date', 'cac_verified_at', 'cac_verification_ref', 'status', 'registered_at'];
+      const esc = v => {
+        let t = String(v == null ? '' : v);
+        if (/^[=+\-@\t\r]/.test(t)) t = "'" + t;
+        return '"' + t.replace(/"/g, '""') + '"';
+      };
+      const csv = [cols.join(',')].concat(rows.map(r => cols.map(c => esc(r[c])).join(','))).join('\r\n');
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', 'attachment; filename="cac-verified-agencies.csv"');
+      res.set('Cache-Control', 'no-store');
+      return res.send('﻿' + csv);
+    }
+    res.set('Cache-Control', 'no-store');
+    res.json({ count: rows.length, verified_count: rows.filter(r => r.verification === 'verified').length, agents: rows });
+  } catch (err) {
+    console.error('Admin cac-verified-agencies error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -6927,6 +7027,46 @@ https://trygethome.online`
   }
 });
 // Agent registration - same as signup but sets role to 'agent'
+// --- Prembly CAC verification store (cac_verifications) ---
+// Key = company type + number without leading zeros, e.g. RC123456 (matches /api/verify-cac parsing).
+function cacKey(raw) {
+  let rc = String(raw || '').trim().replace(/\s/g, '').toUpperCase();
+  let type = 'RC';
+  const m = rc.match(/^(BN|RC|IT|LP)/);
+  if (m) { type = m[1]; rc = rc.slice(2); }
+  rc = rc.replace(/^0+/, '');
+  return rc ? type + rc : '';
+}
+async function getStoredCacVerification(raw) {
+  const key = cacKey(raw);
+  if (!key) return { row: null, tableMissing: false };
+  const { data, error } = await adminClient.from('cac_verifications').select('*').eq('cac_key', key).maybeSingle();
+  if (error) {
+    const missing = error.code === '42P01' || error.code === 'PGRST205' || /cac_verifications/.test(error.message || '');
+    if (!missing) console.error('cac_verifications lookup failed:', error.message);
+    return { row: null, tableMissing: missing };
+  }
+  return { row: data || null, tableMissing: false };
+}
+async function applyStoredCacVerification(userId, raw) {
+  try {
+    const { row } = await getStoredCacVerification(raw);
+    if (!row) return false;
+    const { error: aErr } = await adminClient.from('agents').update({
+      cac_verified: true, cac_verified_name: row.company_name,
+      cac_verified_status: row.company_status, cac_verification_ref: row.reference,
+    }).eq('id', userId);
+    if (aErr) console.error('applyStoredCacVerification agents:', aErr.message);
+    const { error: pErr } = await adminClient.from('profiles')
+      .update({ cac_verified: true, cac_verified_name: row.company_name }).eq('id', userId);
+    if (pErr) console.error('applyStoredCacVerification profiles:', pErr.message);
+    return true;
+  } catch (e) {
+    console.error('applyStoredCacVerification error:', e.message);
+    return false;
+  }
+}
+
 // --- Prembly NIN verification store (nin_verifications) ---
 function cleanNin(v) { return String(v || '').replace(/\D/g, ''); }
 
@@ -6985,6 +7125,18 @@ app.post('/api/auth/agent-register', async (req, res) => {
       console.error('nin_verifications table missing - NIN gate skipped. Run migrations/2026_11_nin_verifications.sql');
     } else if (!chk.row) {
       return res.status(400).json({ error: 'Your NIN has not been verified. Please verify your NIN to complete registration.' });
+    }
+  }
+  // Agencies must have a Prembly-verified CAC number (not required for individual agents)
+  if (req.body.agent_type === 'agency') {
+    if (!cacKey(cac)) {
+      return res.status(400).json({ error: 'A CAC registration number is required to register an agency.' });
+    }
+    const cchk = await getStoredCacVerification(cac);
+    if (cchk.tableMissing) {
+      console.error('cac_verifications table missing - CAC gate skipped. Run migrations/2026_11_cac_verifications.sql');
+    } else if (!cchk.row) {
+      return res.status(400).json({ error: 'Your CAC number has not been verified. Please verify it to complete agency registration.' });
     }
   }
   try {
@@ -7057,6 +7209,7 @@ app.post('/api/auth/agent-register', async (req, res) => {
 
     console.log('Agent profile created successfully:', JSON.stringify(agentInsert[0]));
     if (nin) await applyStoredNinVerification(newUserId, nin);
+    if (cac) await applyStoredCacVerification(newUserId, cac);
 
     // Notification is best-effort only - must never block the registration response
     try {
@@ -7157,6 +7310,20 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
       ? (agency_name || 'Unknown Agency')
       : (full_name || name || 'Unknown Agent');
 
+    // Agencies must have a Prembly-verified CAC number before the agent row is created
+    if (isAgency) {
+      const agencyCac = cac || cac_number;
+      if (!cacKey(agencyCac)) {
+        return res.status(400).json({ error: 'A CAC registration number is required to register an agency.' });
+      }
+      const cchk = await getStoredCacVerification(agencyCac);
+      if (cchk.tableMissing) {
+        console.error('cac_verifications table missing - CAC gate skipped. Run migrations/2026_11_cac_verifications.sql');
+      } else if (!cchk.row) {
+        return res.status(400).json({ error: 'Your CAC number has not been verified. Please verify it to complete agency registration.' });
+      }
+    }
+
     console.log('Calling create_agent_with_retry RPC for id:', id);
 
     const { data, error } = await adminClient.rpc('create_agent_with_retry', {
@@ -7202,6 +7369,7 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
 
     // Copy any stored Prembly NIN verification onto the new agent rows
     if (nin || nin_number) await applyStoredNinVerification(id, nin || nin_number);
+    if (cac || cac_number) await applyStoredCacVerification(id, cac || cac_number);
 
     // Check if agent was referred by a GHA via requested_gha_code
     const referralGhaCode = (requested_gha_code || '').toUpperCase().trim();
@@ -12392,6 +12560,19 @@ app.post('/api/verify-cac', async (req, res) => {
         company_name: verifiedName,
         company_status: companyStatus,
       });
+    }
+
+    // Always record the verified company keyed by RC number (signup verifies before an account exists)
+    {
+      const { error: cvErr } = await adminClient.from('cac_verifications').upsert([{
+        cac_key: companyType + rcClean,
+        company_name: verifiedName,
+        company_status: companyStatus,
+        registration_date: registrationDate ? String(registrationDate) : null,
+        reference: verificationRef,
+        verified_at: new Date().toISOString(),
+      }], { onConflict: 'cac_key' });
+      if (cvErr) console.error('cac_verifications upsert failed:', cvErr.message);
     }
 
     // Save to database if user_id provided
