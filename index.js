@@ -6367,20 +6367,45 @@ function downloadCsv(){
     .then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='nin-verified-agents-'+new Date().toISOString().slice(0,10)+'.csv';document.body.appendChild(a);a.click();a.remove();})
     .catch(function(e){$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
+function verifyOne(it,btn,msg){
+  if(btn)btn.disabled=true;if(msg){msg.className='msg';msg.textContent=' checking...';}
+  return api('/api/admin/verify-agent-nin','POST',{agent_id:it.id}).then(function(r){
+    it.verification='verified';it.nin_verified_name=r.verified_name;it.nin_verified_at=new Date().toISOString();return true;
+  }).catch(function(e){
+    it.verify_error=e.message;if(msg){msg.className='msg err';msg.textContent=' '+e.message;}if(btn)btn.disabled=false;return false;
+  });
+}
+function verifyAll(){
+  var todo=items.filter(function(i){return i.verification!=='verified'&&i.nin_number;});
+  if(!todo.length)return alert('Nothing to verify');
+  if(!confirm('This runs '+todo.length+' paid Prembly NIN checks. Continue?'))return;
+  var ok=0,fail=0,errs=[];
+  todo.reduce(function(p,it){return p.then(function(){$('listMsg').className='msg';$('listMsg').textContent='Verifying '+(ok+fail+1)+' of '+todo.length+'...';
+    return verifyOne(it).then(function(g){if(g)ok++;else{fail++;errs.push((it.full_name||it.email)+': '+it.verify_error);}});});},Promise.resolve())
+  .then(function(){$('listMsg').className=fail?'msg err':'msg ok';$('listMsg').textContent='Done: '+ok+' verified, '+fail+' failed'+(errs.length?' - '+errs.join('; '):'');render();});
+}
 function renderNin(){
   var q=$('filter').value.trim().toLowerCase(),list=$('list');list.textContent='';
   var shown=items.filter(function(it){
     return !q||[it.full_name,it.nin_verified_name,it.email,it.phone,it.nin_number,it.nin_verification_ref].join(' ').toLowerCase().indexOf(q)>-1;
   });
   var bar=mk('div');var dl=mk('button',null,'Download CSV ('+items.length+')');dl.onclick=downloadCsv;
-  bar.appendChild(dl);bar.appendChild(mk('span','msg',' Showing '+shown.length+' of '+items.length));list.appendChild(bar);
+  var all=mk('button','sec','Verify all unverified');all.style.marginLeft='6px';all.onclick=verifyAll;
+  bar.appendChild(dl);bar.appendChild(all);bar.appendChild(mk('span','msg',' Showing '+shown.length+' of '+items.length));list.appendChild(bar);
   var wrap=mk('div');wrap.style.overflowX='auto';
   var tbl=mk('table');tbl.style.cssText='border-collapse:collapse;width:100%;font-size:13px;margin-top:10px';
-  var heads=['Verification','Name (profile)','Name (NIMC)','Email','Phone','NIN','DOB','Verified at','Prembly ref','Status'];
+  var heads=['Action','Verification','Name (profile)','Name (NIMC)','Email','Phone','NIN','DOB','Verified at','Prembly ref','Status'];
   var tr=mk('tr');heads.forEach(function(h){var th=mk('th',null,h);th.style.cssText='text-align:left;padding:6px;border-bottom:2px solid #ddd;white-space:nowrap';tr.appendChild(th);});
   tbl.appendChild(tr);
   shown.forEach(function(it){
     var r=mk('tr');
+    var act=mk('td');act.style.cssText='padding:6px;border-bottom:1px solid #eee;white-space:nowrap';
+    if(it.verification!=='verified'&&it.nin_number){
+      var vb=mk('button',null,'Verify now');var vm=mk('span','msg');
+      vb.onclick=function(){if(confirm('Run one paid Prembly NIN check for '+(it.full_name||it.email)+'?'))verifyOne(it,vb,vm).then(render);};
+      act.appendChild(vb);act.appendChild(vm);
+    }
+    r.appendChild(act);
     [it.verification,it.full_name,it.nin_verified_name,it.email,it.phone,it.nin_number,it.nin_verified_dob,it.nin_verified_at?String(it.nin_verified_at).replace('T',' ').slice(0,19):'',it.nin_verification_ref,it.status].forEach(function(v){
       var td=mk('td',null,v||'');td.style.cssText='padding:6px;border-bottom:1px solid #eee;white-space:nowrap';r.appendChild(td);
     });
@@ -6575,6 +6600,60 @@ app.get('/api/admin/nin-verified-agents', async (req, res) => {
     res.json({ count: rows.length, verified_count: rows.filter(r => r.verification === 'verified').length, agents: rows });
   } catch (err) {
     console.error('Admin nin-verified-agents error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/verify-agent-nin - admin runs the NIN already on file for an agent
+// through Prembly (one paid call) and records the result on agents + profiles.
+app.post('/api/admin/verify-agent-nin', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+    const agentId = req.body && req.body.agent_id;
+    if (!agentId) return res.status(400).json({ error: 'agent_id is required' });
+
+    const { data: prof, error: pErr } = await adminClient
+      .from('profiles').select('id, nin_number, role').eq('id', agentId).maybeSingle();
+    if (pErr) throw pErr;
+    if (!prof || prof.role !== 'agent') return res.status(404).json({ error: 'Agent not found' });
+    const ninClean = String(prof.nin_number || '').replace(/\D/g, '');
+    if (ninClean.length !== 11) return res.status(400).json({ error: 'Agent has no valid 11-digit NIN on file' });
+
+    const premblyRes = await fetch('https://api.prembly.com/verification/vnin', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.PREMBLY_SECRET_KEY,
+        'app-id': process.env.PREMBLY_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ number_nin: ninClean }),
+    });
+    const premblyData = await premblyRes.json().catch(() => ({}));
+    if (!premblyData.status) {
+      return res.status(400).json({ error: premblyData.message || premblyData.detail || 'NIN not found / Prembly rejected it' });
+    }
+    const vd = premblyData.data || premblyData.nin_data || {};
+    const verifiedName = [vd.firstname, vd.middlename, vd.surname].filter(Boolean).join(' ').trim();
+    if (verifiedName.length < 3) return res.status(400).json({ error: 'Prembly returned no identity data' });
+    if (vd.nin_suspension_status === true) return res.status(400).json({ error: 'NIN is suspended' });
+
+    const ref = premblyData.verification?.reference || premblyData.billing_info?.transaction_id || null;
+    const { data: agRows, error: agErr } = await adminClient.from('agents').update({
+      nin_verified: true,
+      nin_verified_at: new Date().toISOString(),
+      nin_verified_name: verifiedName,
+      nin_verified_dob: vd.birthdate || null,
+      nin_verification_ref: ref,
+    }).eq('id', agentId).select('id');
+    if (agErr) console.error('admin verify-agent-nin agents update failed:', agErr.message);
+    const { error: prErr } = await adminClient.from('profiles')
+      .update({ nin_verified: true, nin_verified_name: verifiedName }).eq('id', agentId);
+    if (prErr) console.error('admin verify-agent-nin profiles update failed:', prErr.message);
+
+    res.json({ success: true, verified_name: verifiedName, agents_row_updated: !!(agRows && agRows.length) });
+  } catch (err) {
+    console.error('Admin verify-agent-nin error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -6848,6 +6927,40 @@ https://trygethome.online`
   }
 });
 // Agent registration - same as signup but sets role to 'agent'
+// --- Prembly NIN verification store (nin_verifications) ---
+function cleanNin(v) { return String(v || '').replace(/\D/g, ''); }
+
+// Returns { row, tableMissing }. tableMissing = migration not run yet.
+async function getStoredNinVerification(nin) {
+  const { data, error } = await adminClient.from('nin_verifications').select('*').eq('nin', nin).maybeSingle();
+  if (error) {
+    const missing = error.code === '42P01' || error.code === 'PGRST205' || /nin_verifications/.test(error.message || '');
+    if (!missing) console.error('nin_verifications lookup failed:', error.message);
+    return { row: null, tableMissing: missing };
+  }
+  return { row: data || null, tableMissing: false };
+}
+
+// Copy a stored verification onto the agent's profiles/agents rows.
+async function applyStoredNinVerification(userId, nin) {
+  try {
+    const { row } = await getStoredNinVerification(cleanNin(nin));
+    if (!row) return false;
+    const { error: aErr } = await adminClient.from('agents').update({
+      nin_verified: true, nin_verified_at: row.verified_at, nin_verified_name: row.verified_name,
+      nin_verified_dob: row.dob, nin_verification_ref: row.reference,
+    }).eq('id', userId);
+    if (aErr) console.error('applyStoredNinVerification agents:', aErr.message);
+    const { error: pErr } = await adminClient.from('profiles')
+      .update({ nin_verified: true, nin_verified_name: row.verified_name }).eq('id', userId);
+    if (pErr) console.error('applyStoredNinVerification profiles:', pErr.message);
+    return true;
+  } catch (e) {
+    console.error('applyStoredNinVerification error:', e.message);
+    return false;
+  }
+}
+
 app.post('/api/auth/agent-register', async (req, res) => {
   const { email, password, fullName, phone, address, city, experience, specialty, nin, cac, about, requested_gha_code } = req.body;
   const refGha = req.body.referred_by_gha || null;
@@ -6858,6 +6971,21 @@ app.post('/api/auth/agent-register', async (req, res) => {
   const emailDomain = email.split('@')[1]?.toLowerCase();
   if (blockedDomains.includes(emailDomain)) {
     return res.status(400).json({ error: 'Disposable email addresses are not allowed. Please use a real email.' });
+  }
+  // Registration requires a NIN that already passed Prembly verification
+  // (verify-nin records it in nin_verifications). Non-Nigerian signups are exempt.
+  const regCountry = String(req.body.country || 'NG').toUpperCase();
+  if (regCountry === 'NG') {
+    const ninDigits = cleanNin(nin);
+    if (ninDigits.length !== 11) {
+      return res.status(400).json({ error: 'A valid 11-digit NIN is required to register as an agent.' });
+    }
+    const chk = await getStoredNinVerification(ninDigits);
+    if (chk.tableMissing) {
+      console.error('nin_verifications table missing - NIN gate skipped. Run migrations/2026_11_nin_verifications.sql');
+    } else if (!chk.row) {
+      return res.status(400).json({ error: 'Your NIN has not been verified. Please verify your NIN to complete registration.' });
+    }
   }
   try {
     const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
@@ -6928,6 +7056,7 @@ app.post('/api/auth/agent-register', async (req, res) => {
     }
 
     console.log('Agent profile created successfully:', JSON.stringify(agentInsert[0]));
+    if (nin) await applyStoredNinVerification(newUserId, nin);
 
     // Notification is best-effort only - must never block the registration response
     try {
@@ -7070,6 +7199,9 @@ app.post('/api/auth/create-agent-row', async (req, res) => {
       })
       .eq('id', id);
     if (profileTypeErr) console.error('Profile type update failed:', profileTypeErr.message);
+
+    // Copy any stored Prembly NIN verification onto the new agent rows
+    if (nin || nin_number) await applyStoredNinVerification(id, nin || nin_number);
 
     // Check if agent was referred by a GHA via requested_gha_code
     const referralGhaCode = (requested_gha_code || '').toUpperCase().trim();
@@ -12002,6 +12134,20 @@ app.post('/api/verify-nin', async (req, res) => {
     // Check for suspended NIN
     if (verifiedData.nin_suspension_status === true) {
       return res.status(400).json({ error: 'This NIN has been suspended. Please contact NIMC.' });
+    }
+
+    // Always record the verified identity keyed by NIN (signup verifies before an account exists)
+    {
+      const { error: nvErr } = await adminClient.from('nin_verifications').upsert([{
+        nin: ninClean,
+        verified_name: verifiedName,
+        dob: verifiedData.birthdate || null,
+        gender: verifiedData.gender || null,
+        phone: verifiedData.telephoneno || null,
+        reference: premblyData.verification?.reference || premblyData.billing_info?.transaction_id || null,
+        verified_at: new Date().toISOString(),
+      }], { onConflict: 'nin' });
+      if (nvErr) console.error('nin_verifications upsert failed:', nvErr.message);
     }
 
     // Save to database. If the client did not send user_id, fall back to matching the
