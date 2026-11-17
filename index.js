@@ -6503,23 +6503,35 @@ app.get('/api/admin/nin-verified-agents', async (req, res) => {
     const admin = await verifyAdminToken(req);
     if (!admin) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { data: profs, error: pErr } = await adminClient
-      .from('profiles')
-      .select('id, full_name, email, phone, status, nin_number, nin_verified, created_at')
-      .eq('nin_verified', true)
-      .order('created_at', { ascending: false });
+    // Verification can be recorded on profiles, agents, or both (the two writes in
+    // /api/verify-nin are independent), so take the union of both tables.
+    const { data: profFlag, error: pErr } = await adminClient
+      .from('profiles').select('id').eq('nin_verified', true);
     if (pErr) throw pErr;
+    const { data: agFlag, error: agErr } = await adminClient
+      .from('agents').select('id')
+      .or('nin_verified.eq.true,nin_verified_at.not.is.null');
+    if (agErr) throw agErr;
+    const ids = Array.from(new Set([].concat((profFlag || []).map(r => r.id), (agFlag || []).map(r => r.id))));
 
-    const ids = (profs || []).map(p => p.id);
+    const profs = [];
     const details = {};
     for (let i = 0; i < ids.length; i += 200) {
+      const chunk = ids.slice(i, i + 200);
+      const { data: pr, error: e1 } = await adminClient
+        .from('profiles')
+        .select('id, full_name, email, phone, status, nin_number, nin_verified, created_at')
+        .in('id', chunk);
+      if (e1) throw e1;
+      (pr || []).forEach(r => profs.push(r));
       const { data: ag, error: aErr } = await adminClient
         .from('agents')
         .select('id, nin_verified_at, nin_verified_name, nin_verified_dob, nin_verification_ref')
-        .in('id', ids.slice(i, i + 200));
+        .in('id', chunk);
       if (aErr) throw aErr;
       (ag || []).forEach(a => { details[a.id] = a; });
     }
+    profs.sort((x, y) => String(y.created_at || '').localeCompare(String(x.created_at || '')));
 
     const rows = (profs || []).map(p => {
       const d = details[p.id] || {};
