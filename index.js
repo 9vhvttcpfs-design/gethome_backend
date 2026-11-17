@@ -6376,12 +6376,12 @@ function renderNin(){
   bar.appendChild(dl);bar.appendChild(mk('span','msg',' Showing '+shown.length+' of '+items.length));list.appendChild(bar);
   var wrap=mk('div');wrap.style.overflowX='auto';
   var tbl=mk('table');tbl.style.cssText='border-collapse:collapse;width:100%;font-size:13px;margin-top:10px';
-  var heads=['Name (profile)','Name (NIMC)','Email','Phone','NIN','DOB','Verified at','Prembly ref','Status'];
+  var heads=['Verification','Name (profile)','Name (NIMC)','Email','Phone','NIN','DOB','Verified at','Prembly ref','Status'];
   var tr=mk('tr');heads.forEach(function(h){var th=mk('th',null,h);th.style.cssText='text-align:left;padding:6px;border-bottom:2px solid #ddd;white-space:nowrap';tr.appendChild(th);});
   tbl.appendChild(tr);
   shown.forEach(function(it){
     var r=mk('tr');
-    [it.full_name,it.nin_verified_name,it.email,it.phone,it.nin_number,it.nin_verified_dob,it.nin_verified_at?String(it.nin_verified_at).replace('T',' ').slice(0,19):'',it.nin_verification_ref,it.status].forEach(function(v){
+    [it.verification,it.full_name,it.nin_verified_name,it.email,it.phone,it.nin_number,it.nin_verified_dob,it.nin_verified_at?String(it.nin_verified_at).replace('T',' ').slice(0,19):'',it.nin_verification_ref,it.status].forEach(function(v){
       var td=mk('td',null,v||'');td.style.cssText='padding:6px;border-bottom:1px solid #eee;white-space:nowrap';r.appendChild(td);
     });
     tbl.appendChild(r);
@@ -6512,7 +6512,11 @@ app.get('/api/admin/nin-verified-agents', async (req, res) => {
       .from('agents').select('id')
       .or('nin_verified.eq.true,nin_verified_at.not.is.null');
     if (agErr) throw agErr;
-    const ids = Array.from(new Set([].concat((profFlag || []).map(r => r.id), (agFlag || []).map(r => r.id))));
+    // Also include every agent who submitted a NIN, so unverified/pending ones are visible
+    const { data: ninOnFile, error: nErr } = await adminClient
+      .from('profiles').select('id').eq('role', 'agent').not('nin_number', 'is', null).neq('nin_number', '');
+    if (nErr) throw nErr;
+    const ids = Array.from(new Set([].concat((profFlag || []).map(r => r.id), (agFlag || []).map(r => r.id), (ninOnFile || []).map(r => r.id))));
 
     const profs = [];
     const details = {};
@@ -6535,8 +6539,11 @@ app.get('/api/admin/nin-verified-agents', async (req, res) => {
 
     const rows = (profs || []).map(p => {
       const d = details[p.id] || {};
+      const isVerified = p.nin_verified === true || !!d.nin_verified_at;
+      const isPending = d.nin_verification_ref === 'PENDING_LIVE_VERIFICATION';
       return {
         id: p.id,
+        verification: isVerified ? 'verified' : (isPending ? 'pending' : 'not verified'),
         full_name: p.full_name || '',
         nin_verified_name: d.nin_verified_name || '',
         email: p.email || '',
@@ -6551,7 +6558,7 @@ app.get('/api/admin/nin-verified-agents', async (req, res) => {
     });
 
     if (req.query.format === 'csv') {
-      const cols = ['full_name', 'nin_verified_name', 'email', 'phone', 'nin_number', 'nin_verified_dob', 'nin_verified_at', 'nin_verification_ref', 'status', 'registered_at'];
+      const cols = ['verification', 'full_name', 'nin_verified_name', 'email', 'phone', 'nin_number', 'nin_verified_dob', 'nin_verified_at', 'nin_verification_ref', 'status', 'registered_at'];
       const esc = v => {
         let s = String(v == null ? '' : v);
         if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // neutralise spreadsheet formula injection
@@ -6565,7 +6572,7 @@ app.get('/api/admin/nin-verified-agents', async (req, res) => {
     }
 
     res.set('Cache-Control', 'no-store');
-    res.json({ count: rows.length, agents: rows });
+    res.json({ count: rows.length, verified_count: rows.filter(r => r.verification === 'verified').length, agents: rows });
   } catch (err) {
     console.error('Admin nin-verified-agents error:', err.message);
     res.status(500).json({ error: err.message });
@@ -11997,8 +12004,15 @@ app.post('/api/verify-nin', async (req, res) => {
       return res.status(400).json({ error: 'This NIN has been suspended. Please contact NIMC.' });
     }
 
-    // Save to database if user_id provided
-    if (user_id && verifiedName) {
+    // Save to database. If the client did not send user_id, fall back to matching the
+    // NIN already stored on the agent's profile at registration.
+    var ninTargetIds = user_id ? [user_id] : [];
+    if (!user_id && verifiedName) {
+      console.warn('verify-nin called without user_id; matching by nin_number');
+      const { data: ninMatches } = await adminClient.from('profiles').select('id').eq('nin_number', ninClean).eq('role', 'agent');
+      ninTargetIds = (ninMatches || []).map(function(m) { return m.id; });
+    }
+    for (const user_id of ninTargetIds) {
       const { error: ninAgentErr } = await adminClient.from('agents')
         .update({
           nin_verified: true,
