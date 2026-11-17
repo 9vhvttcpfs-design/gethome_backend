@@ -6324,6 +6324,7 @@ button.sec{background:#666}
   <div class="card tabs">
     <button id="tabSA" class="active">Service Agents</button>
     <button id="tabGHA">GHAs</button>
+    <button id="tabNIN">NIN Verified Agents</button>
     <button id="logout" class="sec" style="float:right">Log out</button>
     <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
   </div>
@@ -6346,17 +6347,50 @@ $('loginBtn').onclick = function(){
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
 $('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-$('tabSA').onclick=function(){mode='SA';$('tabSA').className='active';$('tabGHA').className='';load();};
-$('tabGHA').onclick=function(){mode='GHA';$('tabGHA').className='active';$('tabSA').className='';load();};
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';load();}
+$('tabSA').onclick=function(){setTab('SA');};
+$('tabGHA').onclick=function(){setTab('GHA');};
+$('tabNIN').onclick=function(){setTab('NIN');};
 $('filter').oninput=render;
 function load(){
-  $('listTitle').textContent=mode==='SA'?'Service Agents':'GHAs';$('list').textContent='Loading...';
-  api(mode==='SA'?'/api/admin/all-sas':'/api/admin/all-ghas','GET').then(function(j){
-    items=Array.isArray(j)?j:(j.sas||j.ghas||j.data||[]);render();
+  $('listTitle').textContent=mode==='SA'?'Service Agents':(mode==='GHA'?'GHAs':'Agents with Prembly-verified NIN');
+  $('list').textContent='Loading...';$('listMsg').textContent='';
+  var path=mode==='SA'?'/api/admin/all-sas':(mode==='GHA'?'/api/admin/all-ghas':'/api/admin/nin-verified-agents');
+  api(path,'GET').then(function(j){
+    items=Array.isArray(j)?j:(j.sas||j.ghas||j.agents||j.data||[]);render();
   }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
 function mk(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+function downloadCsv(){
+  fetch('/api/admin/nin-verified-agents?format=csv',{headers:{'Authorization':'Bearer '+token}})
+    .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob();})
+    .then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='nin-verified-agents-'+new Date().toISOString().slice(0,10)+'.csv';document.body.appendChild(a);a.click();a.remove();})
+    .catch(function(e){$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
+}
+function renderNin(){
+  var q=$('filter').value.trim().toLowerCase(),list=$('list');list.textContent='';
+  var shown=items.filter(function(it){
+    return !q||[it.full_name,it.nin_verified_name,it.email,it.phone,it.nin_number,it.nin_verification_ref].join(' ').toLowerCase().indexOf(q)>-1;
+  });
+  var bar=mk('div');var dl=mk('button',null,'Download CSV ('+items.length+')');dl.onclick=downloadCsv;
+  bar.appendChild(dl);bar.appendChild(mk('span','msg',' Showing '+shown.length+' of '+items.length));list.appendChild(bar);
+  var wrap=mk('div');wrap.style.overflowX='auto';
+  var tbl=mk('table');tbl.style.cssText='border-collapse:collapse;width:100%;font-size:13px;margin-top:10px';
+  var heads=['Name (profile)','Name (NIMC)','Email','Phone','NIN','DOB','Verified at','Prembly ref','Status'];
+  var tr=mk('tr');heads.forEach(function(h){var th=mk('th',null,h);th.style.cssText='text-align:left;padding:6px;border-bottom:2px solid #ddd;white-space:nowrap';tr.appendChild(th);});
+  tbl.appendChild(tr);
+  shown.forEach(function(it){
+    var r=mk('tr');
+    [it.full_name,it.nin_verified_name,it.email,it.phone,it.nin_number,it.nin_verified_dob,it.nin_verified_at?String(it.nin_verified_at).replace('T',' ').slice(0,19):'',it.nin_verification_ref,it.status].forEach(function(v){
+      var td=mk('td',null,v||'');td.style.cssText='padding:6px;border-bottom:1px solid #eee;white-space:nowrap';r.appendChild(td);
+    });
+    tbl.appendChild(r);
+  });
+  wrap.appendChild(tbl);list.appendChild(wrap);
+  if(!shown.length)list.appendChild(mk('div','msg','No matches'));
+}
 function render(){
+  if(mode==='NIN')return renderNin();
   var q=$('filter').value.trim().toLowerCase(),list=$('list');list.textContent='';
   items.filter(function(it){
     return !q||[it.full_name,it.email,it.phone,it.sa_code,it.gha_code].join(' ').toLowerCase().indexOf(q)>-1;
@@ -6458,6 +6492,70 @@ app.post('/api/admin/update-gha', async (req, res) => {
     res.json(r.row);
   } catch (err) {
     console.error('Admin update-gha error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/nin-verified-agents - agents whose NIN was verified via Prembly.
+// JSON by default; ?format=csv returns a downloadable CSV for submission to authorities.
+app.get('/api/admin/nin-verified-agents', async (req, res) => {
+  try {
+    const admin = await verifyAdminToken(req);
+    if (!admin) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: profs, error: pErr } = await adminClient
+      .from('profiles')
+      .select('id, full_name, email, phone, status, nin_number, nin_verified, created_at')
+      .eq('nin_verified', true)
+      .order('created_at', { ascending: false });
+    if (pErr) throw pErr;
+
+    const ids = (profs || []).map(p => p.id);
+    const details = {};
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data: ag, error: aErr } = await adminClient
+        .from('agents')
+        .select('id, nin_verified_at, nin_verified_name, nin_verified_dob, nin_verification_ref')
+        .in('id', ids.slice(i, i + 200));
+      if (aErr) throw aErr;
+      (ag || []).forEach(a => { details[a.id] = a; });
+    }
+
+    const rows = (profs || []).map(p => {
+      const d = details[p.id] || {};
+      return {
+        id: p.id,
+        full_name: p.full_name || '',
+        nin_verified_name: d.nin_verified_name || '',
+        email: p.email || '',
+        phone: p.phone || '',
+        nin_number: p.nin_number || '',
+        nin_verified_dob: d.nin_verified_dob || '',
+        nin_verified_at: d.nin_verified_at || '',
+        nin_verification_ref: d.nin_verification_ref || '',
+        status: p.status || '',
+        registered_at: p.created_at || ''
+      };
+    });
+
+    if (req.query.format === 'csv') {
+      const cols = ['full_name', 'nin_verified_name', 'email', 'phone', 'nin_number', 'nin_verified_dob', 'nin_verified_at', 'nin_verification_ref', 'status', 'registered_at'];
+      const esc = v => {
+        let s = String(v == null ? '' : v);
+        if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // neutralise spreadsheet formula injection
+        return '"' + s.replace(/"/g, '""') + '"';
+      };
+      const csv = [cols.join(',')].concat(rows.map(r => cols.map(c => esc(r[c])).join(','))).join('\r\n');
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', 'attachment; filename="nin-verified-agents.csv"');
+      res.set('Cache-Control', 'no-store');
+      return res.send('﻿' + csv);
+    }
+
+    res.set('Cache-Control', 'no-store');
+    res.json({ count: rows.length, agents: rows });
+  } catch (err) {
+    console.error('Admin nin-verified-agents error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
