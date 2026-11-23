@@ -2,7 +2,7 @@
 // WhatsApp/SMS are drafted for the recruiter to copy and send manually, then confirmed via mark-sent.
 // Swap in an API sender for those channels later by extending sendMessage().
 'use strict';
-const crypto = require('crypto');
+const { signToken, readToken } = require('./optout');
 const { limiter } = require('../middleware/security');
 
 const SITE = 'https://trygethome.online';
@@ -11,18 +11,6 @@ const RESEND_COOLDOWN_HOURS = 72;      // never email the same prospect twice wi
 const isUuid = (s) => typeof s === 'string' && /^[0-9a-f-]{36}$/i.test(s);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40);
-
-function secret() {
-  return process.env.GROWTH_SIGNING_SECRET || crypto.createHash('sha256').update('gx-optout:' + (process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || '')).digest('hex');
-}
-function signToken(id) { return id + '.' + crypto.createHmac('sha256', secret()).update(id).digest('hex').slice(0, 24); }
-function readToken(t) {
-  const [id, sig] = String(t || '').split('.');
-  if (!isUuid(id) || !sig) return null;
-  const good = signToken(id).split('.')[1];
-  const a = Buffer.from(sig), b = Buffer.from(good);
-  return a.length === b.length && crypto.timingSafeEqual(a, b) ? id : null;
-}
 
 // Deterministic templates (no model call, no invented claims). {link} carries UTM + GHA ref for attribution.
 function buildMessage(p, channel, template, ctx) {

@@ -75,6 +75,8 @@ app.options('*', cors());
 require('./middleware/security').applySecurity(app);
 // Recruitment CSV import posts up to ~2000 rows; raise the limit for this route only (parsed body is reused by the global parser)
 app.use('/api/growth/recruit/prospects/import', express.json({ limit: '2mb' }));
+// Signed provider webhooks (Resend, WhatsApp) need the raw body to verify signatures
+app.use('/api/growth/webhooks', express.raw({ type: '*/*', limit: '1mb' }));
 app.use(express.json());
 // ── Supabase ───────────────────────────────────────────────
 const supabase = createClient(
@@ -102,6 +104,8 @@ growthHooks.linkProspect = recruit.linkProspect;
 const handoffRouting = require('./growth/handoff')(adminClient, formatWaNumber);
 require('./growth/marketing')(app, adminClient);
 require('./growth/outreachAdmin')(app, adminClient);
+require('./growth/discovery')(app, adminClient);
+require('./growth/messaging')(app, adminClient);
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
