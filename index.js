@@ -72,6 +72,7 @@ app.use(function(req, res, next) {
 });
 // Handle OPTIONS preflight explicitly
 app.options('*', cors());
+require('./middleware/security').applySecurity(app);
 app.use(express.json());
 // ── Supabase ───────────────────────────────────────────────
 const supabase = createClient(
@@ -8735,11 +8736,16 @@ async function createStaffEarnings(agentId, paymentAmount, paymentReference, pla
 
 app.post('/api/flutterwave/webhook', async (req, res) => {
   console.log('Flutterwave webhook received:', JSON.stringify(req.body).substring(0, 200));
-  console.log('Webhook headers:', JSON.stringify(req.headers['verif-hash'] || req.headers['v-hash'] || 'no-hash'));
   try {
+    // Never log the signature or the expected secret. Constant-time comparison.
     const signature = req.headers['verif-hash'];
-    console.log('Webhook hash check - received:', signature, '| expected:', process.env.FLW_WEBHOOK_HASH, '| match:', signature === process.env.FLW_WEBHOOK_HASH);
-    if (!signature || signature !== process.env.FLW_WEBHOOK_HASH) {
+    const expectedHash = process.env.FLW_WEBHOOK_HASH || '';
+    const sigOk = !!signature && !!expectedHash && (function () {
+      const a = Buffer.from(String(signature));
+      const b = Buffer.from(expectedHash);
+      return a.length === b.length && require('crypto').timingSafeEqual(a, b);
+    })();
+    if (!sigOk) {
       console.error('Flutterwave webhook signature mismatch - possible spoofed request');
       return res.status(401).json({ error: 'Invalid signature' });
     }
