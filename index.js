@@ -101,6 +101,7 @@ const recruit = require('./growth/recruit')(app, adminClient, { isAgentSubActive
 growthHooks.linkProspect = recruit.linkProspect;
 const handoffRouting = require('./growth/handoff')(adminClient, formatWaNumber);
 require('./growth/marketing')(app, adminClient);
+require('./growth/outreachAdmin')(app, adminClient);
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';

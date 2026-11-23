@@ -6,7 +6,10 @@ const express = require('express');
 const createAuth = require('../middleware/auth');
 const { limiter } = require('../middleware/security');
 
-const STAGES = ['new', 'contacted', 'interested', 'applied', 'approved', 'subscribed', 'lost'];
+// Pipeline order. qualified / permission_obtained / campaign_ready are managed from the Outreach Command Centre;
+// SAs and GHAs can only set the legacy stages below. approved / subscribed come from real accounts.
+const STAGES = ['new', 'qualified', 'permission_obtained', 'campaign_ready', 'contacted', 'interested', 'applied', 'approved', 'subscribed', 'lost'];
+const STAFF_STAGES = ['new', 'contacted', 'interested', 'applied', 'lost'];
 const SOURCES = ['manual', 'csv_import', 'referral', 'walk_in', 'social', 'event', 'website'];
 const CONSENT = ['public_business_listing', 'prospect_requested', 'existing_relationship', 'referred_by_agent'];
 const CHANNELS = ['whatsapp', 'sms', 'email', 'social', 'field_visit', 'referral', 'event', 'other'];
@@ -281,7 +284,7 @@ module.exports = function mountRecruit(app, db, helpers) {
       const p = await loadProspect(req, res); if (!p) return;
       const b = req.body || {}; const upd = {};
       if (b.stage !== undefined) {
-        if (!STAGES.includes(b.stage)) return res.status(400).json({ error: 'Invalid stage' });
+        if (!STAGES.includes(b.stage) || !STAFF_STAGES.includes(b.stage)) return res.status(400).json({ error: 'Invalid stage' });
         // approved/subscribed reflect real platform state and are set automatically.
         if (['approved', 'subscribed'].includes(b.stage) && b.stage !== p.stage) return res.status(400).json({ error: 'approved and subscribed are set automatically from the agent\'s real account' });
         upd.stage = b.stage;
@@ -323,7 +326,7 @@ module.exports = function mountRecruit(app, db, helpers) {
       const funnel = (list) => {
         const n = (st) => list.filter((p) => STAGES.indexOf(p.stage) >= STAGES.indexOf(st) && p.stage !== 'lost').length;
         const total = list.length;
-        return { prospects: total, contacted: list.filter((p) => p.contacted_at || STAGES.indexOf(p.stage) >= 1 && p.stage !== 'lost').length, interested: n('interested'), applied: n('applied'), approved: n('approved'), subscribed: list.filter((p) => p.stage === 'subscribed').length, lost: list.filter((p) => p.stage === 'lost').length };
+        return { prospects: total, contacted: list.filter((p) => p.contacted_at || STAGES.indexOf(p.stage) >= STAGES.indexOf('contacted') && p.stage !== 'lost').length, interested: n('interested'), applied: n('applied'), approved: n('approved'), subscribed: list.filter((p) => p.stage === 'subscribed').length, lost: list.filter((p) => p.stage === 'lost').length };
       };
       const withRates = (f) => Object.assign(f, { contact_to_apply_pct: rate(f.applied, f.contacted), apply_to_subscribe_pct: rate(f.subscribed, f.applied), prospect_to_subscribe_pct: rate(f.subscribed, f.prospects) });
       const campaignRows = campaigns.map((c) => {
