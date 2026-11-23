@@ -7660,6 +7660,15 @@ app.get('/api/auth/me', async (req, res) => {
 // ──────────────────────────────────────────────────────────
 // PROPERTIES
 // ──────────────────────────────────────────────────────────
+// Columns that identify a depositing customer or a payment and must never appear in public responses.
+// Admin/SA deposit screens read them from their own authenticated endpoints (/api/admin/deposits, /api/sa/deposits).
+const PRIVATE_PROPERTY_FIELDS = ['depositor_name', 'depositor_email', 'depositor_phone', 'deposit_reference'];
+function stripPrivateProperty(p) {
+  if (!p) return p;
+  const o = Object.assign({}, p);
+  PRIVATE_PROPERTY_FIELDS.forEach(function(k) { delete o[k]; });
+  return o;
+}
 app.get('/api/properties', async (req, res) => {
   try {
     if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
@@ -7761,7 +7770,7 @@ app.get('/api/properties', async (req, res) => {
         agent_type: p.agent_type || agentProf?.agent_type || null,
       };
     });
-    res.json(out);
+    res.json(out.map(stripPrivateProperty));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // POST /api/upload-image
@@ -14986,7 +14995,7 @@ app.post('/api/ai/chat', async (req, res) => {
 
     res.json({
       reply: aiReply,
-      properties: foundProperties.slice(0, 3),
+      properties: foundProperties.slice(0, 3).map(stripPrivateProperty),
       is_alternative: isAlternative,
       conversation_id: conversation.id,
       wants_human: requirements.wants_human || false,
