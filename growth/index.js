@@ -30,7 +30,8 @@ function isUuid(s) {
   return typeof s === 'string' && /^[0-9a-f-]{36}$/i.test(s);
 }
 
-module.exports = function mountGrowth(app, db) {
+module.exports = function mountGrowth(app, db, hooks) {
+  hooks = hooks || {};
   const auth = createAuth(db);
 
   async function event(leadId, type, actor, payload) {
@@ -42,6 +43,14 @@ module.exports = function mountGrowth(app, db) {
   async function attributionFor(sessionId) {
     if (!sessionId) return null;
     const { data } = await db.from('gx_attribution').select('*').eq('session_id', sessionId).maybeSingle();
+    return data || null;
+  }
+  // AI conversations carry the chat's own session id; fall back to the mapping saved by the frontend.
+  async function attributionForAi(aiSessionId) {
+    if (!aiSessionId) return null;
+    const direct = await attributionFor(aiSessionId);
+    if (direct) return direct;
+    const { data } = await db.from('gx_attribution').select('*').eq('ai_session_id', aiSessionId).limit(1).maybeSingle();
     return data || null;
   }
 
@@ -78,7 +87,33 @@ module.exports = function mountGrowth(app, db) {
       // First touch wins: never overwrite an existing session row.
       const { error } = await db.from('gx_attribution').upsert([row], { onConflict: 'session_id', ignoreDuplicates: true });
       if (error) { console.error('gx attribution error:', error.message); return res.json({ ok: false }); }
+      // The AI chat uses its own per-tab session id; remember it so AI leads inherit this attribution.
+      const aiSid = clip(b.ai_session_id, 80);
+      if (aiSid) await db.from('gx_attribution').update({ ai_session_id: aiSid }).eq('session_id', session_id).is('ai_session_id', null);
       res.json({ ok: true });
+    } catch (e) { res.json({ ok: false }); }
+  });
+
+  // ---- Authenticated: link this browser's attribution to the signed-in user's profile. ----
+  // Real signups happen in the browser (supabase.auth.signUp), so the frontend calls this on first sign-in.
+  // Only recently created profiles are linked, so an old account logging in from a new browser is not misattributed.
+  app.post('/api/growth/attribution/link', limiter(60 * 1000, 20), async (req, res) => {
+    try {
+      const token = (req.headers.authorization || '').replace(/^Bearers+/i, '').trim();
+      if (!token) return res.status(400).json({ ok: false });
+      const { data: { user }, error: uErr } = await db.auth.getUser(token);
+      if (uErr || !user) return res.status(401).json({ ok: false });
+      // Prefer the id stamped into the account at signup (survives confirming the email on another device).
+      const sessionId = clip(user.user_metadata && user.user_metadata.gx_session_id, 64) || clip(req.body && req.body.session_id, 64);
+      if (!sessionId) return res.json({ ok: true, linked: false, reason: 'no_session' });
+      const { data: prof } = await db.from('profiles').select('id, role, email, phone, created_at').eq('id', user.id).maybeSingle();
+      const created = new Date((prof && prof.created_at) || user.created_at || 0);
+      if (!prof || isNaN(created) || Date.now() - created.getTime() > 7 * 86400000) return res.json({ ok: true, linked: false, reason: 'not_new' });
+      const { data: already } = await db.from('gx_attribution').select('id').eq('profile_id', user.id).limit(1);
+      if (already && already.length) return res.json({ ok: true, linked: false, reason: 'already_linked' });
+      await linkSignup(sessionId, user.id, { role: prof.role });
+      if (prof.role === 'agent' && hooks.linkProspect) await hooks.linkProspect(user.id, prof.email || user.email, prof.phone || (user.user_metadata && user.user_metadata.phone));
+      res.json({ ok: true, linked: true });
     } catch (e) { res.json({ ok: false }); }
   });
 
@@ -274,7 +309,7 @@ module.exports = function mountGrowth(app, db) {
       const contact = { name: a.customer_name || null, email: a.customer_email || null, phone: a.customer_phone || null, requirements: reqs };
       const { data: existing } = await db.from('gx_leads').select('id').eq('source_detail->>ai_lead_id', String(a.id)).maybeSingle();
       if (existing) { await db.from('gx_leads').update(contact).eq('id', existing.id); return; }
-      const attr = await attributionFor(sessionId);
+      const attr = await attributionForAi(sessionId);
       const row = Object.assign({
         source: 'ai_chat',
         segment: a.purpose === 'rent' ? 'renter' : a.purpose === 'shortlet' ? 'shortlet' : 'buyer',

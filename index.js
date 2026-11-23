@@ -73,6 +73,8 @@ app.use(function(req, res, next) {
 // Handle OPTIONS preflight explicitly
 app.options('*', cors());
 require('./middleware/security').applySecurity(app);
+// Recruitment CSV import posts up to ~2000 rows; raise the limit for this route only (parsed body is reused by the global parser)
+app.use('/api/growth/recruit/prospects/import', express.json({ limit: '2mb' }));
 app.use(express.json());
 // ── Supabase ───────────────────────────────────────────────
 const supabase = createClient(
@@ -88,12 +90,15 @@ const serviceClient = process.env.SUPABASE_SERVICE_KEY
   : supabase;
 const adminClient = serviceClient;
 // Growth Engine (lead capture, CRM, attribution). Additive; see growth/index.js
-const growth = require('./growth')(app, adminClient);
+const growthHooks = {};
+const growth = require('./growth')(app, adminClient, growthHooks);
 // BI reuses the platform's own definitions (function declarations are hoisted)
 require('./growth/bi')(app, adminClient, {
   getBillingMonth, isAgentSubActive, isAgentSubExpired,
   getGhaSalarySettings, calcGhaSalary, getGhaAccompanyFee,
 });
+const recruit = require('./growth/recruit')(app, adminClient, { isAgentSubActive });
+growthHooks.linkProspect = recruit.linkProspect;
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
@@ -6335,6 +6340,7 @@ button.sec{background:#666}
     <button id="tabNIN">NIN Verified Agents</button>
     <button id="tabCAC">CAC Verified Agencies</button>
     <button id="tabBI">Growth BI</button>
+    <button id="tabREC">Recruitment</button>
     <button id="logout" class="sec" style="float:right">Log out</button>
     <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
   </div>
@@ -6357,15 +6363,17 @@ $('loginBtn').onclick = function(){
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
 $('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('filter').style.display=m==='BI'?'none':'';load();}
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('filter').style.display=(m==='BI'||m==='REC')?'none':'';load();}
 $('tabSA').onclick=function(){setTab('SA');};
 $('tabGHA').onclick=function(){setTab('GHA');};
 $('tabNIN').onclick=function(){setTab('NIN');};
 $('tabCAC').onclick=function(){setTab('CAC');};
 $('tabBI').onclick=function(){setTab('BI');};
+$('tabREC').onclick=function(){setTab('REC');};
 $('filter').oninput=render;
 function load(){
   if(mode==='BI')return loadBi();
+  if(mode==='REC')return loadRecruit();
   $('listTitle').textContent=mode==='SA'?'Service Agents':(mode==='GHA'?'GHAs':(mode==='CAC'?'Agencies (CAC)':'Agents with Prembly-verified NIN'));
   $('list').textContent='Loading...';$('listMsg').textContent='';
   var path=mode==='SA'?'/api/admin/all-sas':(mode==='GHA'?'/api/admin/all-ghas':(mode==='CAC'?'/api/admin/cac-verified-agencies':'/api/admin/nin-verified-agents'));
@@ -6409,6 +6417,47 @@ function loadBi(){
     list.appendChild(biTable('Traffic sources',src,[['Source',function(x){return x.k;}],['Sessions',function(x){return x.v.sessions;}],['Signups',function(x){return x.v.signups;}]]));
     list.appendChild(biCards([['Spend',money(mk2.total_spend_ngn)],['Cost per lead',mk2.cost_per_lead_ngn==null?'n/a':money(mk2.cost_per_lead_ngn)],['Cost per signup',mk2.cost_per_signup_ngn==null?'n/a':money(mk2.cost_per_signup_ngn)],['Leads',ld.total],['Overdue follow-ups',ld.overdue_follow_ups]]));
     list.appendChild(mk('div','msg',mk2.note));
+  }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
+}
+
+function parseCsv(text){
+  var rows=[],row=[],f='',q=false,i,c;
+  for(i=0;i<text.length;i++){c=text[i];
+    if(q){if(c==='"'){if(text[i+1]==='"'){f+='"';i++;}else q=false;}else f+=c;}
+    else if(c==='"')q=true;
+    else if(c===','){row.push(f);f='';}
+    else if(c==='\\n'||c==='\\r'){if(c==='\\r'&&text[i+1]==='\\n')i++;row.push(f);f='';if(row.some(function(x){return x.trim();}))rows.push(row);row=[];}
+    else f+=c;}
+  row.push(f);if(row.some(function(x){return x.trim();}))rows.push(row);
+  if(!rows.length)return [];
+  var head=rows.shift().map(function(h){return h.trim().toLowerCase();});
+  return rows.map(function(r){var o={};head.forEach(function(h,j){o[h]=(r[j]||'').trim();});return o;});
+}
+function loadRecruit(){
+  $('listTitle').textContent='Agent & agency recruitment';$('list').textContent='Loading...';$('listMsg').textContent='';
+  Promise.all([api('/api/growth/bi/recruitment','GET'),api('/api/growth/recruit/campaigns','GET')]).then(function(r){
+    var d=r[0],camps=r[1],list=$('list');list.textContent='';var o=d.overall;
+    list.appendChild(biCards([['Prospects',o.prospects],['Contacted',o.contacted],['Interested',o.interested],['Applied',o.applied],['Approved',o.approved],['Subscribed',o.subscribed],['Lost',o.lost],['Prospect to subscriber %',o.prospect_to_subscribe_pct]]));
+    list.appendChild(biTable('By campaign',d.by_campaign,[['Campaign',function(x){return x.name+' ('+x.channel+')';}],['Prospects',function(x){return x.prospects;}],['Applied',function(x){return x.applied;}],['Subscribed',function(x){return x.subscribed;}],['Budget',function(x){return money(x.budget_ngn);}],['Cost / subscriber',function(x){return x.cost_per_subscriber_ngn==null?'n/a':money(x.cost_per_subscriber_ngn);}]]));
+    list.appendChild(biTable('By owner (SA / GHA)',d.by_owner,[['Owner',function(x){return x.key;}],['Prospects',function(x){return x.prospects;}],['Applied',function(x){return x.applied;}],['Subscribed',function(x){return x.subscribed;}],['To subscriber %',function(x){return x.prospect_to_subscribe_pct==null?'n/a':x.prospect_to_subscribe_pct;}]]));
+    list.appendChild(biTable('By state',d.by_state,[['State',function(x){return x.key;}],['Prospects',function(x){return x.prospects;}],['Subscribed',function(x){return x.subscribed;}]]));
+    list.appendChild(mk('h2',null,'Create campaign'));
+    var cn=mk('input');cn.placeholder='Campaign name';var cb=mk('input');cb.placeholder='Budget (NGN)';cb.type='number';
+    var cc=mk('select');['whatsapp','sms','email','social','field_visit','referral','event','other'].forEach(function(v){var op=mk('option',null,v);op.value=v;cc.appendChild(op);});
+    var cbtn=mk('button',null,'Create');var cmsg=mk('span','msg');
+    cbtn.onclick=function(){api('/api/growth/recruit/campaigns','POST',{name:cn.value,budget_ngn:cb.value||0,channel:cc.value}).then(function(){loadRecruit();}).catch(function(e){cmsg.className='msg err';cmsg.textContent=e.message;});};
+    [cn,cb,cc,cbtn,cmsg].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});
+    list.appendChild(mk('h2',null,'Import prospects (CSV)'));
+    list.appendChild(mk('div','msg','Header row required. Columns: name, phone, email, type (agent/agency), agency_name, state, city, notes. Phone or email needed per row. Max 300 rows. Only import contacts you are lawfully allowed to contact; opted-out people must not be re-imported.'));
+    var cs=mk('select');camps.forEach(function(c){var op=mk('option',null,c.name);op.value=c.id;cs.appendChild(op);});var none=mk('option',null,'(no campaign)');none.value='';cs.insertBefore(none,cs.firstChild);cs.value='';
+    var cons=mk('select');[['public_business_listing','Public business listing'],['prospect_requested','Prospect asked to hear from us'],['existing_relationship','Existing relationship'],['referred_by_agent','Referred by an agent']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];cons.appendChild(op);});
+    var ta=mk('textarea');ta.rows=6;ta.style.cssText='width:100%;box-sizing:border-box;margin:6px 0;font-family:monospace';ta.placeholder='name,phone,email,type,state,city\\nAda Obi,08031234567,ada@example.com,agent,Lagos,Ikeja';
+    var ib=mk('button',null,'Import');var im=mk('div','msg');
+    ib.onclick=function(){var rows=parseCsv(ta.value);if(!rows.length){im.className='msg err';im.textContent='Nothing to import';return;}
+      ib.disabled=true;im.className='msg';im.textContent='Importing '+rows.length+' rows...';
+      api('/api/growth/recruit/prospects/import','POST',{rows:rows,consent_basis:cons.value,campaign_id:cs.value||undefined}).then(function(x){im.className='msg ok';im.textContent='Inserted '+x.inserted+', already existed '+x.skipped_existing+', rejected '+x.rejected+(x.errors.length?': '+x.errors.slice(0,5).map(function(e){return 'row '+e.row+' '+e.error;}).join('; '):'');ta.value='';})
+      .catch(function(e){im.className='msg err';im.textContent=e.message;}).then(function(){ib.disabled=false;});};
+    [cs,cons].forEach(function(e){e.style.marginRight='6px';list.appendChild(e);});list.appendChild(ta);list.appendChild(ib);list.appendChild(im);
   }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
 
@@ -7262,6 +7311,7 @@ app.post('/api/auth/agent-register', async (req, res) => {
 
     console.log('Agent profile created successfully:', JSON.stringify(agentInsert[0]));
     growth.linkSignup(req.body.session_id, newUserId, { role: 'agent' });
+    recruit.linkProspect(newUserId, email, phone); // link a recruitment prospect with the same email/phone
     if (nin) await applyStoredNinVerification(newUserId, nin);
     if (cac) await applyStoredCacVerification(newUserId, cac);
 
