@@ -99,6 +99,7 @@ require('./growth/bi')(app, adminClient, {
 });
 const recruit = require('./growth/recruit')(app, adminClient, { isAgentSubActive });
 growthHooks.linkProspect = recruit.linkProspect;
+require('./growth/marketing')(app, adminClient);
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
@@ -6341,6 +6342,7 @@ button.sec{background:#666}
     <button id="tabCAC">CAC Verified Agencies</button>
     <button id="tabBI">Growth BI</button>
     <button id="tabREC">Recruitment</button>
+    <button id="tabMKT">Marketing</button>
     <button id="logout" class="sec" style="float:right">Log out</button>
     <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
   </div>
@@ -6363,17 +6365,19 @@ $('loginBtn').onclick = function(){
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
 $('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('filter').style.display=(m==='BI'||m==='REC')?'none':'';load();}
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('tabMKT').className=m==='MKT'?'active':'';$('filter').style.display=(m==='BI'||m==='REC'||m==='MKT')?'none':'';load();}
 $('tabSA').onclick=function(){setTab('SA');};
 $('tabGHA').onclick=function(){setTab('GHA');};
 $('tabNIN').onclick=function(){setTab('NIN');};
 $('tabCAC').onclick=function(){setTab('CAC');};
 $('tabBI').onclick=function(){setTab('BI');};
 $('tabREC').onclick=function(){setTab('REC');};
+$('tabMKT').onclick=function(){setTab('MKT');};
 $('filter').oninput=render;
 function load(){
   if(mode==='BI')return loadBi();
   if(mode==='REC')return loadRecruit();
+  if(mode==='MKT')return loadMkt();
   $('listTitle').textContent=mode==='SA'?'Service Agents':(mode==='GHA'?'GHAs':(mode==='CAC'?'Agencies (CAC)':'Agents with Prembly-verified NIN'));
   $('list').textContent='Loading...';$('listMsg').textContent='';
   var path=mode==='SA'?'/api/admin/all-sas':(mode==='GHA'?'/api/admin/all-ghas':(mode==='CAC'?'/api/admin/cac-verified-agencies':'/api/admin/nin-verified-agents'));
@@ -6458,6 +6462,51 @@ function loadRecruit(){
       api('/api/growth/recruit/prospects/import','POST',{rows:rows,consent_basis:cons.value,campaign_id:cs.value||undefined}).then(function(x){im.className='msg ok';im.textContent='Inserted '+x.inserted+', already existed '+x.skipped_existing+', rejected '+x.rejected+(x.errors.length?': '+x.errors.slice(0,5).map(function(e){return 'row '+e.row+' '+e.error;}).join('; '):'');ta.value='';})
       .catch(function(e){im.className='msg err';im.textContent=e.message;}).then(function(){ib.disabled=false;});};
     [cs,cons].forEach(function(e){e.style.marginRight='6px';list.appendChild(e);});list.appendChild(ta);list.appendChild(ib);list.appendChild(im);
+  }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
+}
+
+function loadMkt(){
+  $('listTitle').textContent='Marketing';$('list').textContent='Loading...';$('listMsg').textContent='';
+  Promise.all([api('/api/growth/marketing/performance','GET'),api('/api/growth/marketing/campaigns','GET'),api('/api/growth/marketing/content?limit=100','GET')]).then(function(r){
+    var perf=r[0].campaigns,camps=r[1],items=r[2],list=$('list');list.textContent='';
+    list.appendChild(biTable('Campaign performance (tracked links)',perf,[['Campaign',function(x){return x.name+' ['+x.utm_campaign+']';}],['Status',function(x){return x.status;}],['Sessions',function(x){return x.sessions;}],['Signups',function(x){return x.signups;}],['Leads',function(x){return x.leads;}],['Spend logged',function(x){return money(x.spend_logged_ngn);}],['Cost / signup',function(x){return x.cost_per_signup_ngn==null?'n/a':money(x.cost_per_signup_ngn);}],['Content',function(x){return x.content_published+'/'+x.content_total+' published';}]]));
+    list.appendChild(mk('div','msg',r[0].note));
+    list.appendChild(mk('h2',null,'New campaign'));
+    var cn=mk('input');cn.placeholder='Campaign name (e.g. Abuja rentals Dec)';var cu=mk('input');cu.placeholder='utm slug (optional)';var cb=mk('input');cb.placeholder='Budget NGN';cb.type='number';
+    var cg=mk('select');[['customer_acquisition','Customer acquisition'],['agent_recruitment','Agent recruitment'],['brand_awareness','Brand awareness']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];cg.appendChild(op);});
+    var cb2=mk('button',null,'Create');var cm=mk('span','msg');
+    cb2.onclick=function(){api('/api/growth/marketing/campaigns','POST',{name:cn.value,utm_campaign:cu.value||undefined,budget_ngn:cb.value||0,goal:cg.value}).then(loadMkt).catch(function(e){cm.className='msg err';cm.textContent=e.message;});};
+    [cn,cu,cb,cg,cb2,cm].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});
+    list.appendChild(mk('h2',null,'Generate copy with AI'));
+    list.appendChild(mk('div','msg','Uses only real listing facts for the chosen city. Everything is saved as a draft: review each claim before approving and posting.'));
+    var gk=mk('select');[['social_post','Social post'],['video_script','Video script'],['ad_copy','Ad copy'],['whatsapp_broadcast','WhatsApp broadcast'],['email','Email'],['seo_blurb','SEO blurb']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];gk.appendChild(op);});
+    var gp=mk('select');['instagram','facebook','x','tiktok','youtube','whatsapp','google_ads','email','website'].forEach(function(v){var op=mk('option',null,v);op.value=v;gp.appendChild(op);});
+    var gc=mk('input');gc.placeholder='City (e.g. Abuja)';
+    var gu=mk('select');[['','Any purpose'],['rent','Rent'],['sale','Sale'],['shortlet','Shortlet']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];gu.appendChild(op);});
+    var gs=mk('select');var gn=mk('option',null,'(no campaign)');gn.value='';gs.appendChild(gn);camps.forEach(function(c){var op=mk('option',null,c.name);op.value=c.id;gs.appendChild(op);});
+    var gt=mk('input');gt.placeholder='Topic or angle (optional)';gt.style.width='100%';gt.style.marginTop='6px';
+    var gb=mk('button',null,'Generate 3 drafts');var gm=mk('span','msg');
+    gb.onclick=function(){gb.disabled=true;gm.className='msg';gm.textContent=' generating...';
+      api('/api/growth/marketing/generate','POST',{kind:gk.value,platform:gp.value,city:gc.value||undefined,purpose:gu.value||undefined,campaign_id:gs.value||undefined,topic:gt.value||undefined,count:3,goal:'customer_acquisition'}).then(function(){loadMkt();}).catch(function(e){gm.className='msg err';gm.textContent=' '+e.message;gb.disabled=false;});};
+    [gk,gp,gc,gu,gs].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});list.appendChild(gt);list.appendChild(gb);list.appendChild(gm);
+    list.appendChild(mk('h2',null,'Content calendar'));
+    if(!items.length)list.appendChild(mk('div','msg','No content yet.'));
+    items.forEach(function(it){
+      var box=mk('div');box.style.cssText='border-top:1px solid #eee;padding:10px 0';
+      box.appendChild(mk('div',null,(it.title||it.kind)+'  |  '+it.kind+(it.platform?' / '+it.platform:'')+(it.generated_by==='ai'?'  |  AI draft':'')));
+      var ta=mk('textarea');ta.value=it.body+(it.hashtags?'\\n'+it.hashtags:'');ta.rows=5;ta.style.cssText='width:100%;box-sizing:border-box;margin:6px 0;font-family:inherit';box.appendChild(ta);
+      var st=mk('select');['idea','draft','approved','scheduled','published','rejected'].forEach(function(v){var op=mk('option',null,v);op.value=v;st.appendChild(op);});st.value=it.status;
+      var when=mk('input');when.type='datetime-local';when.style.cssText='width:auto;margin-left:6px';if(it.scheduled_for){var d=new Date(it.scheduled_for);var pad=function(n){return String(n).padStart(2,'0');};when.value=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());}
+      var url=mk('input');url.placeholder='Published URL';url.value=it.published_url||'';url.style.cssText='width:auto;margin-left:6px';
+      var save=mk('button',null,'Save');save.style.marginLeft='6px';var cp=mk('button','sec','Copy');cp.style.marginLeft='6px';var del=mk('button','sec','Delete');del.style.marginLeft='6px';var msg=mk('span','msg');
+      save.onclick=function(){var body={status:st.value,body:ta.value};if(when.value)body.scheduled_for=new Date(when.value).toISOString();if(url.value)body.published_url=url.value;
+        api('/api/growth/marketing/content/'+it.id,'PATCH',body).then(function(){msg.className='msg ok';msg.textContent=' saved';}).catch(function(e){msg.className='msg err';msg.textContent=' '+e.message;});};
+      cp.onclick=function(){ta.select();try{document.execCommand('copy');msg.className='msg ok';msg.textContent=' copied';}catch(e){}};
+      del.onclick=function(){if(confirm('Delete this item?'))api('/api/growth/marketing/content/'+it.id,'DELETE').then(loadMkt).catch(function(e){msg.className='msg err';msg.textContent=' '+e.message;});};
+      [st,when,url,save,cp,del,msg].forEach(function(e){box.appendChild(e);});
+      if(it.link_url){var lk=mk('div','msg','Tracked link: '+it.link_url);box.appendChild(lk);}
+      list.appendChild(box);
+    });
   }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
 
