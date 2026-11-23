@@ -15086,8 +15086,7 @@ async function upsertAiLead(conversation, requirements, conversationText, topPro
 }
 
 // Human handoff
-// Human handoff. Routes to the SA covering the location; if none is available, to a GHA assigned there;
-// otherwise to GetHome support. Returns the contact the customer should be shown (WhatsApp link).
+// Human handoff. Routes to the SA covering the location; if none is available, to GetHome Realestate's line. Returns the contact the customer should be shown (WhatsApp link).
 async function handleHumanHandoff(conversation, requirements, conversationText) {
   try {
     await adminClient.from('ai_conversations').update({ status: 'handed_off' }).eq('id', conversation.id);
@@ -15100,16 +15099,16 @@ async function handleHumanHandoff(conversation, requirements, conversationText) 
     var handoffMsg = 'Customer requested human assistance.\n\nConversation summary:\n' + conversationText.substring(0, 500);
     var title = '🤖 AI Handoff — Customer Needs Human Assistance';
 
-    if (contact.role === 'SA' || contact.role === 'GHA') {
+    if (contact.role === 'SA') {
       await adminClient.from('notifications').insert([{
         recipient_type: contact.role, recipient_id: contact.id, type: 'ai_handoff',
-        title: contact.role === 'GHA' ? title + ' (no SA available for this location)' : title,
+        title: title,
         message: handoffMsg, is_read: false,
       }]);
     } else {
       await adminClient.from('notifications').insert([{
         recipient_type: 'ADMIN', recipient_id: '00000000-0000-0000-0000-000000000000', type: 'ai_handoff',
-        title: '🤖 AI Handoff — No SA or GHA Found for Territory', message: handoffMsg, is_read: false,
+        title: '🤖 AI Handoff — No SA Found for Territory (customer sent to GetHome line)', message: handoffMsg, is_read: false,
       }]);
     }
     console.log('AI handoff triggered | routed to:', contact.role, contact.code || '');
