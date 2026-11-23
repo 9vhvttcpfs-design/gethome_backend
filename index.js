@@ -89,6 +89,11 @@ const serviceClient = process.env.SUPABASE_SERVICE_KEY
 const adminClient = serviceClient;
 // Growth Engine (lead capture, CRM, attribution). Additive; see growth/index.js
 const growth = require('./growth')(app, adminClient);
+// BI reuses the platform's own definitions (function declarations are hoisted)
+require('./growth/bi')(app, adminClient, {
+  getBillingMonth, isAgentSubActive, isAgentSubExpired,
+  getGhaSalarySettings, calcGhaSalary, getGhaAccompanyFee,
+});
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
@@ -6329,6 +6334,7 @@ button.sec{background:#666}
     <button id="tabGHA">GHAs</button>
     <button id="tabNIN">NIN Verified Agents</button>
     <button id="tabCAC">CAC Verified Agencies</button>
+    <button id="tabBI">Growth BI</button>
     <button id="logout" class="sec" style="float:right">Log out</button>
     <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
   </div>
@@ -6351,13 +6357,15 @@ $('loginBtn').onclick = function(){
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
 $('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';load();}
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('filter').style.display=m==='BI'?'none':'';load();}
 $('tabSA').onclick=function(){setTab('SA');};
 $('tabGHA').onclick=function(){setTab('GHA');};
 $('tabNIN').onclick=function(){setTab('NIN');};
 $('tabCAC').onclick=function(){setTab('CAC');};
+$('tabBI').onclick=function(){setTab('BI');};
 $('filter').oninput=render;
 function load(){
+  if(mode==='BI')return loadBi();
   $('listTitle').textContent=mode==='SA'?'Service Agents':(mode==='GHA'?'GHAs':(mode==='CAC'?'Agencies (CAC)':'Agents with Prembly-verified NIN'));
   $('list').textContent='Loading...';$('listMsg').textContent='';
   var path=mode==='SA'?'/api/admin/all-sas':(mode==='GHA'?'/api/admin/all-ghas':(mode==='CAC'?'/api/admin/cac-verified-agencies':'/api/admin/nin-verified-agents'));
@@ -6365,6 +6373,45 @@ function load(){
     items=Array.isArray(j)?j:(j.sas||j.ghas||j.agents||j.data||[]);render();
   }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
+function money(n){return 'NGN '+Math.round(Number(n)||0).toLocaleString('en-NG');}
+function biTable(title,rows,cols){
+  var box=mk('div');box.appendChild(mk('h2',null,title));
+  var wrap=mk('div');wrap.style.overflowX='auto';
+  var t=mk('table');t.style.cssText='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:14px';
+  var hr=mk('tr');cols.forEach(function(c){var th=mk('th',null,c[0]);th.style.cssText='text-align:left;padding:6px;border-bottom:2px solid #ddd;white-space:nowrap';hr.appendChild(th);});t.appendChild(hr);
+  rows.forEach(function(r){var tr=mk('tr');cols.forEach(function(c){var v=c[1](r);var td=mk('td',null,v==null?'':String(v));td.style.cssText='padding:6px;border-bottom:1px solid #eee;white-space:nowrap';tr.appendChild(td);});t.appendChild(tr);});
+  if(!rows.length){var e=mk('tr');var td=mk('td','msg','No data');td.colSpan=cols.length;e.appendChild(td);t.appendChild(e);}
+  wrap.appendChild(t);box.appendChild(wrap);return box;
+}
+function biCards(pairs){
+  var g=mk('div');g.style.cssText='display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:14px';
+  pairs.forEach(function(p){var c=mk('div');c.style.cssText='background:#f4f5f7;border-radius:8px;padding:10px';var v=mk('div',null,p[1]==null?'n/a':String(p[1]));v.style.cssText='font-size:18px;font-weight:600';c.appendChild(v);c.appendChild(mk('div','code',p[0]));g.appendChild(c);});
+  return g;
+}
+function loadBi(){
+  $('listTitle').textContent='Growth BI';$('list').textContent='Loading...';$('listMsg').textContent='';
+  var days=Number(window.biDays||30),to=new Date(),from=new Date(Date.now()-days*86400000);
+  var q='?from='+from.toISOString().slice(0,10)+'&to='+to.toISOString().slice(0,10);
+  Promise.all([api('/api/growth/bi/summary','GET'),api('/api/growth/bi/funnel'+q,'GET'),api('/api/growth/bi/revenue','GET'),api('/api/growth/bi/agents','GET'),api('/api/growth/bi/gha-performance','GET'),api('/api/growth/bi/leads'+q,'GET'),api('/api/growth/bi/marketing'+q,'GET')])
+  .then(function(r){
+    var s=r[0],f=r[1],rev=r[2],gh=r[4],ld=r[5],mk2=r[6],list=$('list');list.textContent='';
+    var bar=mk('div');[7,30,90].forEach(function(d){var b=mk('button',d===days?null:'sec',d+' days');b.style.marginRight='6px';b.onclick=function(){window.biDays=d;loadBi();};bar.appendChild(b);});list.appendChild(bar);
+    list.appendChild(mk('h2',null,'Overview'));
+    list.appendChild(biCards([['Customers',s.customers],['Agents',s.agents_total],['Agencies',s.agencies_total],['ID-verified',s.agents_id_verified],['Approved',s.agents_approved],['Paying',s.paying_agents],['Live listings',s.listings_live],['Featured',s.featured_listings],['Open leads',s.leads_open],['Revenue '+s.billing_month,money(s.subscription_revenue_this_month_ngn)]]));
+    list.appendChild(mk('h2',null,'Funnel (last '+days+' days)'));
+    var cf=f.customer_funnel,af=f.agent_funnel;
+    list.appendChild(biCards([['Visits',cf.visits],['Leads',cf.leads],['Attributed signups',cf.attributed_signups],['Visit to signup %',cf.visit_to_signup_pct],['Lead conversion %',cf.lead_conversion_pct],['Agent signups',af.signed_up],['Verified',af.id_verified],['Approved',af.approved],['Paying',af.paying],['Signup to paying %',af.signup_to_paying_pct]]));
+    list.appendChild(mk('div','msg',f.note));
+    list.appendChild(biTable('Revenue by month',rev.history,[['Month',function(x){return x.month;}],['Revenue',function(x){return money(x.revenue_ngn);}],['Payments',function(x){return x.payments;}]]));
+    list.appendChild(biTable('GHA performance - '+gh.month+' (salary '+money(gh.settings.salary)+', target '+gh.settings.target+', PPA '+money(gh.settings.ppa)+')',gh.ghas,[['GHA',function(x){return (x.name||'')+' '+(x.gha_code||'');}],['Referred',function(x){return x.referred_agents_total;}],['Subscribing',function(x){return x.subscribing_agents+'/'+x.monthly_target+(x.target_met?' met':'');}],['Sub revenue',function(x){return money(x.subscription_revenue_ngn);}],['Salary earned',function(x){return money(x.salary_earned_ngn);}],['Salary owed',function(x){return money(x.salary_owed_ngn);}],['Inspections',function(x){return x.accompanied_inspections;}],['Insp. fees',function(x){return money(x.inspection_fees_ngn);}]]));
+    list.appendChild(mk('div','msg','Totals: '+gh.totals.ghas_at_target+' of '+gh.totals.ghas+' GHAs at target, salary earned '+money(gh.totals.salary_earned_ngn)+', owed '+money(gh.totals.salary_owed_ngn)+', inspection fees '+money(gh.totals.inspection_fees_ngn)+'.'));
+    var src=Object.keys(mk2.by_utm_source).map(function(k){return {k:k,v:mk2.by_utm_source[k]};});
+    list.appendChild(biTable('Traffic sources',src,[['Source',function(x){return x.k;}],['Sessions',function(x){return x.v.sessions;}],['Signups',function(x){return x.v.signups;}]]));
+    list.appendChild(biCards([['Spend',money(mk2.total_spend_ngn)],['Cost per lead',mk2.cost_per_lead_ngn==null?'n/a':money(mk2.cost_per_lead_ngn)],['Cost per signup',mk2.cost_per_signup_ngn==null?'n/a':money(mk2.cost_per_signup_ngn)],['Leads',ld.total],['Overdue follow-ups',ld.overdue_follow_ups]]));
+    list.appendChild(mk('div','msg',mk2.note));
+  }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
+}
+
 function mk(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
 function downloadCsv(){
   var csvPath=mode==='CAC'?'/api/admin/cac-verified-agencies':'/api/admin/nin-verified-agents';
