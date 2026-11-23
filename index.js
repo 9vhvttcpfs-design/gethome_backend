@@ -99,6 +99,7 @@ require('./growth/bi')(app, adminClient, {
 });
 const recruit = require('./growth/recruit')(app, adminClient, { isAgentSubActive });
 growthHooks.linkProspect = recruit.linkProspect;
+const handoffRouting = require('./growth/handoff')(adminClient, formatWaNumber);
 require('./growth/marketing')(app, adminClient);
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
@@ -14984,8 +14985,9 @@ app.post('/api/ai/chat', async (req, res) => {
     }]);
 
     // Handle human handoff
+    var handoffContact = null;
     if (requirements.wants_human) {
-      await handleHumanHandoff(conversation, requirements, conversationText);
+      handoffContact = await handleHumanHandoff(conversation, requirements, conversationText);
     }
 
     // Save/update lead if customer has shared contact info or wants inspection
@@ -14999,6 +15001,8 @@ app.post('/api/ai/chat', async (req, res) => {
       is_alternative: isAlternative,
       conversation_id: conversation.id,
       wants_human: requirements.wants_human || false,
+      // Who the customer can WhatsApp right now (SA, else GHA, else GetHome). Only sent on a handoff.
+      contact: handoffContact ? { role: handoffContact.role, name: handoffContact.name, whatsapp: handoffContact.whatsapp, wa_link: handoffContact.wa_link } : null,
     });
   } catch(err) {
     console.error('AI chat error:', err.message);
@@ -15082,39 +15086,37 @@ async function upsertAiLead(conversation, requirements, conversationText, topPro
 }
 
 // Human handoff
+// Human handoff. Routes to the SA covering the location; if none is available, to a GHA assigned there;
+// otherwise to GetHome support. Returns the contact the customer should be shown (WhatsApp link).
 async function handleHumanHandoff(conversation, requirements, conversationText) {
   try {
     await adminClient.from('ai_conversations').update({ status: 'handed_off' }).eq('id', conversation.id);
 
-    var sa = null;
-    if (requirements.location || requirements.city) {
-      sa = await findSaByLocation(requirements.location || requirements.city);
-    }
+    var loc = requirements.location || requirements.city || '';
+    var summary = [requirements.bedrooms ? requirements.bedrooms + ' bedroom' : null, requirements.property_type,
+      requirements.purpose ? 'for ' + requirements.purpose : null, loc ? 'in ' + loc : null].filter(Boolean).join(' ');
+    var contact = await handoffRouting.resolveHandoffContact(loc, summary);
 
     var handoffMsg = 'Customer requested human assistance.\n\nConversation summary:\n' + conversationText.substring(0, 500);
+    var title = '🤖 AI Handoff — Customer Needs Human Assistance';
 
-    if (sa?.id) {
+    if (contact.role === 'SA' || contact.role === 'GHA') {
       await adminClient.from('notifications').insert([{
-        recipient_type: 'SA',
-        recipient_id: sa.id,
-        type: 'ai_handoff',
-        title: '🤖 AI Handoff — Customer Needs Human Assistance',
-        message: handoffMsg,
-        is_read: false,
+        recipient_type: contact.role, recipient_id: contact.id, type: 'ai_handoff',
+        title: contact.role === 'GHA' ? title + ' (no SA available for this location)' : title,
+        message: handoffMsg, is_read: false,
       }]);
     } else {
       await adminClient.from('notifications').insert([{
-        recipient_type: 'ADMIN',
-        recipient_id: '00000000-0000-0000-0000-000000000000',
-        type: 'ai_handoff',
-        title: '🤖 AI Handoff — No SA Found for Territory',
-        message: handoffMsg,
-        is_read: false,
+        recipient_type: 'ADMIN', recipient_id: '00000000-0000-0000-0000-000000000000', type: 'ai_handoff',
+        title: '🤖 AI Handoff — No SA or GHA Found for Territory', message: handoffMsg, is_read: false,
       }]);
     }
-    console.log('AI handoff triggered | sa:', sa?.sa_code || 'admin fallback');
+    console.log('AI handoff triggered | routed to:', contact.role, contact.code || '');
+    return contact;
   } catch(err) {
     console.error('Handoff error:', err.message);
+    return null;
   }
 }
 

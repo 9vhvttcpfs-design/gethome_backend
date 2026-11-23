@@ -23,4 +23,10 @@ function matchesCity(location, city) {
   return !!key && CITY_AREAS[key].some((a) => wordIn(loc, a));
 }
 
-module.exports = { CITY_AREAS, matchesCity };
+function cityOf(location) {
+  const names = Object.keys(CITY_AREAS);
+  for (let i = 0; i < names.length; i++) if (matchesCity(location, names[i])) return names[i];
+  return null;
+}
+
+module.exports = { CITY_AREAS, matchesCity, cityOf };
