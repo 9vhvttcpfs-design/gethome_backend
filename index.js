@@ -87,6 +87,8 @@ const serviceClient = process.env.SUPABASE_SERVICE_KEY
     })
   : supabase;
 const adminClient = serviceClient;
+// Growth Engine (lead capture, CRM, attribution). Additive; see growth/index.js
+const growth = require('./growth')(app, adminClient);
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
@@ -6992,7 +6994,10 @@ app.post('/api/auth/signup', async (req, res) => {
             referral_source: refGha ? 'gha_referral' : 'direct',
           }], { onConflict: 'id' });
         if (profileErr) console.error('Profile error (non-blocking):', profileErr.message);
-        else console.log('Customer profile created for:', userEmail);
+        else {
+          console.log('Customer profile created for:', userEmail);
+          growth.linkSignup(req.body.session_id, finalUserId, { role: 'customer' });
+        }
       })();
     }
     // Send welcome email - completely non-blocking, never affects response
@@ -7209,6 +7214,7 @@ app.post('/api/auth/agent-register', async (req, res) => {
     }
 
     console.log('Agent profile created successfully:', JSON.stringify(agentInsert[0]));
+    growth.linkSignup(req.body.session_id, newUserId, { role: 'agent' });
     if (nin) await applyStoredNinVerification(newUserId, nin);
     if (cac) await applyStoredCacVerification(newUserId, cac);
 
@@ -14914,6 +14920,7 @@ async function upsertAiLead(conversation, requirements, conversationText, topPro
     }
 
     console.log('AI lead saved/updated | sa:', sa?.sa_code || 'none', '| agent:', agentId || 'none');
+    growth.syncAiLead(conversation.id); // mirror into gx_leads CRM; never throws
   } catch(err) {
     console.error('Upsert AI lead error:', err.message);
   }
