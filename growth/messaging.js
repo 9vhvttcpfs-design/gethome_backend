@@ -232,10 +232,16 @@ module.exports = function mountMessaging(app, db, deps) {
       const qs = new URLSearchParams({ utm_source: 'recruit', utm_medium: step.channel, utm_campaign: slug(c.name) });
       if (ghaCode) qs.set('ref', ghaCode);
       const link = SITE + '/?' + qs.toString();
-      const out = await AI.personalize({ prospect: p, contact: ct, template: tpl, settings, link, generate: deps.aiGenerate });
+      let out;
+      if (step.channel === 'whatsapp') {
+        // WhatsApp marketing goes out as a Meta-approved template with positional variables; never AI-rewritten.
+        if (tpl.wa_status !== 'approved') continue;   // wait until Meta approves the template
+        const vars = AI.mergeVars(p, ct, settings, link);
+        out = { subject: null, body: AI.merge(tpl.body, vars), generated_by: 'template', facts: AI.factsFor(p, ct), provider: 'template', ai_rejected: null, wa_variables: (tpl.variables || []).map((k) => vars[k] || '') };
+      } else out = await AI.personalize({ prospect: p, contact: ct, template: tpl, settings, link, generate: deps.aiGenerate });
       const { error } = await db.from('gx_messages').insert([{
         prospect_id: p.id, contact_id: ct ? ct.id : null, campaign_id: c.id, enrollment_id: en.id, step: en.current_step, channel: step.channel, template_id: tpl.id,
-        subject: out.subject, body: out.body, generated_by: out.generated_by, personalization: { facts: out.facts, provider: out.provider, ai_rejected: out.ai_rejected }, consent_basis: gate.basis,
+        subject: out.subject, body: out.body, generated_by: out.generated_by, personalization: { facts: out.facts, provider: out.provider, ai_rejected: out.ai_rejected, wa_variables: out.wa_variables }, consent_basis: gate.basis,
         status: c.approval_required ? 'pending_approval' : 'approved', scheduled_for: en.next_send_at, created_by: 'campaign',
       }]);
       if (!error) prepared++;

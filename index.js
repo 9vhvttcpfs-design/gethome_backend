@@ -106,6 +106,8 @@ require('./growth/marketing')(app, adminClient);
 require('./growth/outreachAdmin')(app, adminClient);
 require('./growth/discovery')(app, adminClient);
 require('./growth/messaging')(app, adminClient);
+require('./growth/whatsapp')(app, adminClient);
+require('./growth/analytics')(app, adminClient, { isAgentSubActive, calcGhaSalary, getGhaSalarySettings, getBillingMonth });
 console.log('adminClient using service key:', !!process.env.SUPABASE_SERVICE_KEY);
 console.log('Admin client initialized:', process.env.SUPABASE_SERVICE_KEY ? 'SERVICE KEY' : 'ANON KEY FALLBACK');
 const BUCKET_NAME = process.env.SUPABASE_STORAGE_BUCKET || 'property-media';
