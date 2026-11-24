@@ -23,6 +23,7 @@ const SETTING_RULES = {
   email_sender_name: (v) => typeof v === 'string' && v.trim().length >= 2 && v.length <= 60,
   reply_to_email: (v) => D.normEmail(v) !== null,
   retention_days_unengaged: (v) => Number.isInteger(v) && v >= 30 && v <= 3650,
+  outreach_whatsapp_number: (v) => D.normPhone(v) !== null,
   ai_provider: (v) => ['template', 'anthropic', 'openai_compatible'].includes(v),
   email_provider: (v) => ['resend', 'smtp'].includes(v),
   send_spacing_ms: (v) => Number.isInteger(v) && v >= 0 && v <= 5000,

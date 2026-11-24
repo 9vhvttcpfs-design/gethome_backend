@@ -3,6 +3,8 @@
 // Swap in an API sender for those channels later by extending sendMessage().
 'use strict';
 const { signToken, readToken } = require('./optout');
+const C = require('./consent');
+const Dd = require('./dedupe');
 const { limiter } = require('../middleware/security');
 
 const SITE = 'https://trygethome.online';
@@ -33,6 +35,8 @@ function buildMessage(p, channel, template, ctx) {
       'You can register here: ' + link, '',
       'If you have any questions, just reply to this message.'].join('\n');
   }
+  const wa = Dd.normPhone(ctx.waNumber);
+  if (wa) body += '\n\nYou can also message us on WhatsApp: https://wa.me/' + wa;
   const subject = template === 'followup' ? 'Following up: list your properties on GetHome' : 'Invitation to list your properties on GetHome';
   return { subject, text: body, link };
 }
@@ -94,7 +98,8 @@ module.exports = function mountOutreach(ctx) {
       let ghaCode = null, campaignName = null;
       if (p.owner_type === 'GHA' && p.owner_id) { const { data: g } = await db.from('gha_agents').select('gha_code').eq('id', p.owner_id).maybeSingle(); ghaCode = g && g.gha_code; }
       if (p.campaign_id) { const { data: c } = await db.from('gx_recruit_campaigns').select('name').eq('id', p.campaign_id).maybeSingle(); campaignName = c && c.name; }
-      const msg = buildMessage(p, channel, template, { ghaCode, campaignName });
+      const outSettings = await C.getSettings(db);
+      const msg = buildMessage(p, channel, template, { ghaCode, campaignName, waNumber: outSettings.outreach_whatsapp_number });
 
       const { data: row, error: insErr } = await db.from('gx_outreach').insert([{
         prospect_id: p.id, channel, template, subject: channel === 'email' ? msg.subject : null,

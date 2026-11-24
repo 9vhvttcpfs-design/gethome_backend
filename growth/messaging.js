@@ -316,7 +316,8 @@ module.exports = function mountMessaging(app, db, deps) {
 
   // ---------- the send queue ----------
   function emailFooter(settings, unsub) {
-    return '\n\n--\n' + (settings.email_sender_name || 'GetHome') + ', GetHome Realestate Ltd (trygethome.online)\nYou are receiving this because your business contact details are publicly listed or you asked to hear from us. To stop receiving messages from us, use this link: ' + unsub;
+    const wa = D.normPhone(settings.outreach_whatsapp_number);
+    return '\n\n--\n' + (settings.email_sender_name || 'GetHome') + ', GetHome Realestate Ltd (trygethome.online)' + (wa ? '\nWhatsApp: https://wa.me/' + wa : '') + '\nYou are receiving this because your business contact details are publicly listed or you asked to hear from us. To stop receiving messages from us, use this link: ' + unsub;
   }
   const baseUrl = (req) => (process.env.API_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || (req.protocol + '://' + req.get('host'))).replace(/\/$/, '');
 
@@ -347,7 +348,7 @@ module.exports = function mountMessaging(app, db, deps) {
       }
       const unsub = baseUrl(req) + '/api/growth/opt-out/' + signToken(p.id);
       const text = m.body + emailFooter(settings, unsub);
-      const html = '<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#374151;line-height:1.6">' + Mail.esc(m.body).replace(/\n/g, '<br>') + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0"><p style="color:#94a3b8;font-size:12px">' + Mail.esc(settings.email_sender_name || 'GetHome') + ', GetHome Realestate Ltd (trygethome.online)<br>You are receiving this because your business contact details are publicly listed or you asked to hear from us. <a href="' + Mail.esc(unsub) + '">Stop receiving messages from us</a>.</p></div>';
+      const html = '<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#374151;line-height:1.6">' + Mail.esc(m.body).replace(/\n/g, '<br>') + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0"><p style="color:#94a3b8;font-size:12px">' + Mail.esc(settings.email_sender_name || 'GetHome') + ', GetHome Realestate Ltd (trygethome.online)<br>' + (D.normPhone(settings.outreach_whatsapp_number) ? 'WhatsApp: <a href="https://wa.me/' + D.normPhone(settings.outreach_whatsapp_number) + '">+' + D.normPhone(settings.outreach_whatsapp_number) + '</a><br>' : '') + 'You are receiving this because your business contact details are publicly listed or you asked to hear from us. <a href="' + Mail.esc(unsub) + '">Stop receiving messages from us</a>.</p></div>';
       await db.from('gx_messages').update({ status: 'sending', attempts: (m.attempts || 0) + 1 }).eq('id', m.id);
       try {
         const r = await sendEmailFn({ from: Mail.fromAddress(settings.email_sender_name), to: ct.value, subject: m.subject, text, html, replyTo: settings.reply_to_email, headers: { 'List-Unsubscribe': '<' + unsub + '>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } });

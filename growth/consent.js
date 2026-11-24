@@ -10,7 +10,7 @@
 const DEFAULTS = {
   li_b2b_email_enabled: false, max_email_attempts: 2, max_whatsapp_attempts: 2,
   daily_discovery_limit: 300, daily_email_limit: 100,
-  email_sender_name: 'GetHome', ai_provider: 'template', email_provider: 'resend', send_spacing_ms: 700, daily_whatsapp_limit: 50, reply_to_email: 'gethome.realest@gmail.com', retention_days_unengaged: 365,
+  email_sender_name: 'GetHome', ai_provider: 'template', email_provider: 'resend', send_spacing_ms: 700, daily_whatsapp_limit: 50, reply_to_email: 'gethome.realest@gmail.com', outreach_whatsapp_number: '09077246534', retention_days_unengaged: 365,
 };
 
 async function getSettings(db) {
