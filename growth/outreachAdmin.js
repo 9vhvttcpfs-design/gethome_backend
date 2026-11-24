@@ -383,6 +383,33 @@ module.exports = function mountOutreachAdmin(app, db) {
     res.json({ settings: s, legitimate_interest_acknowledgement: (ack && ack.value) || null });
   });
 
+  // Plain-language setup checklist for the "Start Here" tab. Reports only whether each variable is SET, never its value.
+  router.get('/outreach/readiness', read, async (req, res) => {
+    try {
+      const E = process.env, has = (k) => !!E[k];
+      const count = async (table, f) => { try { let q = db.from(table).select('id', { count: 'exact', head: true }); if (f) q = f(q); const { count: c } = await q; return c || 0; } catch (e) { return null; } };
+      const s = await C.getSettings(db);
+      const items = [
+        { key: 'email', title: 'Email sending (Resend)', ok: has('RESEND_API_KEY') && has('OUTREACH_FROM_EMAIL'), needed_for: 'Sending invitation emails to agents and agencies.', how: 'On Render add RESEND_API_KEY and OUTREACH_FROM_EMAIL (an address on a domain you verified in Resend, e.g. outreach@mail.trygethome.online).', missing: ['RESEND_API_KEY', 'OUTREACH_FROM_EMAIL'].filter((k) => !has(k)) },
+        { key: 'email_tracking', title: 'Email delivery tracking (Resend webhook)', ok: has('RESEND_WEBHOOK_SECRET'), needed_for: 'Knowing which emails were delivered, bounced or marked as spam.', how: 'In Resend > Webhooks add the URL ' + (E.API_PUBLIC_URL || E.RENDER_EXTERNAL_URL || 'https://<your-render-url>') + '/api/growth/webhooks/resend, then put its signing secret in RESEND_WEBHOOK_SECRET.', missing: has('RESEND_WEBHOOK_SECRET') ? [] : ['RESEND_WEBHOOK_SECRET'] },
+        { key: 'unsubscribe', title: 'Unsubscribe links', ok: has('API_PUBLIC_URL') || has('RENDER_EXTERNAL_URL'), needed_for: 'Every email must carry a working unsubscribe link (required by law).', how: 'Set API_PUBLIC_URL to your Render URL.', missing: (has('API_PUBLIC_URL') || has('RENDER_EXTERNAL_URL')) ? [] : ['API_PUBLIC_URL'] },
+        { key: 'whatsapp', title: 'WhatsApp (Meta Cloud API)', ok: has('WA_PHONE_NUMBER_ID') && has('WA_ACCESS_TOKEN'), optional: true, needed_for: 'Sending approved WhatsApp templates to people who opted in. Without it you can still copy messages and send by hand.', how: 'Meta Business > WhatsApp > API setup. Add WA_PHONE_NUMBER_ID, WA_ACCESS_TOKEN, WA_BUSINESS_ACCOUNT_ID, WA_APP_SECRET and WA_VERIFY_TOKEN.', missing: ['WA_PHONE_NUMBER_ID', 'WA_ACCESS_TOKEN'].filter((k) => !has(k)) },
+        { key: 'ai', title: 'AI message writer', ok: has('ANTHROPIC_API_KEY') || has('LOCAL_AI_URL'), optional: true, needed_for: 'Slightly personalised openings. Without it, plain templates are used and everything still works.', how: 'ANTHROPIC_API_KEY is already used by the AI chat; nothing more to do if that works.', missing: [] },
+        { key: 'sms', title: 'SMS (Termii)', ok: has('TERMII_API_KEY'), optional: true, needed_for: 'Payment and booking confirmation SMS to customers. It is NOT used by outreach to agents.', how: 'Add TERMII_API_KEY and TERMII_SENDER_ID (sender ID must be approved by Termii). Note: the confirmation SMS code currently passes the customer email instead of a phone number, so no SMS can arrive until a phone field is saved at checkout.', missing: has('TERMII_API_KEY') ? [] : ['TERMII_API_KEY'] },
+      ];
+      const [prospects, contactable, campaigns, active, toReview, replies, suppressed] = await Promise.all([
+        count('gx_prospects'), count('gx_prospects', (q) => q.in('stage', ['qualified', 'permission_obtained', 'campaign_ready'])),
+        count('gx_recruit_campaigns'), count('gx_recruit_campaigns', (q) => q.eq('status', 'active')),
+        count('gx_messages', (q) => q.eq('status', 'pending_approval')), count('gx_replies', (q) => q.eq('needs_human', true).eq('handled', false)), count('gx_suppressions'),
+      ]);
+      res.json({
+        items, settings: { legitimate_interest_email: !!(s && s.li_b2b_email_enabled), approval_required: true },
+        counts: { prospects, ready_to_contact: contactable, campaigns, active_campaigns: active, messages_to_review: toReview, replies_waiting: replies, suppressed },
+        required_ok: items.filter((i) => !i.optional).every((i) => i.ok),
+      });
+    } catch (e) { console.error('readiness error:', e.message); res.status(500).json({ error: 'Could not build checklist.' }); }
+  });
+
   router.patch('/outreach/settings', manage, async (req, res) => {
     try {
       const b = req.body || {}, changed = {};
