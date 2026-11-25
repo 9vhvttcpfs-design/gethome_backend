@@ -74,6 +74,15 @@ module.exports = function mountMarketing(app, db) {
       if (b.status !== undefined) { if (!CAMPAIGN_STATUSES.includes(b.status)) return res.status(400).json({ error: 'Invalid status' }); upd.status = b.status; }
       if (b.budget_ngn !== undefined) { const n = Number(b.budget_ngn); if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'Invalid budget' }); upd.budget_ngn = n; }
       if (b.notes !== undefined) upd.notes = clip(b.notes, 1000);
+      // utm_campaign is deliberately not editable: links already posted carry it.
+      if (b.name !== undefined) { const v = clip(b.name, 120); if (!v) return res.status(400).json({ error: 'name cannot be empty' }); upd.name = v; }
+      if (b.goal !== undefined) { if (!GOALS.includes(b.goal)) return res.status(400).json({ error: 'Invalid goal' }); upd.goal = b.goal; }
+      for (const k of ['channel', 'state', 'city']) if (b[k] !== undefined) upd[k] = clip(b[k], k === 'channel' ? 30 : 60);
+      for (const k of ['start_date', 'end_date']) {
+        if (b[k] === undefined) continue;
+        if (!b[k]) { upd[k] = null; continue; }
+        const d = new Date(b[k]); if (isNaN(d)) return res.status(400).json({ error: k + ' invalid' }); upd[k] = d.toISOString().slice(0, 10);
+      }
       if (!Object.keys(upd).length) return res.status(400).json({ error: 'Nothing to update' });
       const { error } = await db.from('gx_campaigns').update(upd).eq('id', req.params.id);
       if (error) return res.status(500).json({ error: error.message });

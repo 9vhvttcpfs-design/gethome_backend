@@ -270,6 +270,20 @@ module.exports = function mountGrowth(app, db, hooks) {
       res.json(data);
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
+  app.patch('/api/growth/spend/:id', auth.requireAdmin, async (req, res) => {
+    try {
+      if (!isUuid(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
+      const b = req.body || {}, upd = {};
+      if (b.amount_ngn !== undefined) { const n = Number(b.amount_ngn); if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'amount_ngn must be a non-negative number' }); upd.amount_ngn = n; }
+      if (b.spend_date !== undefined) { const d = new Date(b.spend_date); if (isNaN(d)) return res.status(400).json({ error: 'spend_date invalid' }); upd.spend_date = d.toISOString().slice(0, 10); }
+      if (b.channel !== undefined) { const c = clip(b.channel, 40); if (!c) return res.status(400).json({ error: 'channel required' }); upd.channel = c; }
+      if (b.notes !== undefined) upd.notes = clip(b.notes, 500);
+      if (!Object.keys(upd).length) return res.status(400).json({ error: 'Nothing to update' });
+      const { error } = await db.from('gx_spend').update(upd).eq('id', req.params.id);
+      if (error) return res.status(500).json({ error: error.message });
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
   app.delete('/api/growth/spend/:id', auth.requireAdmin, async (req, res) => {
     if (!isUuid(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
     const { error } = await db.from('gx_spend').delete().eq('id', req.params.id);

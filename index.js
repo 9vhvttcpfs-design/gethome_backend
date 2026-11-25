@@ -6475,8 +6475,8 @@ function loadRecruit(){
 
 function loadMkt(){
   $('listTitle').textContent='Marketing';$('list').textContent='Loading...';$('listMsg').textContent='';
-  Promise.all([api('/api/growth/marketing/performance','GET'),api('/api/growth/marketing/campaigns','GET'),api('/api/growth/marketing/content?limit=100','GET')]).then(function(r){
-    var perf=r[0].campaigns,camps=r[1],items=r[2],list=$('list');list.textContent='';
+  Promise.all([api('/api/growth/marketing/performance','GET'),api('/api/growth/marketing/campaigns','GET'),api('/api/growth/marketing/content?limit=100','GET'),api('/api/growth/spend','GET')]).then(function(r){
+    var perf=r[0].campaigns,camps=r[1],items=r[2],spendRows=r[3]||[],list=$('list');list.textContent='';
     list.appendChild(biTable('Campaign performance (tracked links)',perf,[['Campaign',function(x){return x.name+' ['+x.utm_campaign+']';}],['Status',function(x){return x.status;}],['Sessions',function(x){return x.sessions;}],['Signups',function(x){return x.signups;}],['Leads',function(x){return x.leads;}],['Spend logged',function(x){return money(x.spend_logged_ngn);}],['Cost / signup',function(x){return x.cost_per_signup_ngn==null?'n/a':money(x.cost_per_signup_ngn);}],['Content',function(x){return x.content_published+'/'+x.content_total+' published';}]]));
     list.appendChild(mk('div','msg',r[0].note));
     list.appendChild(mk('h2',null,'New campaign'));
@@ -6485,6 +6485,54 @@ function loadMkt(){
     var cb2=mk('button',null,'Create');var cm=mk('span','msg');
     cb2.onclick=function(){api('/api/growth/marketing/campaigns','POST',{name:cn.value,utm_campaign:cu.value||undefined,budget_ngn:cb.value||0,goal:cg.value}).then(loadMkt).catch(function(e){cm.className='msg err';cm.textContent=e.message;});};
     [cn,cu,cb,cg,cb2,cm].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});
+    if(camps.length){
+      list.appendChild(mk('div','msg','Edit a campaign. The utm slug cannot change, because links you already posted use it.'));
+      camps.forEach(function(c){
+        var row=mk('div');row.style.cssText='border-top:1px solid #eee;padding:6px 0';
+        var kn=mk('input');kn.value=c.name||'';kn.style.cssText='width:180px;margin-right:6px';
+        var kg=mk('select');[['customer_acquisition','Customer acquisition'],['agent_recruitment','Agent recruitment'],['brand_awareness','Brand awareness']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];kg.appendChild(op);});kg.value=c.goal;kg.style.marginRight='6px';
+        var ks=mk('select');['draft','active','paused','completed'].forEach(function(v){var op=mk('option',null,v);op.value=v;ks.appendChild(op);});ks.value=c.status;ks.style.marginRight='6px';
+        var kb=mk('input');kb.type='number';kb.min='0';kb.value=c.budget_ngn||0;kb.style.cssText='width:110px;margin-right:6px';
+        var kc=mk('input');kc.value=c.city||'';kc.placeholder='City';kc.style.cssText='width:100px;margin-right:6px';
+        var kt=mk('input');kt.value=c.notes||'';kt.placeholder='Notes';kt.style.cssText='width:160px;margin-right:6px';
+        var ksv=mk('button',null,'Save');ksv.style.marginRight='6px';var kmg=mk('span','msg');
+        ksv.onclick=function(){api('/api/growth/marketing/campaigns/'+c.id,'PATCH',{name:kn.value,goal:kg.value,status:ks.value,budget_ngn:kb.value||0,city:kc.value,notes:kt.value}).then(function(){loadMkt();}).catch(function(e){kmg.className='msg err';kmg.textContent=' '+e.message;});};
+        row.appendChild(mk('span',null,'['+c.utm_campaign+'] '));
+        [kn,kg,ks,kb,kc,kt,ksv,kmg].forEach(function(e){row.appendChild(e);});
+        list.appendChild(row);
+      });
+    }
+    list.appendChild(mk('h2',null,'Log spend'));
+    list.appendChild(mk('div','msg','Record money spent on a campaign (ads, boosts, influencers). This powers Cost / signup in the table above.'));
+    var sc=mk('select');var so=mk('option',null,'(choose campaign)');so.value='';sc.appendChild(so);camps.forEach(function(c){var op=mk('option',null,c.name);op.value=c.utm_campaign;sc.appendChild(op);});
+    var sch=mk('select');['instagram','facebook','x','tiktok','youtube','whatsapp','google_ads','email','website','other'].forEach(function(v){var op=mk('option',null,v);op.value=v;sch.appendChild(op);});
+    var sa=mk('input');sa.type='number';sa.min='0';sa.placeholder='Amount NGN';
+    var sd=mk('input');sd.type='date';sd.value=new Date().toISOString().slice(0,10);
+    var sn=mk('input');sn.placeholder='Note (optional)';
+    var sb=mk('button',null,'Log spend');var sm=mk('span','msg');
+    sb.onclick=function(){
+      if(!sc.value){sm.className='msg err';sm.textContent=' choose a campaign';return;}
+      if(!(Number(sa.value)>0)){sm.className='msg err';sm.textContent=' enter an amount';return;}
+      var cp0=camps.filter(function(c){return c.utm_campaign===sc.value;})[0];
+      sb.disabled=true;
+      api('/api/growth/spend','POST',{channel:sch.value,campaign_name:cp0?cp0.name:null,utm_campaign:sc.value,amount_ngn:sa.value,spend_date:sd.value,notes:sn.value||undefined}).then(function(){loadMkt();}).catch(function(e){sm.className='msg err';sm.textContent=' '+e.message;sb.disabled=false;});};
+    [sc,sch,sa,sd,sn,sb,sm].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});
+    if(spendRows.length){
+      list.appendChild(mk('div','msg','Logged spend (latest 30). Edit and Save, or Delete a wrong entry.'));
+      spendRows.slice(0,30).forEach(function(s){
+        var row=mk('div');row.style.cssText='border-top:1px solid #eee;padding:6px 0';
+        row.appendChild(mk('span',null,(s.campaign_name||s.utm_campaign||'(no campaign)')+'  |  '));
+        var ech=mk('input');ech.value=s.channel||'';ech.style.cssText='width:110px;margin-right:6px';
+        var eam=mk('input');eam.type='number';eam.min='0';eam.value=s.amount_ngn;eam.style.cssText='width:120px;margin-right:6px';
+        var edt=mk('input');edt.type='date';edt.value=String(s.spend_date||'').slice(0,10);edt.style.cssText='width:auto;margin-right:6px';
+        var eno=mk('input');eno.value=s.notes||'';eno.placeholder='Note';eno.style.cssText='width:160px;margin-right:6px';
+        var esv=mk('button',null,'Save');esv.style.marginRight='6px';var edl=mk('button','sec','Delete');edl.style.marginRight='6px';var emg=mk('span','msg');
+        esv.onclick=function(){api('/api/growth/spend/'+s.id,'PATCH',{channel:ech.value,amount_ngn:eam.value,spend_date:edt.value,notes:eno.value}).then(function(){loadMkt();}).catch(function(e){emg.className='msg err';emg.textContent=' '+e.message;});};
+        edl.onclick=function(){if(confirm('Delete this spend entry?'))api('/api/growth/spend/'+s.id,'DELETE').then(function(){loadMkt();}).catch(function(e){emg.className='msg err';emg.textContent=' '+e.message;});};
+        [ech,eam,edt,eno,esv,edl,emg].forEach(function(e){row.appendChild(e);});
+        list.appendChild(row);
+      });
+    }
     list.appendChild(mk('h2',null,'Generate copy with AI'));
     list.appendChild(mk('div','msg','Uses only real listing facts for the chosen city. Everything is saved as a draft: review each claim before approving and posting.'));
     var gk=mk('select');[['social_post','Social post'],['video_script','Video script'],['ad_copy','Ad copy'],['whatsapp_broadcast','WhatsApp broadcast'],['email','Email'],['seo_blurb','SEO blurb']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];gk.appendChild(op);});
