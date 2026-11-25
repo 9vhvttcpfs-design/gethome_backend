@@ -6503,12 +6503,45 @@ function loadRecruit(){
   }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
 }
 
+function uploadMedia(file){
+  var fd=new FormData();fd.append('file',file);
+  return fetch('/api/growth/marketing/media',{method:'POST',headers:{'Authorization':'Bearer '+token},body:fd}).then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error(j.error||'Upload failed');return j;});});
+}
+function shareItem(it,text,msg){
+  if(!it.media_url){if(navigator.share){navigator.share({text:text}).catch(function(){});}else{msg.className='msg err';msg.textContent=' sharing needs a phone browser; use Copy';}return;}
+  msg.className='msg';msg.textContent=' preparing...';
+  fetch(it.media_url).then(function(r){return r.blob();}).then(function(blob){
+    var ext=it.media_type==='video'?'mp4':'jpg';var file=new File([blob],'gethome.'+ext,{type:blob.type||(it.media_type==='video'?'video/mp4':'image/jpeg')});
+    if(navigator.canShare&&navigator.canShare({files:[file]})){msg.textContent='';return navigator.share({files:[file],text:text});}
+    msg.className='msg err';msg.textContent=' this browser cannot share files directly. Use Download, then post from the app.';
+  }).catch(function(e){if(e&&e.name==='AbortError'){msg.textContent='';return;}msg.className='msg err';msg.textContent=' could not prepare the file. Use Download instead.';});
+}
+function insightsView(box,d){
+  box.textContent='';
+  box.appendChild(mk('div','msg','Posts analysed: '+d.posts_analysed+'. '+d.scoring));
+  if(d.note)box.appendChild(mk('div','msg err',d.note));
+  var a=d.advice;
+  function list2(title,arr){if(!arr||!arr.length)return;box.appendChild(mk('h2',null,title));arr.forEach(function(t){box.appendChild(mk('div',null,'- '+(typeof t==='string'?t:JSON.stringify(t))));});}
+  if(a){box.appendChild(mk('h2',null,'Summary'));box.appendChild(mk('div',null,a.summary||''));list2('What worked',a.what_worked);list2('What did not',a.what_did_not);list2('Why (hypotheses)',a.why);list2('Do next',a.do_next);
+    if(a.ideas){[['customer_acquisition','Ideas to win customers'],['agent_recruitment','Ideas to win agents']].forEach(function(g){var arr=a.ideas[g[0]];if(!arr||!arr.length)return;box.appendChild(mk('h2',null,g[1]));arr.forEach(function(i){box.appendChild(mk('div',null,'- ['+(i.platform||'')+' / '+(i.format||'')+'] Hook: '+(i.hook||'')+' | '+(i.idea||'')));});});}}
+  var g=d.groups||{};
+  Object.keys(g).forEach(function(k){if(!g[k].length)return;box.appendChild(mk('h2',null,k.replace(/_/g,' ')));g[k].forEach(function(r){box.appendChild(mk('div',null,r.label+': average score '+r.avg_score+' over '+r.posts+' post(s)'));});});
+  function posts(title,arr){if(!arr||!arr.length)return;box.appendChild(mk('h2',null,title));arr.forEach(function(p){box.appendChild(mk('div',null,'['+(p.platform||'?')+' / '+p.media+'] score '+p.score+' | '+JSON.stringify(p.metrics)+' | '+(p.title||'')+' '+(p.url||'')));});}
+  posts('Best posts',d.top);posts('Weakest posts',d.bottom);
+}
 function loadMkt(){
   $('listTitle').textContent='Marketing';$('list').textContent='Loading...';$('listMsg').textContent='';
   Promise.all([api('/api/growth/marketing/performance','GET'),api('/api/growth/marketing/campaigns','GET'),api('/api/growth/marketing/content?limit=100','GET'),api('/api/growth/spend','GET')]).then(function(r){
     var perf=r[0].campaigns,camps=r[1],items=r[2],spendRows=r[3]||[],list=$('list');list.textContent='';
     list.appendChild(biTable('Campaign performance (tracked links)',perf,[['Campaign',function(x){return x.name+' ['+x.utm_campaign+']';}],['Status',function(x){return x.status;}],['Sessions',function(x){return x.sessions;}],['Signups',function(x){return x.signups;}],['Leads',function(x){return x.leads;}],['Spend logged',function(x){return money(x.spend_logged_ngn);}],['Cost / signup',function(x){return x.cost_per_signup_ngn==null?'n/a':money(x.cost_per_signup_ngn);}],['Content',function(x){return x.content_published+'/'+x.content_total+' published';}]]));
     list.appendChild(mk('div','msg',r[0].note));
+    list.appendChild(mk('h2',null,'Insights and advice'));
+    list.appendChild(mk('div','msg','Ranks your published posts by how people reacted, explains likely reasons, and suggests what to make next. Enter the numbers for each post below (Save numbers) first: the more posts with numbers, the better the advice.'));
+    var ig=mk('select');[['','Both goals'],['customer_acquisition','Customer acquisition'],['agent_recruitment','Agent outreach']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];ig.appendChild(op);});ig.style.marginRight='6px';
+    var id2=mk('select');[['30','Last 30 days'],['90','Last 90 days'],['365','Last year']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];id2.appendChild(op);});id2.value='90';id2.style.marginRight='6px';
+    var ib=mk('button',null,'Analyse my posts');var ibox=mk('div');
+    ib.onclick=function(){ib.disabled=true;ibox.textContent='Analysing...';api('/api/growth/marketing/insights?days='+id2.value+(ig.value?'&goal='+ig.value:''),'GET').then(function(d){ib.disabled=false;insightsView(ibox,d);}).catch(function(e){ib.disabled=false;ibox.textContent=e.message;});};
+    [ig,id2,ib].forEach(function(e){e.style.marginBottom='6px';list.appendChild(e);});list.appendChild(ibox);
     list.appendChild(mk('h2',null,'New campaign'));
     var cn=mk('input');cn.placeholder='Campaign name (e.g. Abuja rentals Dec)';var cu=mk('input');cu.placeholder='utm slug (optional)';var cb=mk('input');cb.placeholder='Budget NGN';cb.type='number';
     var cg=mk('select');[['customer_acquisition','Customer acquisition'],['agent_recruitment','Agent recruitment'],['brand_awareness','Brand awareness']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];cg.appendChild(op);});
@@ -6570,11 +6603,27 @@ function loadMkt(){
     var gc=mk('input');gc.placeholder='City (e.g. Abuja)';
     var gu=mk('select');[['','Any purpose'],['rent','Rent'],['sale','Sale'],['shortlet','Shortlet']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];gu.appendChild(op);});
     var gs=mk('select');var gn=mk('option',null,'(no campaign)');gn.value='';gs.appendChild(gn);camps.forEach(function(c){var op=mk('option',null,c.name);op.value=c.id;gs.appendChild(op);});
+    var gg=mk('select');[['customer_acquisition','For customers'],['agent_recruitment','For agents / agencies']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];gg.appendChild(op);});
     var gt=mk('input');gt.placeholder='Topic or angle (optional)';gt.style.width='100%';gt.style.marginTop='6px';
     var gb=mk('button',null,'Generate 3 drafts');var gm=mk('span','msg');
     gb.onclick=function(){gb.disabled=true;gm.className='msg';gm.textContent=' generating...';
-      api('/api/growth/marketing/generate','POST',{kind:gk.value,platform:gp.value,city:gc.value||undefined,purpose:gu.value||undefined,campaign_id:gs.value||undefined,topic:gt.value||undefined,count:3,goal:'customer_acquisition'}).then(function(){loadMkt();}).catch(function(e){gm.className='msg err';gm.textContent=' '+e.message;gb.disabled=false;});};
-    [gk,gp,gc,gu,gs].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});list.appendChild(gt);list.appendChild(gb);list.appendChild(gm);
+      api('/api/growth/marketing/generate','POST',{kind:gk.value,platform:gp.value,city:gc.value||undefined,purpose:gu.value||undefined,campaign_id:gs.value||undefined,topic:gt.value||undefined,count:3,goal:gg.value}).then(function(){loadMkt();}).catch(function(e){gm.className='msg err';gm.textContent=' '+e.message;gb.disabled=false;});};
+    [gk,gp,gc,gu,gs,gg].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});list.appendChild(gt);list.appendChild(gb);list.appendChild(gm);
+    list.appendChild(mk('h2',null,'Create a post with a photo or video'));
+    list.appendChild(mk('div','msg','Upload a photo (JPG, PNG, WEBP) or video (MP4, MOV, up to 50 MB), write the caption, and save. Then use Share / post on the post below to send it to Facebook, Instagram or TikTok.'));
+    var pf=mk('input');pf.type='file';pf.accept='image/jpeg,image/png,image/webp,video/mp4,video/quicktime';pf.style.cssText='width:100%;margin-bottom:6px';
+    var pc=mk('textarea');pc.rows=4;pc.placeholder='Caption';pc.style.cssText='width:100%;box-sizing:border-box;margin-bottom:6px;font-family:inherit';
+    var ph=mk('input');ph.placeholder='Hashtags (optional)';ph.style.cssText='width:100%;margin-bottom:6px';
+    var pp=mk('select');['instagram','facebook','tiktok','x','youtube','whatsapp'].forEach(function(v){var op=mk('option',null,v);op.value=v;pp.appendChild(op);});
+    var pg=mk('select');[['customer_acquisition','For customers'],['agent_recruitment','For agents / agencies']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];pg.appendChild(op);});
+    var pcs=mk('select');var pco=mk('option',null,'(no campaign)');pco.value='';pcs.appendChild(pco);camps.forEach(function(c){var op=mk('option',null,c.name);op.value=c.id;pcs.appendChild(op);});
+    var pb=mk('button',null,'Save post');var pm=mk('span','msg');
+    pb.onclick=function(){
+      if(!pc.value.trim()){pm.className='msg err';pm.textContent=' write a caption';return;}
+      pb.disabled=true;pm.className='msg';pm.textContent=' uploading...';
+      var up=pf.files&&pf.files[0]?uploadMedia(pf.files[0]):Promise.resolve(null);
+      up.then(function(m){return api('/api/growth/marketing/content','POST',{kind:'social_post',platform:pp.value,goal:pg.value,campaign_id:pcs.value||undefined,body:pc.value,hashtags:ph.value||undefined,media_url:m?m.url:undefined,media_type:m?m.media_type:undefined});}).then(function(){loadMkt();}).catch(function(e){pb.disabled=false;pm.className='msg err';pm.textContent=' '+e.message;});};
+    list.appendChild(pf);list.appendChild(pc);list.appendChild(ph);[pp,pg,pcs,pb,pm].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});
     list.appendChild(mk('h2',null,'Content calendar'));
     if(!items.length)list.appendChild(mk('div','msg','No content yet.'));
     items.forEach(function(it){
@@ -6591,6 +6640,23 @@ function loadMkt(){
       del.onclick=function(){if(confirm('Delete this item?'))api('/api/growth/marketing/content/'+it.id,'DELETE').then(loadMkt).catch(function(e){msg.className='msg err';msg.textContent=' '+e.message;});};
       [st,when,url,save,cp,del,msg].forEach(function(e){box.appendChild(e);});
       if(it.link_url){var lk=mk('div','msg','Tracked link: '+it.link_url);box.appendChild(lk);}
+      var gl=(it.context&&it.context.goal)==='agent_recruitment'?'agents':'customers';
+      box.appendChild(mk('div','msg','For '+gl+(it.media_url?' | has '+it.media_type:' | no photo/video')));
+      if(it.media_url){var pv=it.media_type==='video'?mk('video'):mk('img');pv.src=it.media_url;if(it.media_type==='video'){pv.controls=true;}pv.style.cssText='max-width:260px;max-height:200px;display:block;margin:6px 0;border-radius:6px';box.appendChild(pv);}
+      var row2=mk('div');row2.style.margin='6px 0';
+      var sh=mk('button',null,'Share / post');var shm=mk('span','msg');
+      sh.onclick=function(){shareItem(it,ta.value,shm);};row2.appendChild(sh);
+      if(it.media_url){var dl=mk('a');dl.href=it.media_url;dl.target='_blank';dl.rel='noopener';dl.textContent='Download / open file';dl.style.cssText='margin-left:10px;font-size:13px';row2.appendChild(dl);}
+      [['Facebook','https://www.facebook.com/'],['Instagram','https://www.instagram.com/'],['TikTok','https://www.tiktok.com/upload']].forEach(function(p){var a2=mk('a');a2.href=p[1];a2.target='_blank';a2.rel='noopener';a2.textContent='Open '+p[0];a2.style.cssText='margin-left:10px;font-size:13px';row2.appendChild(a2);});
+      row2.appendChild(shm);box.appendChild(row2);
+      var att=mk('input');att.type='file';att.accept='image/jpeg,image/png,image/webp,video/mp4,video/quicktime';att.style.cssText='width:auto;margin-top:4px';
+      var attm=mk('span','msg');att.onchange=function(){if(!att.files||!att.files[0])return;attm.className='msg';attm.textContent=' uploading...';uploadMedia(att.files[0]).then(function(m){return api('/api/growth/marketing/content/'+it.id,'PATCH',{media_url:m.url,media_type:m.media_type});}).then(function(){loadMkt();}).catch(function(e){attm.className='msg err';attm.textContent=' '+e.message;});};
+      box.appendChild(mk('div','msg',it.media_url?'Replace photo/video:':'Attach photo/video:'));box.appendChild(att);box.appendChild(attm);
+      var mt=it.metrics||{};var mrow=mk('div');mrow.style.marginTop='6px';mrow.appendChild(mk('div','msg','Numbers after posting (from the platform insights; leave blank if unknown):'));
+      var mf={};[['reach','Reach'],['views','Views'],['likes','Likes'],['comments','Comments'],['shares','Shares'],['saves','Saves'],['clicks','Link clicks']].forEach(function(k){var inp=mk('input');inp.type='number';inp.min='0';inp.placeholder=k[1];inp.title=k[1];inp.value=mt[k[0]]!=null?mt[k[0]]:'';inp.style.cssText='width:90px;margin:0 6px 6px 0';mf[k[0]]=inp;mrow.appendChild(inp);});
+      var msv=mk('button',null,'Save numbers');var msm=mk('span','msg');msv.style.marginLeft='4px';
+      msv.onclick=function(){var o={};Object.keys(mf).forEach(function(k){if(mf[k].value!=='')o[k]=mf[k].value;});api('/api/growth/marketing/content/'+it.id,'PATCH',{metrics:o}).then(function(){msm.className='msg ok';msm.textContent=' saved';}).catch(function(e){msm.className='msg err';msm.textContent=' '+e.message;});};
+      mrow.appendChild(msv);mrow.appendChild(msm);box.appendChild(mrow);
       list.appendChild(box);
     });
   }).catch(function(e){$('list').textContent='';$('listMsg').className='msg err';$('listMsg').textContent=e.message;});
