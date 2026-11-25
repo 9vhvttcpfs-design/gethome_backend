@@ -6351,6 +6351,7 @@ button.sec{background:#666}
     <button id="tabBI">Growth BI</button>
     <button id="tabREC">Recruitment</button>
     <button id="tabMKT">Marketing</button>
+    <button id="tabBULK">Bulk Email</button>
     <button id="logout" class="sec" style="float:right">Log out</button>
     <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
   </div>
@@ -6373,7 +6374,7 @@ $('loginBtn').onclick = function(){
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
 $('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('tabMKT').className=m==='MKT'?'active':'';$('filter').style.display=(m==='BI'||m==='REC'||m==='MKT')?'none':'';load();}
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('tabMKT').className=m==='MKT'?'active':'';$('tabBULK').className=m==='BULK'?'active':'';$('filter').style.display=(m==='BI'||m==='REC'||m==='MKT'||m==='BULK')?'none':'';load();}
 $('tabSA').onclick=function(){setTab('SA');};
 $('tabGHA').onclick=function(){setTab('GHA');};
 $('tabNIN').onclick=function(){setTab('NIN');};
@@ -6381,8 +6382,37 @@ $('tabCAC').onclick=function(){setTab('CAC');};
 $('tabBI').onclick=function(){setTab('BI');};
 $('tabREC').onclick=function(){setTab('REC');};
 $('tabMKT').onclick=function(){setTab('MKT');};
+$('tabBULK').onclick=function(){setTab('BULK');};
 $('filter').oninput=render;
+function loadBulk(){
+  $('listTitle').textContent='Bulk Email';$('listMsg').textContent='';var list=$('list');list.textContent='';
+  list.appendChild(mk('div','msg','Sends one email to many prospects at once. Anyone marked do-not-contact, unsubscribed, bounced or already registered is skipped automatically. Use {{contact_name}} for the greeting: it becomes the recipient name, or Sir/Madam when no name is recorded. Other placeholders: {{business_name}}, {{city}}, {{state}}, {{link}}, {{sender_name}}.'));
+  var sj=mk('input');sj.placeholder='Subject';sj.style.width='100%';
+  var bd=mk('textarea');bd.rows=10;bd.style.cssText='width:100%;box-sizing:border-box;margin:6px 0;font-family:inherit';
+  bd.value='Hello {{contact_name}},\\n\\nI am writing from {{sender_name}}. GetHome is a Nigerian property marketplace that connects property seekers with verified agents and agencies. We are inviting agents{{in_location}} to list their properties on the platform.\\n\\nYou can see how it works and register here: {{link}}\\n\\nIf you have questions, just reply to this email.\\n\\nKind regards,\\n{{sender_name}}';
+  var im=mk('input');im.placeholder='Optional image link (https://...)';im.style.cssText='width:100%;margin-bottom:6px';
+  var st=mk('input');st.placeholder='State (optional, e.g. Lagos)';st.style.marginRight='6px';
+  var lm=mk('input');lm.type='number';lm.min='1';lm.max='200';lm.value='100';lm.style.cssText='width:90px;margin-right:6px';
+  var go=mk('button',null,'Send to matching prospects');var msg=mk('div','msg');msg.style.whiteSpace='pre-wrap';
+  go.onclick=function(){
+    if(!sj.value||!bd.value){msg.className='msg err';msg.textContent='Subject and message are required.';return;}
+    if(!confirm('Send this email to up to '+lm.value+' matching prospects now?'))return;
+    go.disabled=true;msg.className='msg';msg.textContent='Sending, this can take up to a minute...';
+    api('/api/growth/outreach/bulk-send','POST',{subject:sj.value,body:bd.value,image_url:im.value||undefined,state:st.value||undefined,limit:Number(lm.value)||100}).then(function(r){
+      go.disabled=false;msg.className='msg ok';
+      msg.textContent='Matched '+r.matched+', queued '+r.queued+(r.sending?', sent '+r.sending.sent+', failed '+r.sending.failed+(r.sending.stopped_reason?' (stopped: '+r.sending.stopped_reason+')':''):'')+'\\nSkipped: '+JSON.stringify(r.skipped)+'\\n'+r.note;
+    }).catch(function(e){go.disabled=false;msg.className='msg err';msg.textContent=e.message;});};
+  list.appendChild(sj);list.appendChild(bd);list.appendChild(im);list.appendChild(st);list.appendChild(lm);list.appendChild(go);list.appendChild(msg);
+  list.appendChild(mk('h2',null,'Logo shown at the top of every email'));
+  list.appendChild(mk('div','msg','Paste a public https link to your logo image (for example one uploaded to your website or Supabase Storage). Leave empty for no logo.'));
+  var lg=mk('input');lg.placeholder='https://trygethome.online/logo.png';lg.style.cssText='width:70%;margin-right:6px';
+  var lb=mk('button',null,'Save logo');var lmsg=mk('span','msg');
+  api('/api/growth/outreach/settings','GET').then(function(r){lg.value=(r.settings&&r.settings.email_logo_url)||'';}).catch(function(){});
+  lb.onclick=function(){api('/api/growth/outreach/settings','PATCH',{email_logo_url:lg.value.trim()}).then(function(){lmsg.className='msg ok';lmsg.textContent=' saved';}).catch(function(e){lmsg.className='msg err';lmsg.textContent=' '+e.message;});};
+  list.appendChild(lg);list.appendChild(lb);list.appendChild(lmsg);
+}
 function load(){
+  if(mode==='BULK')return loadBulk();
   if(mode==='BI')return loadBi();
   if(mode==='REC')return loadRecruit();
   if(mode==='MKT')return loadMkt();

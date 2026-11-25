@@ -39,7 +39,7 @@ function mergeVars(prospect, contact, settings, link) {
   const contactName = (contact && contact.label) || prospect.contact_person || null;
   const where = [prospect.city, prospect.state].filter(Boolean).join(', ');
   return {
-    contact_name: contactName || 'there', business_name: prospect.name || 'your business', city: prospect.city || '', state: prospect.state || '',
+    contact_name: contactName || 'Sir/Madam', business_name: prospect.name || 'your business', city: prospect.city || '', state: prospect.state || '',
     in_location: where ? ' in ' + where : '', link, sender_name: (settings && settings.email_sender_name) || 'GetHome',
   };
 }

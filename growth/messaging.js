@@ -286,6 +286,11 @@ module.exports = function mountMessaging(app, db, deps) {
     const upd = { status: 'approved', approved_by: actorOf(req), approved_at: now().toISOString() };
     if (edits && edits.body !== undefined) { const b = clip(edits.body, 8000); if (!b) return { ok: false, error: 'Body cannot be empty' }; upd.body = b; upd.generated_by = 'human'; }
     if (edits && edits.subject !== undefined) { upd.subject = clip(edits.subject, 200); }
+    if (edits && edits.image_url !== undefined) {
+      const u = edits.image_url ? Mail.httpsUrl(String(edits.image_url)) : null;
+      if (edits.image_url && !u) return { ok: false, error: 'image_url must be a public https:// link' };
+      upd.personalization = Object.assign({}, m.personalization || {}, { image_url: u });
+    }
     await db.from('gx_messages').update(upd).eq('id', id);
     return { ok: true };
   }
@@ -348,7 +353,10 @@ module.exports = function mountMessaging(app, db, deps) {
       }
       const unsub = baseUrl(req) + '/api/growth/opt-out/' + signToken(p.id);
       const text = m.body + emailFooter(settings, unsub);
-      const html = '<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#374151;line-height:1.6">' + Mail.esc(m.body).replace(/\n/g, '<br>') + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0"><p style="color:#94a3b8;font-size:12px">' + Mail.esc(settings.email_sender_name || 'GetHome') + ', GetHome Realestate Ltd (trygethome.online)<br>' + (D.normPhone(settings.outreach_whatsapp_number) ? 'WhatsApp: <a href="https://wa.me/' + D.normPhone(settings.outreach_whatsapp_number) + '">+' + D.normPhone(settings.outreach_whatsapp_number) + '</a><br>' : '') + 'You are receiving this because your business contact details are publicly listed or you asked to hear from us. <a href="' + Mail.esc(unsub) + '">Stop receiving messages from us</a>.</p></div>';
+      const html = Mail.wrapHtml({
+        body: m.body, logoUrl: settings.email_logo_url, imageUrl: m.personalization && m.personalization.image_url,
+        footerHtml: Mail.esc(settings.email_sender_name || 'GetHome') + ', GetHome Realestate Ltd (trygethome.online)<br>' + (D.normPhone(settings.outreach_whatsapp_number) ? 'WhatsApp: <a href="https://wa.me/' + D.normPhone(settings.outreach_whatsapp_number) + '">+' + D.normPhone(settings.outreach_whatsapp_number) + '</a><br>' : '') + 'You are receiving this because your business contact details are publicly listed or you asked to hear from us. <a href="' + Mail.esc(unsub) + '">Stop receiving messages from us</a>.',
+      });
       await db.from('gx_messages').update({ status: 'sending', attempts: (m.attempts || 0) + 1 }).eq('id', m.id);
       try {
         const r = await sendEmailFn({ from: Mail.fromAddress(settings.email_sender_name), to: ct.value, subject: m.subject, text, html, replyTo: settings.reply_to_email, headers: { 'List-Unsubscribe': '<' + unsub + '>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } });
@@ -393,6 +401,57 @@ module.exports = function mountMessaging(app, db, deps) {
       await audit(req, 'cycle.run', 'queue', null, { prepared, stopped, sent });
       res.json({ prepared, sequences_stopped: stopped, sending: sent });
     } catch (e) { fail(res, e, 'cycle'); }
+  });
+
+  // ---------- bulk email ----------
+  // One subject + body (with {{contact_name}} etc.) to many prospects at once. Each recipient is checked against the
+  // do-not-contact gate, gets their own greeting ("Hello Ben," or "Hello Sir/Madam," when no name is recorded), and the
+  // optional image_url is shown in the email. Messages are queued as approved and sent in the same request, up to the
+  // per-request and daily limits; anything left over goes out the next time Run cycle / Process queue is used.
+  router.post('/outreach/bulk-send', manage, limiter(60 * 1000, 6), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const subject = clip(b.subject, 200), body = clip(b.body, 5000);
+      if (!subject || !body) return res.status(400).json({ error: 'subject and body are required' });
+      let imageUrl = null;
+      if (b.image_url) { imageUrl = Mail.httpsUrl(String(b.image_url)); if (!imageUrl) return res.status(400).json({ error: 'image_url must be a public https:// link' }); }
+      const settings = await C.getSettings(db);
+      const cap = Math.min(Math.max(parseInt(b.limit) || 100, 1), 200);
+      let prospects = [];
+      if (Array.isArray(b.prospect_ids) && b.prospect_ids.length) {
+        const { data } = await db.from('gx_prospects').select('*').in('id', b.prospect_ids.filter(isUuid).slice(0, cap)); prospects = data || [];
+      } else {
+        let q = db.from('gx_prospects').select('*').eq('do_not_contact', false).in('stage', ['new', 'qualified', 'permission_obtained', 'campaign_ready', 'contacted']).order('discovered_at', { ascending: true }).limit(cap);
+        if (clip(b.state, 60)) q = q.ilike('state', String(b.state).replace(/[^\w ]/g, ''));
+        if (clip(b.category, 40)) q = q.eq('category', String(b.category));
+        const { data } = await q; prospects = data || [];
+      }
+      const since = new Date(now().getTime() - 72 * 3600000).toISOString();
+      const skipped = {}; let queued = 0; const skip = (r) => { skipped[r] = (skipped[r] || 0) + 1; };
+      const campaignTag = slug(clip(b.campaign_tag, 40) || 'bulk_email');
+      for (const p of prospects) {
+        const { data: contacts } = await db.from('gx_prospect_contacts').select('*').eq('prospect_id', p.id).eq('channel', 'email');
+        const pool = (contacts || []).sort((a, c2) => (c2.is_primary ? 1 : 0) - (a.is_primary ? 1 : 0));
+        let ct = null, why = pool.length ? null : 'no_email';
+        for (const x of pool) { const g = await C.evaluateSend(db, p, x, 'email', settings); if (g.ok) { ct = x; break; } why = g.reason; }
+        if (!ct) { skip(why); continue; }
+        const { data: recent } = await db.from('gx_messages').select('id').eq('prospect_id', p.id).eq('channel', 'email').in('status', ['approved', 'sending', 'sent', 'delivered']).gte('created_at', since).limit(1);
+        if (recent && recent.length) { skip('emailed_recently'); continue; }
+        let ghaCode = null;
+        if (p.owner_type === 'GHA' && p.owner_id) { const { data: g } = await db.from('gha_agents').select('gha_code').eq('id', p.owner_id).maybeSingle(); ghaCode = g && g.gha_code; }
+        const qs = new URLSearchParams({ utm_source: 'recruit', utm_medium: 'email', utm_campaign: campaignTag }); if (ghaCode) qs.set('ref', ghaCode);
+        const vars = AI.mergeVars(p, ct, settings, SITE + '/?' + qs.toString());
+        const { error } = await db.from('gx_messages').insert([{
+          prospect_id: p.id, contact_id: ct.id, campaign_id: null, step: 1, channel: 'email', subject: AI.merge(subject, vars), body: AI.merge(body, vars),
+          generated_by: 'human', personalization: { image_url: imageUrl, bulk: true }, consent_basis: 'b2b_unsubscribe_link',
+          status: 'approved', approved_by: actorOf(req), approved_at: now().toISOString(), scheduled_for: now().toISOString(), created_by: 'bulk_send',
+        }]);
+        if (error) skip('error'); else queued++;
+      }
+      const sending = queued ? await processQueue(req, { max: 50, budgetMs: 40000 }) : null;
+      await audit(req, 'bulk.send', 'queue', null, { queued, skipped, sent: sending && sending.sent });
+      res.json({ matched: prospects.length, queued, skipped, sending, note: 'Anything not yet sent stays approved and goes out on the next Run cycle / Process queue, within your daily email limit.' });
+    } catch (e) { fail(res, e, 'bulk-send'); }
   });
 
   // ---------- replies ----------

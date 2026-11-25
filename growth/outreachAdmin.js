@@ -24,6 +24,7 @@ const SETTING_RULES = {
   reply_to_email: (v) => D.normEmail(v) !== null,
   retention_days_unengaged: (v) => Number.isInteger(v) && v >= 30 && v <= 3650,
   outreach_whatsapp_number: (v) => D.normPhone(v) !== null,
+  email_logo_url: (v) => v === '' || (typeof v === 'string' && /^https:\/\/[^\s"'<>]{4,500}$/.test(v)),
   ai_provider: (v) => ['template', 'anthropic', 'openai_compatible'].includes(v),
   email_provider: (v) => ['resend', 'smtp'].includes(v),
   send_spacing_ms: (v) => Number.isInteger(v) && v >= 0 && v <= 5000,
@@ -72,7 +73,7 @@ module.exports = function mountOutreachAdmin(app, db) {
     if (p.email_permission === 'granted') return 'consent';
     if (p.email_permission === 'withdrawn' || p.do_not_contact) return 'none';
     const hasEmail = (contacts || []).some((c) => c.channel === 'email' && c.verification_status !== 'invalid' && c.verification_status !== 'bounced');
-    return settings.li_b2b_email_enabled && hasEmail && (p.source_url || (contacts || []).some((c) => c.source_url)) ? 'legitimate_interest' : 'none';
+    return hasEmail ? 'allowed' : 'none';
   }
 
   // ---- Prospects: list ----

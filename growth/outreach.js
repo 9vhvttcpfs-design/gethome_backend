@@ -20,7 +20,7 @@ function buildMessage(p, channel, template, ctx) {
   if (ctx.ghaCode) params.set('ref', ctx.ghaCode);
   const link = SITE + '/?' + params.toString();
   const who = p.type === 'agency' ? 'agencies' : 'agents';
-  const hello = 'Hello ' + (p.name || (p.type === 'agency' ? (p.agency_name || 'there') : 'there')) + ',';
+  const hello = 'Hello ' + (p.name || (p.type === 'agency' ? (p.agency_name || 'Sir/Madam') : 'Sir/Madam')) + ',';
   const where = p.city || p.state ? ' in ' + [p.city, p.state].filter(Boolean).join(', ') : '';
   let body;
   if (template === 'followup') {
@@ -55,7 +55,7 @@ async function sendEmail(to, subject, text, unsubUrl) {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        from: 'GetHome <' + (process.env.SMTP_FROM || 'noreply@trygethome.online') + '>',
+        from: require('./email').fromAddress('GetHome'),
         to: [to], subject, text: textFull, html,
         headers: { 'List-Unsubscribe': '<' + unsubUrl + '>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' },
       }),

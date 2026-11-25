@@ -1,8 +1,7 @@
 // The single gate every sender must pass before a message to a prospect is queued or sent.
 // Rules (from the approved policy):
 //  - suppressed, opted-out, bounced/invalid, already-registered and lost prospects are never contacted;
-//  - email: explicit consent if recorded; otherwise one B2B first-contact basis, "legitimate interest",
-//    which only works when an admin has switched it on after the assessment is signed off;
+//  - email: allowed unless the prospect is opted out / suppressed / bounced / withdrawn (no consent record needed);
 //  - WhatsApp: explicit opt-in only (Meta policy), never legitimate interest;
 //  - stop after the configured number of unanswered attempts (default 2) and when a reply awaits a human.
 'use strict';
@@ -10,7 +9,7 @@
 const DEFAULTS = {
   li_b2b_email_enabled: false, max_email_attempts: 2, max_whatsapp_attempts: 2,
   daily_discovery_limit: 300, daily_email_limit: 100,
-  email_sender_name: 'GetHome', ai_provider: 'template', email_provider: 'resend', send_spacing_ms: 700, daily_whatsapp_limit: 50, reply_to_email: 'gethome.realest@gmail.com', outreach_whatsapp_number: '09077246534', retention_days_unengaged: 365,
+  email_sender_name: 'GetHome', ai_provider: 'template', email_provider: 'resend', send_spacing_ms: 700, daily_whatsapp_limit: 50, reply_to_email: 'gethome.realest@gmail.com', outreach_whatsapp_number: '09130649368', email_logo_url: '', retention_days_unengaged: 365,
 };
 
 async function getSettings(db) {
@@ -59,10 +58,9 @@ async function evaluateSend(db, prospect, contact, channel, settings) {
   if (c && c.event === 'granted') return { ok: true, basis: c.basis, reason: null };
 
   if (channel === 'whatsapp') return no('whatsapp_requires_opt_in');
-  // Email with no explicit consent: B2B legitimate interest, only when enabled and the contact's origin is recorded.
-  if (!s.li_b2b_email_enabled) return no('legitimate_interest_not_enabled');
-  if (!(contact.source_url || prospect.source_url)) return no('source_not_recorded');
-  return { ok: true, basis: 'legitimate_interest_b2b', reason: null };
+  // Promotional email needs no recorded consent: it is allowed unless the prospect opted out, is suppressed,
+  // bounced, or has withdrawn (all checked above). Every email still carries a working unsubscribe link.
+  return { ok: true, basis: 'b2b_unsubscribe_link', reason: null };
 }
 
 // Appends a consent event and refreshes the prospect's denormalised permission + pipeline stage.

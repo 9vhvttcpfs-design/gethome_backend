@@ -38,4 +38,17 @@ async function send(provider, message, fetchImpl) {
   return provider === 'smtp' ? sendSmtp(message) : sendResend(message, fetchImpl);
 }
 
-module.exports = { send, configured, fromAddress, esc };
+const httpsUrl = (u) => (typeof u === 'string' && /^https:\/\/[^\s"'<>]{4,500}$/.test(u.trim()) ? u.trim() : null);
+
+// Shared HTML wrapper. logoUrl (optional, top, small) and imageUrl (optional, below the logo, full width) must be public https URLs;
+// anything else is ignored. footerHtml is trusted markup built by the caller.
+function wrapHtml({ body, footerHtml, logoUrl, imageUrl }) {
+  const logo = httpsUrl(logoUrl), img = httpsUrl(imageUrl);
+  return '<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#374151;line-height:1.6">' +
+    (logo ? '<p style="margin:0 0 16px"><img src="' + esc(logo) + '" alt="GetHome" style="max-height:48px;max-width:200px;border:0"></p>' : '') +
+    (img ? '<p style="margin:0 0 16px"><img src="' + esc(img) + '" alt="" style="max-width:100%;height:auto;border:0;border-radius:6px"></p>' : '') +
+    esc(body).replace(/\n/g, '<br>') +
+    '<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0"><p style="color:#94a3b8;font-size:12px">' + footerHtml + '</p></div>';
+}
+
+module.exports = { send, configured, fromAddress, esc, wrapHtml, httpsUrl };
