@@ -6390,26 +6390,48 @@ function loadBulk(){
   var sj=mk('input');sj.placeholder='Subject';sj.style.width='100%';
   var bd=mk('textarea');bd.rows=10;bd.style.cssText='width:100%;box-sizing:border-box;margin:6px 0;font-family:inherit';
   bd.value='Hello {{contact_name}},\\n\\nI am writing from {{sender_name}}. GetHome is a Nigerian property marketplace that connects property seekers with verified agents and agencies. We are inviting agents{{in_location}} to list their properties on the platform.\\n\\nYou can see how it works and register here: {{link}}\\n\\nIf you have questions, just reply to this email.\\n\\nKind regards,\\n{{sender_name}}';
-  var im=mk('input');im.placeholder='Optional image link (https://...)';im.style.cssText='width:100%;margin-bottom:6px';
+  var imgUrl='';var go;
+  var im=imagePicker(function(u){imgUrl=u;},function(busy){go.disabled=busy;});
   var st=mk('input');st.placeholder='State (optional, e.g. Lagos)';st.style.marginRight='6px';
   var lm=mk('input');lm.type='number';lm.min='1';lm.max='200';lm.value='100';lm.style.cssText='width:90px;margin-right:6px';
-  var go=mk('button',null,'Send to matching prospects');var msg=mk('div','msg');msg.style.whiteSpace='pre-wrap';
+  go=mk('button',null,'Send to matching prospects');var msg=mk('div','msg');msg.style.whiteSpace='pre-wrap';
   go.onclick=function(){
     if(!sj.value||!bd.value){msg.className='msg err';msg.textContent='Subject and message are required.';return;}
     if(!confirm('Send this email to up to '+lm.value+' matching prospects now?'))return;
     go.disabled=true;msg.className='msg';msg.textContent='Sending, this can take up to a minute...';
-    api('/api/growth/outreach/bulk-send','POST',{subject:sj.value,body:bd.value,image_url:im.value||undefined,state:st.value||undefined,limit:Number(lm.value)||100}).then(function(r){
+    api('/api/growth/outreach/bulk-send','POST',{subject:sj.value,body:bd.value,image_url:imgUrl||undefined,state:st.value||undefined,limit:Number(lm.value)||100}).then(function(r){
       go.disabled=false;msg.className='msg ok';
       msg.textContent='Matched '+r.matched+', queued '+r.queued+(r.sending?', sent '+r.sending.sent+', failed '+r.sending.failed+(r.sending.stopped_reason?' (stopped: '+r.sending.stopped_reason+')':''):'')+'\\nSkipped: '+JSON.stringify(r.skipped)+'\\n'+r.note;
     }).catch(function(e){go.disabled=false;msg.className='msg err';msg.textContent=e.message;});};
-  list.appendChild(sj);list.appendChild(bd);list.appendChild(im);list.appendChild(st);list.appendChild(lm);list.appendChild(go);list.appendChild(msg);
+  list.appendChild(sj);list.appendChild(bd);list.appendChild(mk('div','msg','Image in the email (optional):'));list.appendChild(im.el);list.appendChild(st);list.appendChild(lm);list.appendChild(go);list.appendChild(msg);
   list.appendChild(mk('h2',null,'Logo shown at the top of every email'));
-  list.appendChild(mk('div','msg','Paste a public https link to your logo image (for example one uploaded to your website or Supabase Storage). Leave empty for no logo.'));
-  var lg=mk('input');lg.placeholder='https://trygethome.online/logo.png';lg.style.cssText='width:70%;margin-right:6px';
-  var lb=mk('button',null,'Save logo');var lmsg=mk('span','msg');
-  api('/api/growth/outreach/settings','GET').then(function(r){lg.value=(r.settings&&r.settings.email_logo_url)||'';}).catch(function(){});
-  lb.onclick=function(){api('/api/growth/outreach/settings','PATCH',{email_logo_url:lg.value.trim()}).then(function(){lmsg.className='msg ok';lmsg.textContent=' saved';}).catch(function(e){lmsg.className='msg err';lmsg.textContent=' '+e.message;});};
-  list.appendChild(lg);list.appendChild(lb);list.appendChild(lmsg);
+  list.appendChild(mk('div','msg','Choose your logo from your photos or files. It is saved straight away. Remove it for no logo.'));
+  var lmsg=mk('span','msg');
+  var lg=imagePicker(function(u){
+    lmsg.className='msg';lmsg.textContent=' saving...';
+    api('/api/growth/outreach/settings','PATCH',{email_logo_url:u}).then(function(){lmsg.className='msg ok';lmsg.textContent=u?' logo saved':' logo removed';}).catch(function(e){lmsg.className='msg err';lmsg.textContent=' '+e.message;});
+  });
+  api('/api/growth/outreach/settings','GET').then(function(r){lg.show((r.settings&&r.settings.email_logo_url)||'');}).catch(function(){});
+  list.appendChild(lg.el);list.appendChild(lmsg);
+}
+// Photo library / file picker for one image: uploads on selection, shows a preview, and can be removed.
+function imagePicker(onChange,onBusy){
+  var el=mk('div');el.style.marginBottom='8px';
+  var file=mk('input');file.type='file';file.accept='image/jpeg,image/png,image/webp';file.style.cssText='width:auto';
+  var msg=mk('span','msg');
+  var pv=mk('img');pv.alt='';pv.style.cssText='display:none;max-width:260px;max-height:160px;margin:6px 0;border-radius:6px';
+  var rm=mk('button','sec','Remove image');rm.style.display='none';
+  function show(u){if(u){pv.src=u;}else{pv.removeAttribute('src');file.value='';}pv.style.display=u?'block':'none';rm.style.display=u?'inline-block':'none';}
+  file.onchange=function(){
+    var f=file.files&&file.files[0];if(!f)return;
+    if(['image/jpeg','image/png','image/webp'].indexOf(f.type)<0){msg.className='msg err';msg.textContent=' choose a JPG, PNG or WEBP photo';file.value='';return;}
+    msg.className='msg';msg.textContent=' uploading...';file.disabled=true;rm.disabled=true;if(onBusy)onBusy(true);
+    function done(){file.disabled=false;rm.disabled=false;if(onBusy)onBusy(false);}
+    uploadMedia(f).then(function(m){done();msg.textContent='';show(m.url);onChange(m.url);}).catch(function(e){done();file.value='';msg.className='msg err';msg.textContent=' '+e.message;});
+  };
+  rm.onclick=function(){msg.textContent='';show('');onChange('');};
+  el.appendChild(file);el.appendChild(msg);el.appendChild(pv);el.appendChild(rm);
+  return {el:el,show:show};
 }
 function load(){
   if(mode==='BULK')return loadBulk();
