@@ -103,6 +103,9 @@ const recruit = require('./growth/recruit')(app, adminClient, { isAgentSubActive
 growthHooks.linkProspect = recruit.linkProspect;
 const handoffRouting = require('./growth/handoff')(adminClient, formatWaNumber);
 require('./growth/marketing')(app, adminClient);
+const customerMail = require('./growth/customerMail')(app, adminClient);
+// Daily, weekly and monthly customer updates: checks every 10 minutes whether one is due (switched on in Admin Tools).
+setInterval(customerMail.runScheduled, 10 * 60 * 1000);
 require('./growth/outreachAdmin')(app, adminClient);
 require('./growth/discovery')(app, adminClient);
 require('./growth/messaging')(app, adminClient);
@@ -6322,20 +6325,60 @@ const ADMIN_TOOLS_HTML = `<!DOCTYPE html>
 <meta name="robots" content="noindex,nofollow">
 <title>GetHome Admin Tools</title>
 <style>
-body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;padding:16px;color:#1a1a1a}
-.wrap{max-width:900px;margin:0 auto}
-.card{background:#fff;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
-h1{font-size:20px}h2{font-size:16px;margin:0 0 10px}
-input{padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px;width:100%;box-sizing:border-box}
-button{padding:8px 14px;border:0;border-radius:6px;background:#0a7d4f;color:#fff;font-size:14px;cursor:pointer}
-button.sec{background:#666}
-.row{display:grid;grid-template-columns:1.2fr 1.4fr 1fr 1fr auto;gap:8px;align-items:center;padding:8px 0;border-top:1px solid #eee}
-.row .code{font-size:12px;color:#666}
-.msg{font-size:13px;margin-top:6px}.err{color:#b00020}.ok{color:#0a7d4f}
-.tabs button{margin-right:6px}.tabs button.active{background:#1a1a1a}
-@media(max-width:700px){.row{grid-template-columns:1fr}}
-</style></head><body><div class="wrap">
-<h1>GetHome Admin Tools</h1>
+:root{--navy:#0a2240;--green:#0a7d4f;--green-dark:#08653f;--line:#e3e8ef;--muted:#64748b;--bg:#f5f7fa}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:var(--bg);margin:0;color:#0f172a;line-height:1.5}
+.top{background:var(--navy);color:#fff}
+.top div{max-width:1100px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+h1{font-size:18px;margin:0;letter-spacing:.2px}h1 span{color:#6ee7b7}
+.wrap{max-width:1100px;margin:0 auto;padding:20px}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:24px;margin-bottom:16px;box-shadow:0 1px 2px rgba(15,23,42,.05)}
+#login{max-width:380px;margin:48px auto}
+h2{font-size:15px;margin:0 0 10px;color:var(--navy)}
+#listTitle{font-size:20px;margin-bottom:14px}
+#list h2{margin:28px 0 10px;padding-top:20px;border-top:1px solid var(--line)}
+#list>h2:first-child,#list>div:first-child>h2:first-child{margin-top:0;padding-top:0;border-top:0}
+input,select,textarea{padding:9px 11px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px;font-family:inherit;background:#fff;color:inherit;max-width:100%}
+input,textarea{width:100%}
+select{cursor:pointer;padding-right:28px}
+input[type=checkbox],input[type=radio]{width:auto}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--green);box-shadow:0 0 0 3px rgba(10,125,79,.15)}
+#list input,#list select,#list textarea{margin-bottom:6px}
+button{padding:9px 16px;border:1px solid transparent;border-radius:8px;background:var(--green);color:#fff;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:background .15s,border-color .15s}
+button:hover{background:var(--green-dark)}
+button.sec{background:#fff;color:#334155;border-color:#cbd5e1}
+button.sec:hover{background:#f1f5f9;border-color:#94a3b8}
+button:disabled{opacity:.55;cursor:default}
+button:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid #6ee7b7;outline-offset:2px}
+#list button{margin-bottom:6px}
+a{color:var(--green)}
+#logout{background:transparent;color:#fff;border-color:rgba(255,255,255,.35)}
+#logout:hover{background:rgba(255,255,255,.12)}
+nav{display:flex;flex-wrap:wrap;gap:6px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin-bottom:16px;box-shadow:0 1px 2px rgba(15,23,42,.05)}
+.group{position:relative}
+nav .parent{background:transparent;color:#334155}
+nav .parent:after{content:'';display:inline-block;margin-left:8px;border:4px solid transparent;border-top-color:currentColor;transform:translateY(2px)}
+nav .parent:hover,.group.open .parent{background:#f1f5f9}
+nav .group.current .parent{background:var(--navy);color:#fff}
+.menu{display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:30;min-width:230px;background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 28px rgba(15,23,42,.14);padding:6px}
+.group.open .menu{display:block}
+.menu button{display:block;width:100%;text-align:left;background:transparent;color:#334155;font-weight:500}
+.menu button:hover{background:#f1f5f9}
+.menu button.active{background:#e7f5ee;color:var(--green-dark);font-weight:700}
+#filter{margin-bottom:16px}
+#list table{font-size:13px}
+#list th{background:#f8fafc;color:var(--muted);font-weight:600}
+.row{display:grid;grid-template-columns:1.2fr 1.4fr 1fr 1fr auto;gap:10px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
+.row .code{font-size:12px;color:var(--muted)}
+#list .row input,#list .row button{margin-bottom:0}
+.msg{font-size:13px;margin:6px 0;color:var(--muted)}.err{color:#b00020}.ok{color:var(--green)}
+.photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.photos input{width:100%}
+details{margin-bottom:8px}
+@media(max-width:700px){.wrap{padding:12px}.card{padding:16px}.row{grid-template-columns:1fr}.group{position:static;flex:1 1 40%}nav{position:relative}nav .parent{width:100%}.menu{left:8px;right:8px;top:auto}}
+</style></head><body>
+<header class="top"><div><h1>Get<span>Home</span> Admin</h1><button id="logout" style="display:none">Log out</button></div></header>
+<div class="wrap">
 <div id="login" class="card">
   <h2>Admin login</h2>
   <p><input id="email" type="email" placeholder="Admin email" autocomplete="username"></p>
@@ -6343,19 +6386,27 @@ button.sec{background:#666}
   <button id="loginBtn">Log in</button><div id="loginMsg" class="msg err"></div>
 </div>
 <div id="app" style="display:none">
-  <div class="card tabs">
-    <button id="tabSA" class="active">Service Agents</button>
-    <button id="tabGHA">GHAs</button>
-    <button id="tabNIN">NIN Verified Agents</button>
-    <button id="tabCAC">CAC Verified Agencies</button>
-    <button id="tabBI">Growth BI</button>
-    <button id="tabREC">Recruitment</button>
-    <button id="tabMKT">Marketing</button>
-    <button id="tabBULK">Bulk Email</button>
-    <button id="tabSENT">Sent Emails</button>
-    <button id="logout" class="sec" style="float:right">Log out</button>
-    <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
-  </div>
+  <nav aria-label="Admin sections">
+    <div class="group"><button type="button" class="parent" aria-haspopup="true" aria-expanded="false">Team</button><div class="menu">
+      <button id="tabSA" class="active">Service Agents</button>
+      <button id="tabGHA">GHAs</button>
+    </div></div>
+    <div class="group"><button type="button" class="parent" aria-haspopup="true" aria-expanded="false">Verification</button><div class="menu">
+      <button id="tabNIN">NIN Verified Agents</button>
+      <button id="tabCAC">CAC Verified Agencies</button>
+    </div></div>
+    <div class="group"><button type="button" class="parent" aria-haspopup="true" aria-expanded="false">Growth</button><div class="menu">
+      <button id="tabBI">Growth BI</button>
+      <button id="tabREC">Recruitment</button>
+      <button id="tabMKT">Marketing</button>
+    </div></div>
+    <div class="group"><button type="button" class="parent" aria-haspopup="true" aria-expanded="false">Email</button><div class="menu">
+      <button id="tabCUST">Customer Emails</button>
+      <button id="tabBULK">Bulk Email to Prospects</button>
+      <button id="tabSENT">Sent Emails</button>
+    </div></div>
+  </nav>
+  <input id="filter" placeholder="Filter by name, email, phone or code">
   <div class="card"><h2 id="listTitle"></h2><div id="list"></div><div id="listMsg" class="msg"></div></div>
 </div>
 <script>
@@ -6371,11 +6422,18 @@ $('loginBtn').onclick = function(){
     .then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||'Login failed');return j;});})
     .then(function(j){
       if(!j.user||j.user.role!=='admin')throw new Error('Not an admin account');
-      token=j.token;$('pw').value='';$('login').style.display='none';$('app').style.display='block';load();
+      token=j.token;$('pw').value='';$('login').style.display='none';$('app').style.display='block';$('logout').style.display='';markNav();load();
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
-$('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('tabMKT').className=m==='MKT'?'active':'';$('tabBULK').className=m==='BULK'?'active':'';$('tabSENT').className=m==='SENT'?'active':'';$('filter').style.display=(m==='BI'||m==='REC'||m==='MKT'||m==='BULK'||m==='SENT')?'none':'';load();}
+$('logout').onclick=function(){token=null;items=[];closeMenus();$('app').style.display='none';$('logout').style.display='none';$('login').style.display='block';};
+// Dropdown menus. The group holding the open section is highlighted.
+var groups=Array.prototype.slice.call(document.querySelectorAll('nav .group'));
+function closeMenus(){groups.forEach(function(g){g.classList.remove('open');g.firstElementChild.setAttribute('aria-expanded','false');});}
+function markNav(){groups.forEach(function(g){g.classList.toggle('current',!!g.querySelector('.menu .active'));});}
+groups.forEach(function(g){g.firstElementChild.onclick=function(e){e.stopPropagation();var open=!g.classList.contains('open');closeMenus();if(open){g.classList.add('open');g.firstElementChild.setAttribute('aria-expanded','true');}};});
+document.addEventListener('click',closeMenus);
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeMenus();});
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('tabMKT').className=m==='MKT'?'active':'';$('tabBULK').className=m==='BULK'?'active':'';$('tabSENT').className=m==='SENT'?'active':'';$('tabCUST').className=m==='CUST'?'active':'';$('filter').style.display=(m==='BI'||m==='REC'||m==='MKT'||m==='BULK'||m==='SENT'||m==='CUST')?'none':'';markNav();load();}
 $('tabSA').onclick=function(){setTab('SA');};
 $('tabGHA').onclick=function(){setTab('GHA');};
 $('tabNIN').onclick=function(){setTab('NIN');};
@@ -6385,6 +6443,7 @@ $('tabREC').onclick=function(){setTab('REC');};
 $('tabMKT').onclick=function(){setTab('MKT');};
 $('tabBULK').onclick=function(){setTab('BULK');};
 $('tabSENT').onclick=function(){setTab('SENT');};
+$('tabCUST').onclick=function(){setTab('CUST');};
 $('filter').oninput=render;
 function loadBulk(){
   $('listTitle').textContent='Bulk Email';$('listMsg').textContent='';var list=$('list');list.textContent='';
@@ -6417,7 +6476,7 @@ function loadBulk(){
   list.appendChild(lg.el);list.appendChild(lmsg);
 }
 // Photo library / file picker for one image: uploads on selection, shows a preview, and can be removed.
-function imagePicker(onChange,onBusy){
+function imagePicker(onChange,onBusy,prepare){
   var el=mk('div');el.style.marginBottom='8px';
   var file=mk('input');file.type='file';file.accept='image/jpeg,image/png,image/webp';file.style.cssText='width:auto';
   var msg=mk('span','msg');
@@ -6429,7 +6488,7 @@ function imagePicker(onChange,onBusy){
     if(['image/jpeg','image/png','image/webp'].indexOf(f.type)<0){msg.className='msg err';msg.textContent=' choose a JPG, PNG or WEBP photo';file.value='';return;}
     msg.className='msg';msg.textContent=' uploading...';file.disabled=true;rm.disabled=true;if(onBusy)onBusy(true);
     function done(){file.disabled=false;rm.disabled=false;if(onBusy)onBusy(false);}
-    uploadMedia(f).then(function(m){done();msg.textContent='';show(m.url);onChange(m.url);}).catch(function(e){done();file.value='';msg.className='msg err';msg.textContent=' '+e.message;});
+    (prepare?prepare(f):Promise.resolve(f)).then(uploadMedia).then(function(m){done();msg.textContent='';show(m.url);onChange(m.url);}).catch(function(e){done();file.value='';msg.className='msg err';msg.textContent=' '+e.message;});
   };
   rm.onclick=function(){msg.textContent='';show('');onChange('');};
   el.appendChild(file);el.appendChild(msg);el.appendChild(pv);el.appendChild(rm);
@@ -6470,7 +6529,89 @@ function loadSent(){
   list.appendChild(find);list.appendChild(rows);list.appendChild(info);list.appendChild(more);
   page();
 }
+function loadCustomers(){
+  $('listTitle').textContent='Customer Emails';$('listMsg').textContent='';var list=$('list');list.textContent='';
+  list.appendChild(mk('div','msg','Invite registered customers back to find a home, a commercial space or a shortlet. Every email has buttons for each and an unsubscribe link.'));
+  var count=mk('div','msg','Counting customers...');list.appendChild(count);
+  api('/api/growth/customer-mail/audience','GET').then(function(a){count.textContent=a.can_email+' customers can be emailed ('+a.customers+' registered, '+a.unsubscribed+' unsubscribed or bounced).';}).catch(function(e){count.className='msg err';count.textContent=e.message;});
+  var sj=mk('input');sj.value='Still looking for the right place?';sj.placeholder='Subject';sj.style.width='100%';
+  var bd=mk('textarea');bd.rows=8;bd.style.cssText='width:100%;box-sizing:border-box;margin:6px 0;font-family:inherit';
+  bd.value='Hello {{name}},\\n\\nAre you still looking for a home or a commercial space, or planning a short stay? New listings are added on GetHome, so check back and see what fits you.\\n\\nYou can rent, buy, find commercial space or book a shortlet using the buttons below.\\n\\nThe GetHome team';
+  list.appendChild(sj);list.appendChild(bd);list.appendChild(mk('div','msg','{{name}} becomes the first name of the customer.'));
+  list.appendChild(mk('h2',null,'Photos (up to 4, optional)'));
+  var photos=['','','',''],uploading=0;var send,test;
+  function lock(){send.disabled=test.disabled=uploading>0;}
+  var grid=mk('div','photos');
+  var pickers=photos.map(function(_,i){var p=imagePicker(function(u){photos[i]=u;},function(busy){uploading+=busy?1:-1;lock();},asJpeg);grid.appendChild(p.el);return p;});
+  list.appendChild(grid);
+  list.appendChild(mk('h2',null,'Latest listings with their photos'));
+  var ln=mk('select');[['3','Show 3 latest'],['6','Show 6 latest'],['0','Do not show listings']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];ln.appendChild(op);});ln.style.marginRight='6px';
+  var lp=mk('select');[['','Any kind'],['rent','For rent'],['sale','For sale'],['shortlet','Shortlets']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];lp.appendChild(op);});
+  list.appendChild(ln);list.appendChild(lp);
+  function message(extra){var m={subject:sj.value,body:bd.value,images:photos.filter(Boolean),listings:Number(ln.value),purpose:lp.value||undefined};for(var k in extra)m[k]=extra[k];return m;}
+  var msg=mk('div','msg');msg.style.whiteSpace='pre-wrap';
+  function say(text,kind){msg.className='msg'+(kind?' '+kind:'');msg.textContent=text;}
+  list.appendChild(mk('h2',null,'Check it, then send'));
+  var pv=mk('button','sec','Preview');pv.style.marginRight='6px';
+  var frame=mk('iframe');frame.setAttribute('sandbox','');frame.title='Email preview';frame.style.cssText='display:none;width:100%;height:520px;border:1px solid #ddd;border-radius:8px;margin-top:8px;background:#fff';
+  pv.onclick=function(){say('Preparing preview...');api('/api/growth/customer-mail/preview','POST',message()).then(function(r){say('');frame.srcdoc=r.html;frame.style.display='block';}).catch(function(e){say(e.message,'err');});};
+  var to=mk('input');to.type='email';to.placeholder='Your email, for a test';to.style.cssText='width:220px;margin-right:6px';
+  test=mk('button','sec','Send test');test.style.marginRight='6px';
+  test.onclick=function(){if(!to.value.trim()){say('Enter your email for the test.','err');return;}say('Sending test...');api('/api/growth/customer-mail/send','POST',message({test_to:to.value.trim()})).then(function(){say('Test sent. Check your inbox.','ok');}).catch(function(e){say(e.message,'err');});};
+  var skip=mk('select');[['0','Send to everyone'],['1','Leave out anyone emailed in the last day'],['7','Leave out the last 7 days'],['30','Leave out the last 30 days']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];skip.appendChild(op);});skip.style.marginRight='6px';
+  send=mk('button',null,'Send to all now');
+  send.onclick=function(){
+    if(!confirm('Send this email to your registered customers now?'))return;
+    var body=message({skip_recent_days:Number(skip.value)}),sent=0,failed=0;
+    send.disabled=test.disabled=true;say('Sending...');
+    function pass(){
+      api('/api/growth/customer-mail/send','POST',body).then(function(r){
+        sent+=r.sent;failed+=r.failed;
+        if(r.stopped_reason==='batch_full'&&r.remaining>0&&(r.sent||r.failed)){say('Sending... '+sent+' sent so far.');return pass();}
+        send.disabled=test.disabled=false;
+        var why={daily_limit:'Daily email limit reached. Press Send again tomorrow with the same message to carry on.',provider_error:'The email service rejected several in a row, so sending stopped.'}[r.stopped_reason]||'';
+        say('Sent '+sent+(failed?', failed '+failed:'')+(r.already_had_it?', '+r.already_had_it+' already had this message':'')+(r.emailed_recently?', '+r.emailed_recently+' left out as emailed recently':'')+(r.remaining?', '+r.remaining+' still to send':'')+'. '+why+(r.last_error?' Reason given: '+r.last_error:''),failed||why?'err':'ok');
+      }).catch(function(e){send.disabled=test.disabled=false;say(e.message+(sent?' ('+sent+' were sent)':''),'err');});
+    }
+    pass();
+  };
+  [pv,to,test].forEach(function(e){e.style.marginBottom='6px';list.appendChild(e);});list.appendChild(mk('br'));list.appendChild(skip);list.appendChild(send);list.appendChild(msg);list.appendChild(frame);
+  list.appendChild(mk('h2',null,'Automatic updates'));
+  list.appendChild(mk('div','msg','Sends the message above automatically, with the latest listings at that time, until a customer unsubscribes. Daily, weekly and monthly each keep their own message, so you can run any of them. Choosing one here loads what you saved for it.'));
+  var dState=mk('div','msg','Checking...'),wState=mk('div','msg'),mState=mk('div','msg');list.appendChild(dState);list.appendChild(wState);list.appendChild(mState);
+  function option(sel,value,label){var o=mk('option',null,label);o.value=value;sel.appendChild(o);}
+  var days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  var freq=mk('select');option(freq,'daily','Daily update');option(freq,'weekly','Weekly update');option(freq,'monthly','Monthly update');freq.value='weekly';freq.style.marginRight='6px';
+  var day=mk('select');day.style.marginRight='6px';
+  function fillDays(){day.textContent='';day.style.display=freq.value==='daily'?'none':'';if(freq.value==='daily')return;if(freq.value==='weekly'){[1,2,3,4,5,6,0].forEach(function(d){option(day,d,'Every '+days[d]);});}else{for(var d=1;d<=28;d++)option(day,d,'Day '+d+' of the month');}}
+  var hr=mk('select');for(var h=6;h<=20;h++)option(hr,h,(h>12?h-12:h)+':00 '+(h<12?'am':'pm')+' (Nigeria time)');hr.value='9';hr.style.marginRight='6px';
+  var on=mk('button');on.style.marginRight='6px';var off=mk('button','sec');var dm=mk('div','msg');
+  var lim=mk('input');lim.type='number';lim.min='0';lim.max='5000';lim.style.cssText='width:110px;margin-right:6px';
+  var ls=mk('button','sec','Save limit');var lm=mk('span','msg');
+  var saved=null;
+  function status(el,name,s){
+    var last=s.last?' Last sent ('+s.last.period+'): '+s.last.sent+(s.last.failed?', failed '+s.last.failed:'')+(s.last.waiting?', '+s.last.waiting+' still waiting':'')+(s.last.error?'. Reason given: '+s.last.error:''):'';
+    el.className=s.enabled?'msg ok':'msg';el.textContent=name+': '+(s.enabled?'ON, next on '+s.next+'.':'OFF.')+last;
+  }
+  function controls(){var s=saved&&saved[freq.value];var name=freq.value;on.textContent=s&&s.enabled?'Save changes':'Start '+name+' update';off.textContent='Stop '+name+' update';off.style.display=s&&s.enabled?'':'none';}
+  function fillForm(){
+    var s=saved&&saved[freq.value];fillDays();dm.textContent='';
+    if(s&&s.subject){sj.value=s.subject;bd.value=s.body;ln.value=String(s.listings);lp.value=s.purpose||'';hr.value=String(s.hour);day.value=String(s.day);photos.forEach(function(_,i){photos[i]=(s.images||[])[i]||'';pickers[i].show(photos[i]);});}
+    controls();
+  }
+  function show(d){saved=d;status(dState,'Daily',d.daily);status(wState,'Weekly',d.weekly);status(mState,'Monthly',d.monthly);lim.value=d.daily_limit;controls();}
+  function save(body,done){dm.className='msg';dm.textContent='Saving...';api('/api/growth/customer-mail/schedule','PUT',body).then(function(d){show(d);dm.className='msg ok';dm.textContent=done;}).catch(function(e){dm.className='msg err';dm.textContent=e.message;});}
+  freq.onchange=fillForm;fillDays();controls();
+  on.onclick=function(){if(!confirm('Email every customer this '+freq.value+' update until they unsubscribe?'))return;save(message({frequency:freq.value,enabled:true,day:Number(day.value),hour:Number(hr.value)}),'Saved.');};
+  off.onclick=function(){save({frequency:freq.value,enabled:false},'Stopped.');};
+  ls.onclick=function(){api('/api/growth/outreach/settings','PATCH',{daily_email_limit:Number(lim.value)}).then(function(){lm.className='msg ok';lm.textContent=' saved';}).catch(function(e){lm.className='msg err';lm.textContent=' '+e.message;});};
+  [freq,day,hr,on,off,dm].forEach(function(e){list.appendChild(e);});
+  list.appendChild(mk('div','msg','Most emails allowed per day (shared with outreach). Keep it within what your email provider plan allows.'));
+  list.appendChild(lim);list.appendChild(ls);list.appendChild(lm);
+  api('/api/growth/customer-mail/schedule','GET').then(function(d){show(d);fillForm();}).catch(function(e){dState.className='msg err';dState.textContent=e.message;});
+}
 function load(){
+  if(mode==='CUST')return loadCustomers();
   if(mode==='SENT')return loadSent();
   if(mode==='BULK')return loadBulk();
   if(mode==='BI')return loadBi();
