@@ -1,11 +1,11 @@
 // The single gate every sender must pass before a message to a prospect is queued or sent.
 // Rules (from the approved policy):
-//  - email: allowed to anyone who can receive it and has not blocked us. Blocked only when opted out, suppressed (includes
+//  - email and WhatsApp: allowed to anyone who can receive it and has not blocked us. Blocked only when opted out, suppressed (includes
 //    spam complaints), bounced/invalid, consent withdrawn, or they replied that they are not interested. Being emailed
 //    before, having replied, or being registered does not block a new email;
 //  - automated follow-up steps additionally stop on registration, an unanswered reply and the attempt limit;
-//  - WhatsApp: explicit opt-in only (Meta policy), never legitimate interest;
-//  - WhatsApp also stops after the attempt limit, for registered/lost prospects and while a reply awaits a human.
+//  - WhatsApp needs no recorded opt-in here (owner's decision). Meta's own policy does expect one, and Meta can
+//    restrict a number that people block or report.
 'use strict';
 
 const DEFAULTS = {
@@ -48,8 +48,8 @@ async function evaluateSend(db, prospect, contact, channel, settings, opts) {
   if (contact.verification_status === 'invalid' || contact.verification_status === 'bounced') return no('contact_' + contact.verification_status);
   if (prospect.stage === 'lost' && /^not interested/i.test(prospect.lost_reason || '')) return no('said_not_interested');
 
-  // These limit unprompted repeats: WhatsApp, and follow-ups that a sequence sends by itself.
-  const limited = channel === 'whatsapp' || !!(opts && opts.followUp);
+  // These limit unprompted repeats: follow-ups that a sequence sends by itself.
+  const limited = !!(opts && opts.followUp);
   if (limited && BLOCKED_STAGES.indexOf(prospect.stage) !== -1) return no('stage_' + prospect.stage);
 
   const attempts = channel === 'email' ? (prospect.email_attempts || 0) : (prospect.whatsapp_attempts || 0);
@@ -63,9 +63,9 @@ async function evaluateSend(db, prospect, contact, channel, settings, opts) {
   if (c && c.event === 'withdrawn') return no('consent_withdrawn');
   if (c && c.event === 'granted') return { ok: true, basis: c.basis, reason: null };
 
-  if (channel === 'whatsapp') return no('whatsapp_requires_opt_in');
-  // Promotional email needs no recorded consent: it is allowed unless the prospect opted out, is suppressed,
-  // bounced, or has withdrawn (all checked above). Every email still carries a working unsubscribe link.
+  // No recorded consent is needed: sending is allowed unless the prospect opted out, is suppressed, bounced,
+  // or has withdrawn (all checked above). Emails carry an unsubscribe link; on WhatsApp a "STOP" reply opts out.
+  if (channel === 'whatsapp') return { ok: true, basis: 'public_business_contact', reason: null };
   return { ok: true, basis: 'b2b_unsubscribe_link', reason: null };
 }
 

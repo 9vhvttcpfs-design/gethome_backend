@@ -43,13 +43,14 @@ No credential is ever stored in the database or shown in the page.
 2. **Qualify and permission:** prospects with contact details are auto-qualified. Record explicit consent (Prospects > open one > Consent record) where you have it. Use "Can we message this prospect?" to see exactly why a send is allowed or blocked.
 3. **Campaign:** create a follow-up *sequence* (invitation + up to two follow-ups), create a *campaign*, **Enrol** prospects (only those passing the permission check are enrolled), **Activate**, **Prepare messages**.
 4. **Review & Send:** read, edit, approve or reject each message, then **Send approved now** (or **Run cycle now** on the Campaigns tab, which also prepares due follow-ups).
+   For a one-off WhatsApp to many people, use **Send > Bulk WhatsApp** instead: pick an approved template and press **Send now**.
 5. **Replies:** log email replies, answer WhatsApp replies within 24 hours, mark handled.
 6. **Dashboard:** press **Sync registrations & payments** to link prospects to real GetHome accounts and record verified payments, then read the figures.
 
 ## 5. Rules built in
 
 * Email goes to anyone who can receive it and has not blocked us. Opted out, unsubscribed, complained, bounced or replied "not interested" are blocked. Previously emailed, replied and registered prospects can be emailed again. Always with an unsubscribe link. The daily email limit still applies.
-* WhatsApp marketing only with a recorded opt-in, only as Meta-approved templates. Free-form replies only inside 24 hours of the prospect's message.
+* WhatsApp marketing goes to anyone with a number who has not blocked us (no recorded opt-in needed), only as Meta-approved templates. Meta's policy expects opt-in and can restrict a number that gets blocked or reported, so start with small batches and put "Reply STOP to opt out" in each template. Free-form replies only inside 24 hours of the prospect's message.
 * Automatic follow-ups stop: after the attempt limit (default 2), on reply, registration, subscription, opt-out, bounce, or admin stop.
 * Opt-outs and bounces go on a permanent suppression list that imports and campaigns check.
 * Paying agents and revenue count only payments with a verified payment reference. The compensation model is not changed.

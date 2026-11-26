@@ -201,6 +201,12 @@ module.exports = function mountMessaging(app, db, deps) {
         if (inCampaign.has(p.id)) { skipped.already_enrolled = (skipped.already_enrolled || 0) + 1; continue; }
         const { data: contacts } = await db.from('gx_prospect_contacts').select('*').eq('prospect_id', p.id);
         const pool = (contacts || []).filter((x) => (channel === 'email' ? x.channel === 'email' : x.channel !== 'email')).sort((a, b2) => (b2.is_primary ? 1 : 0) - (a.is_primary ? 1 : 0));
+        // Older prospects hold their number only on the prospect row.
+        const phone = channel === 'whatsapp' && !pool.length ? D.normPhone(p.phone) : null;
+        if (phone) {
+          const { data: made } = await db.from('gx_prospect_contacts').insert([{ prospect_id: p.id, channel: 'phone', value: phone, is_primary: true, verification_status: 'format_valid', verification_method: 'format' }]).select().single();
+          if (made) pool.push(made);
+        }
         let chosen = null, lastReason = pool.length ? null : 'no_contact';
         for (const ct of pool) { const g = await C.evaluateSend(db, p, ct, channel, settings); if (g.ok) { chosen = ct; break; } lastReason = g.reason; }
         if (!chosen) { skipped[lastReason] = (skipped[lastReason] || 0) + 1; continue; }

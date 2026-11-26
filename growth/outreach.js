@@ -88,7 +88,6 @@ module.exports = function mountOutreach(ctx) {
       if (!p) return res.status(404).json({ error: 'Prospect not found' });
       if (!canTouch(req.crm, p)) return res.status(403).json({ error: 'Forbidden' });
       if (p.do_not_contact) return res.status(409).json({ error: 'This prospect has opted out and must not be contacted.' });
-      if (channel !== 'email' && (p.stage === 'lost' || p.stage === 'subscribed')) return res.status(409).json({ error: 'Prospect is already ' + p.stage + '.' });
       if (channel === 'email' && !p.email) return res.status(400).json({ error: 'Prospect has no email address.' });
       if (channel !== 'email' && !p.phone) return res.status(400).json({ error: 'Prospect has no phone number.' });
       const { data: sup } = await db.from('gx_suppressions').select('value').in('value', [p.phone, p.email].filter(Boolean)).limit(1);
