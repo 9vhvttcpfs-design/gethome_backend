@@ -6352,6 +6352,7 @@ button.sec{background:#666}
     <button id="tabREC">Recruitment</button>
     <button id="tabMKT">Marketing</button>
     <button id="tabBULK">Bulk Email</button>
+    <button id="tabSENT">Sent Emails</button>
     <button id="logout" class="sec" style="float:right">Log out</button>
     <p><input id="filter" placeholder="Filter by name, email, phone or code"></p>
   </div>
@@ -6374,7 +6375,7 @@ $('loginBtn').onclick = function(){
     }).catch(function(e){$('loginMsg').textContent=e.message;});
 };
 $('logout').onclick=function(){token=null;items=[];$('app').style.display='none';$('login').style.display='block';};
-function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('tabMKT').className=m==='MKT'?'active':'';$('tabBULK').className=m==='BULK'?'active':'';$('filter').style.display=(m==='BI'||m==='REC'||m==='MKT'||m==='BULK')?'none':'';load();}
+function setTab(m){mode=m;$('tabSA').className=m==='SA'?'active':'';$('tabGHA').className=m==='GHA'?'active':'';$('tabNIN').className=m==='NIN'?'active':'';$('tabCAC').className=m==='CAC'?'active':'';$('tabBI').className=m==='BI'?'active':'';$('tabREC').className=m==='REC'?'active':'';$('tabMKT').className=m==='MKT'?'active':'';$('tabBULK').className=m==='BULK'?'active':'';$('tabSENT').className=m==='SENT'?'active':'';$('filter').style.display=(m==='BI'||m==='REC'||m==='MKT'||m==='BULK'||m==='SENT')?'none':'';load();}
 $('tabSA').onclick=function(){setTab('SA');};
 $('tabGHA').onclick=function(){setTab('GHA');};
 $('tabNIN').onclick=function(){setTab('NIN');};
@@ -6383,6 +6384,7 @@ $('tabBI').onclick=function(){setTab('BI');};
 $('tabREC').onclick=function(){setTab('REC');};
 $('tabMKT').onclick=function(){setTab('MKT');};
 $('tabBULK').onclick=function(){setTab('BULK');};
+$('tabSENT').onclick=function(){setTab('SENT');};
 $('filter').oninput=render;
 function loadBulk(){
   $('listTitle').textContent='Bulk Email';$('listMsg').textContent='';var list=$('list');list.textContent='';
@@ -6433,7 +6435,43 @@ function imagePicker(onChange,onBusy){
   el.appendChild(file);el.appendChild(msg);el.appendChild(pv);el.appendChild(rm);
   return {el:el,show:show};
 }
+function loadSent(){
+  $('listTitle').textContent='Sent Emails';$('listMsg').textContent='';var list=$('list');list.textContent='';
+  list.appendChild(mk('div','msg','Newest first. Delivered and bounced only update when email delivery tracking (the Resend webhook) is set up; otherwise emails stay as sent.'));
+  var find=mk('input');find.placeholder='Search the loaded emails by address, business or subject';find.style.cssText='width:100%;margin:6px 0';
+  var rows=mk('div');var info=mk('div','msg');var more=mk('button','sec','Load more');more.style.display='none';
+  var offset=0,size=50,shown=[];
+  function applyFind(){var q=find.value.trim().toLowerCase();shown.forEach(function(s){s.box.style.display=!q||s.text.indexOf(q)>=0?'':'none';});}
+  find.oninput=applyFind;
+  function add(m){
+    var p=m.prospect||{};
+    var box=mk('div');box.style.cssText='border-top:1px solid #eee;padding:10px 0';
+    box.appendChild(mk('div',null,m.subject||'(no subject)'));
+    box.appendChild(mk('div','msg','To: '+(m.to||'(address removed)')+(p.name?' | '+p.name:'')+([p.city,p.state].filter(Boolean).length?' | '+[p.city,p.state].filter(Boolean).join(', '):'')));
+    box.appendChild(mk('div','msg',new Date(m.sent_at).toLocaleString()+' | '+m.status+(m.bounce_reason?': '+m.bounce_reason:'')));
+    var full=mk('div');full.style.display='none';
+    var img=m.personalization&&m.personalization.image_url;
+    if(img){var pv=mk('img');pv.src=img;pv.alt='';pv.loading='lazy';pv.style.cssText='max-width:260px;max-height:200px;display:block;margin:6px 0;border-radius:6px';full.appendChild(pv);}
+    var body=mk('div',null,m.body);body.style.cssText='white-space:pre-wrap;margin:6px 0';full.appendChild(body);
+    var view=mk('button','sec','View message');
+    view.onclick=function(){var open=full.style.display==='none';full.style.display=open?'block':'none';view.textContent=open?'Hide message':'View message';};
+    box.appendChild(view);box.appendChild(full);rows.appendChild(box);
+    shown.push({box:box,text:[m.to,p.name,m.subject].join(' ').toLowerCase()});
+  }
+  function page(){
+    more.disabled=true;info.className='msg';info.textContent='Loading...';
+    api('/api/growth/outreach/messages?sent=true&limit='+size+'&offset='+offset,'GET').then(function(r){
+      r.forEach(add);offset+=r.length;applyFind();
+      info.textContent=offset?'Showing '+offset+' emails':'No emails have been sent yet.';
+      more.disabled=false;more.style.display=r.length===size?'':'none';
+    }).catch(function(e){more.disabled=false;more.style.display='';info.className='msg err';info.textContent=e.message;});
+  }
+  more.onclick=page;
+  list.appendChild(find);list.appendChild(rows);list.appendChild(info);list.appendChild(more);
+  page();
+}
 function load(){
+  if(mode==='SENT')return loadSent();
   if(mode==='BULK')return loadBulk();
   if(mode==='BI')return loadBi();
   if(mode==='REC')return loadRecruit();

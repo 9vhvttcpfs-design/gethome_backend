@@ -270,7 +270,11 @@ module.exports = function mountMessaging(app, db, deps) {
   // ---------- review and approval ----------
   router.get('/outreach/messages', read, async (req, res) => {
     try {
-      let q = db.from('gx_messages').select('*').order('created_at', { ascending: false }).limit(Math.min(parseInt(req.query.limit) || 50, 200));
+      // ?sent=true lists emails that actually went out (including ones that later bounced), newest first.
+      const sentOnly = req.query.sent === 'true';
+      const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200), offset = Math.max(parseInt(req.query.offset) || 0, 0);
+      let q = db.from('gx_messages').select('*').order(sentOnly ? 'sent_at' : 'created_at', { ascending: false }).order('id', { ascending: true }).range(offset, offset + limit - 1);
+      if (sentOnly) q = q.eq('channel', 'email').not('sent_at', 'is', null);
       if (req.query.status) q = q.eq('status', String(req.query.status).slice(0, 30));
       if (isUuid(req.query.campaign_id)) q = q.eq('campaign_id', req.query.campaign_id);
       const { data, error } = await q;
