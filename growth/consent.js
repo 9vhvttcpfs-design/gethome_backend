@@ -18,7 +18,8 @@ async function getSettings(db) {
   const out = Object.assign({}, DEFAULTS);
   try {
     const { data } = await db.from('gx_settings').select('key, value');
-    (data || []).forEach((r) => { out[r.key] = r.value; });
+    // social_accounts holds the linked social pages; it is not an outreach setting and is never shown with them.
+    (data || []).forEach((r) => { if (r.key !== 'social_accounts') out[r.key] = r.value; });
   } catch (e) { /* defaults apply */ }
   return out;
 }

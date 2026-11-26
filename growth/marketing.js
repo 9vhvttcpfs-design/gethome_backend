@@ -1,7 +1,7 @@
 // GetHome Growth Engine - Phase 5: marketing campaigns, AI copy/script generation grounded in real
 // listing data, a content calendar with approval, and campaign performance from tracked links.
-// Photos/videos are uploaded here; posting is done from the phone's share sheet or the platform's own page (no platform keys
-// needed), then the post URL and its numbers are recorded here. Insights rank what performed and advise what to make next.
+// Photos/videos are uploaded here. Facebook and Instagram can be posted to directly once linked (social.js); other
+// platforms are posted from the phone or their own page. Post numbers are recorded here. Insights rank what performed and advise what to make next.
 'use strict';
 const express = require('express');
 const createAuth = require('../middleware/auth');
@@ -9,6 +9,7 @@ const { limiter } = require('../middleware/security');
 const { matchesCity } = require('./cityAreas');
 const multer = require('multer');
 const crypto = require('crypto');
+const mountSocial = require('./social');
 
 const GOALS = ['customer_acquisition', 'agent_recruitment', 'brand_awareness'];
 const KINDS = ['social_post', 'video_script', 'ad_copy', 'whatsapp_broadcast', 'email', 'seo_blurb'];
@@ -181,6 +182,7 @@ module.exports = function mountMarketing(app, db) {
         const u = clip(b.media_url, 600); if (!u || !/^https:\/\//i.test(u)) return res.status(400).json({ error: 'media_url must be an https link' });
         row.media_url = u; row.media_type = b.media_type === 'video' ? 'video' : 'image';
       }
+      if (!row.hashtags && row.kind === 'social_post' && !/#\w/.test(body)) row.hashtags = (await mountSocial.suggestHashtags({ text: body, platform: row.platform, goal: row.context.goal })) || null;
       const { data, error } = await db.from('gx_content_items').insert([row]).select().single();
       if (error) return res.status(500).json({ error: error.message });
       res.json(data);
@@ -354,7 +356,7 @@ module.exports = function mountMarketing(app, db) {
         'Write in clear, friendly Nigerian English. Naira amounts use the ₦ sign.',
         'STRICT RULES: use only the FACTS provided. Never invent prices, listing counts, statistics, testimonials, awards, user numbers, guarantees or legal/financial promises. If a figure is not in FACTS, do not mention it.',
         'You may state these platform truths: properties are physically inspected by verified agents; fees are shown up front; inspections can be booked on the platform; verified agents and agencies can list properties.',
-        'Do not use hashtags unless the kind is social_post; then add 3 to 5 relevant ones. Do not use misleading urgency.',
+        'Never put hashtags inside "body". For social_post, put 3 to 5 hashtags that describe exactly what that post says in "hashtags"; otherwise leave it empty. Do not use misleading urgency.',
         'Return ONLY a JSON array of ' + count + ' objects with keys "title" (short internal label), "body", "hashtags" (string, may be empty). No prose outside the JSON.',
       ].join('\n');
       const userMsg = 'Write ' + count + ' different variations of ' + KIND_SPEC[b.kind] + '.\n' + JSON.stringify({
@@ -376,7 +378,7 @@ module.exports = function mountMarketing(app, db) {
 
       const rows = items.slice(0, count).map((it) => ({
         campaign_id: campaign ? campaign.id : null, kind: b.kind, platform, title: clip(it && it.title, 160), body: clip(it && it.body, 6000) || '',
-        hashtags: clip(it && it.hashtags, 300), link_url: b.kind === 'seo_blurb' ? null : link, status: 'draft', generated_by: 'ai',
+        hashtags: (b.kind === 'social_post' || b.kind === 'video_script') ? (mountSocial.finalTags(mountSocial.onTopic(mountSocial.cleanTags(it && it.hashtags), { text: it && it.body, city }), mountSocial.ruleTags({ text: it && it.body, city, purpose, goal }), platform) || null) : null, link_url: b.kind === 'seo_blurb' ? null : link, status: 'draft', generated_by: 'ai',
         context: { facts, city, purpose, topic, goal }, created_by: req.admin.email || req.admin.id,
       })).filter((r) => r.body);
       if (!rows.length) return res.status(502).json({ error: 'The AI returned empty content. Try again.' });
@@ -385,6 +387,8 @@ module.exports = function mountMarketing(app, db) {
       res.json({ items: data, facts_used: facts, note: 'Saved as drafts. Review every claim before approving and posting.' });
     } catch (e) { console.error('[marketing/generate]', e.message); res.status(500).json({ error: 'Generation failed' }); }
   });
+
+  mountSocial(router, db);
 
   app.use('/api/growth', router);
 };

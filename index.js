@@ -6567,7 +6567,104 @@ function uploadMedia(file){
   var fd=new FormData();fd.append('file',file);
   return fetch('/api/growth/marketing/media',{method:'POST',headers:{'Authorization':'Bearer '+token},body:fd}).then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error(j.error||'Upload failed');return j;});});
 }
+function copyText(text){
+  if(navigator.clipboard&&navigator.clipboard.writeText)return navigator.clipboard.writeText(text);
+  var t=mk('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove();return Promise.resolve();
+}
+function fullCaption(body,tags){
+  var have=(body.match(/#[A-Za-z0-9_]+/g)||[]).map(function(t){return t.toLowerCase();});
+  var add=(tags.match(/#[A-Za-z0-9_]+/g)||[]).filter(function(t){return have.indexOf(t.toLowerCase())<0;});
+  return body.trim()+(add.length?'\\n\\n'+add.join(' '):'');
+}
+// Instagram only takes JPG, so marketing photos are converted (and large ones shrunk) before upload.
+function asJpeg(file){
+  if(!/^image\\//.test(file.type)||!window.createImageBitmap)return Promise.resolve(file);
+  return createImageBitmap(file).then(function(bm){
+    var s=Math.min(1,1440/bm.width),c=mk('canvas');c.width=Math.round(bm.width*s);c.height=Math.round(bm.height*s);
+    var x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.drawImage(bm,0,0,c.width,c.height);
+    return new Promise(function(done){c.toBlob(function(b){done(b?new File([b],'photo.jpg',{type:'image/jpeg'}):file);},'image/jpeg',0.9);});
+  }).catch(function(){return file;});
+}
+function hashtagButton(input,getText,getOptions,msg){
+  var b=mk('button','sec','Create hashtags');
+  b.onclick=function(){
+    if(!getText().trim()){msg.className='msg err';msg.textContent=' write the caption first';return;}
+    b.disabled=true;msg.className='msg';msg.textContent=' creating hashtags...';
+    var body=getOptions();body.text=getText();
+    api('/api/growth/marketing/hashtags','POST',body).then(function(r){input.value=r.hashtags;msg.textContent='';b.disabled=false;}).catch(function(e){b.disabled=false;msg.className='msg err';msg.textContent=' '+e.message;});
+  };
+  return b;
+}
+function socialAccountsBox(acc){
+  var box=mk('div');box.appendChild(mk('h2',null,'Linked social accounts'));
+  if(!acc){box.appendChild(mk('div','msg err','Could not load the linked accounts.'));return box;}
+  box.appendChild(mk('div','msg',(acc.facebook.connected?'Facebook linked: '+acc.facebook.page_name:'Facebook not linked')+' | '+(acc.instagram.connected?'Instagram linked: @'+acc.instagram.username:'Instagram not linked')));
+  box.appendChild(mk('div','msg','To post with one click, paste your Facebook Page ID and an access token. Instagram is picked up automatically when it is a Business or Creator account connected to that Page.'));
+  var how=mk('details');how.appendChild(mk('summary','msg','Where do I get these?'));
+  ['1. Page ID: open your Facebook Page, then About, then Page transparency.','2. Go to developers.facebook.com and create an app of type Business. Add your privacy policy link and switch the app to Live, otherwise the public may not see what it posts.','3. In business.facebook.com settings, add a System User, give it your Page and the app, and generate a token that does not expire.','4. Tick these permissions: pages_show_list, pages_read_engagement, pages_manage_posts, business_management, instagram_basic, instagram_content_publish.','5. Paste the Page ID and token below and press Link account. The token is stored encrypted and is never shown again.'].forEach(function(t){how.appendChild(mk('div','msg',t));});
+  box.appendChild(how);
+  var pid=mk('input');pid.placeholder='Facebook Page ID';pid.value=acc.facebook.page_id||'';pid.style.cssText='width:100%;margin:4px 0';
+  var tok=mk('input');tok.type='password';tok.autocomplete='off';tok.placeholder=acc.facebook.connected?'Access token saved (paste a new one to replace it)':'Access token';tok.style.cssText='width:100%;margin:4px 0';
+  var lb=mk('button',null,'Link account');var um=mk('span','msg');
+  function say(text,bad){um.className=bad?'msg err':'msg';um.textContent=' '+text;}
+  lb.onclick=function(){lb.disabled=true;say('checking with Facebook...');api('/api/growth/marketing/social/accounts','PUT',{page_id:pid.value.trim(),access_token:tok.value.trim()}).then(function(){loadMkt();}).catch(function(e){lb.disabled=false;say(e.message,true);});};
+  box.appendChild(pid);box.appendChild(tok);box.appendChild(lb);
+  if(acc.facebook.page_id){var ub=mk('button','sec','Unlink');ub.style.marginLeft='6px';ub.onclick=function(){if(confirm('Unlink Facebook and Instagram?'))api('/api/growth/marketing/social/accounts/meta','DELETE').then(function(){loadMkt();}).catch(function(e){say(e.message,true);});};box.appendChild(ub);}
+  box.appendChild(um);
+  box.appendChild(mk('div','msg','Links to your profiles (optional), used for the View our page links under each post:'));
+  var inputs={};[['facebook','Facebook page link'],['instagram','Instagram link'],['tiktok','TikTok link'],['x','X link'],['youtube','YouTube link']].forEach(function(p){var i=mk('input');i.type='url';i.placeholder=p[1]+' (https://...)';i.value=(acc.links||{})[p[0]]||'';i.style.cssText='width:100%;margin:3px 0';inputs[p[0]]=i;box.appendChild(i);});
+  var sl=mk('button',null,'Save links');var slm=mk('span','msg');
+  sl.onclick=function(){var links={};Object.keys(inputs).forEach(function(k){links[k]=inputs[k].value.trim();});api('/api/growth/marketing/social/accounts','PUT',{links:links}).then(function(){slm.className='msg ok';slm.textContent=' saved';}).catch(function(e){slm.className='msg err';slm.textContent=' '+e.message;});};
+  box.appendChild(sl);box.appendChild(slm);
+  return box;
+}
+// One row of posting buttons under a post. Facebook and Instagram publish directly; the others open ready to paste.
+function postButtons(it,acc,ta,tg,st,url,msg){
+  var wrap=mk('div');wrap.style.margin='6px 0';
+  var posts=(it.context&&it.context.posts)||{};
+  var done=mk('div','msg');
+  function showDone(){done.textContent='';Object.keys(posts).forEach(function(k){var a=mk('a',null,'Posted to '+k+(posts[k].url?' (view)':''));if(posts[k].url){a.href=posts[k].url;a.target='_blank';a.rel='noopener';}a.style.marginRight='10px';done.appendChild(a);});}
+  function say(text,bad){msg.className=bad?'msg err':'msg ok';msg.textContent=' '+text;}
+  function publish(platform){
+    return api('/api/growth/marketing/content/'+it.id+'/publish','POST',{platform:platform,caption:ta.value,hashtags:tg.value,again:!!posts[platform]}).then(function(r){
+      if(r.hashtags)tg.value=r.hashtags;
+      if(r.pending)return r.message;
+      posts[platform]={url:r.url};st.value='published';if(r.published_url)url.value=r.published_url;showDone();return 'posted to '+platform;
+    }).catch(function(e){throw new Error(platform+': '+e.message);});
+  }
+  var buttons=[];
+  function direct(label,platforms){
+    var b=mk('button',null,label);b.style.marginRight='6px';
+    b.onclick=function(){
+      var again=platforms.filter(function(p){return posts[p];});
+      if(!confirm((again.length?'Already posted to '+again.join(' and ')+'. Post again? ':label+' now? ')+'\\n\\n'+fullCaption(ta.value,tg.value).slice(0,600)))return;
+      buttons.forEach(function(x){x.disabled=true;});say('posting...');var results=[],failed=false;
+      platforms.reduce(function(chain,p){return chain.then(function(){return publish(p).then(function(t){results.push(t);}).catch(function(e){failed=true;results.push(e.message);});});},Promise.resolve()).then(function(){buttons.forEach(function(x){x.disabled=false;});say(results.join(' | '),failed);});
+    };
+    buttons.push(b);wrap.appendChild(b);
+  }
+  var fb=acc&&acc.facebook.connected,ig=acc&&acc.instagram.connected;
+  if(it.kind==='social_post'){
+    if(fb)direct('Post to Facebook',['facebook']);
+    if(ig&&it.media_url)direct('Post to Instagram',['instagram']);
+    if(fb&&ig&&it.media_url)direct('Post to both',['facebook','instagram']);
+    if(!fb)wrap.appendChild(mk('div','msg','Link your Facebook Page under Linked social accounts to post from here with one click.'));
+    else if(ig&&!it.media_url)wrap.appendChild(mk('div','msg','Attach a photo or video to post to Instagram too.'));
+  }
+  var hand=mk('div');hand.style.marginTop='6px';
+  [['Post on X',function(t){return 'https://x.com/intent/post?text='+encodeURIComponent(t);}],['Share on WhatsApp',function(t){return 'https://wa.me/?text='+encodeURIComponent(t);}],['Post on TikTok',function(){return 'https://www.tiktok.com/upload';}]].forEach(function(p){
+    var b=mk('button','sec',p[0]);b.style.marginRight='6px';
+    b.onclick=function(){var text=fullCaption(ta.value,tg.value);copyText(text).then(function(){say('caption copied'+(it.media_url?'; add the photo or video there':''));}).catch(function(){say('could not copy; use Copy',true);});window.open(p[1](text),'_blank','noopener');};
+    hand.appendChild(b);
+  });
+  wrap.appendChild(hand);
+  var links=(acc&&acc.links)||{};
+  if(Object.keys(links).length){var lr=mk('div','msg','View our page: ');Object.keys(links).forEach(function(k){var a=mk('a',null,k);a.href=links[k];a.target='_blank';a.rel='noopener';a.style.marginRight='8px';lr.appendChild(a);});wrap.appendChild(lr);}
+  showDone();wrap.appendChild(done);
+  return wrap;
+}
 function shareItem(it,text,msg){
+  copyText(text).catch(function(){});
   if(!it.media_url){if(navigator.share){navigator.share({text:text}).catch(function(){});}else{msg.className='msg err';msg.textContent=' sharing needs a phone browser; use Copy';}return;}
   msg.className='msg';msg.textContent=' preparing...';
   fetch(it.media_url).then(function(r){return r.blob();}).then(function(blob){
@@ -6591,8 +6688,9 @@ function insightsView(box,d){
 }
 function loadMkt(){
   $('listTitle').textContent='Marketing';$('list').textContent='Loading...';$('listMsg').textContent='';
-  Promise.all([api('/api/growth/marketing/performance','GET'),api('/api/growth/marketing/campaigns','GET'),api('/api/growth/marketing/content?limit=100','GET'),api('/api/growth/spend','GET')]).then(function(r){
-    var perf=r[0].campaigns,camps=r[1],items=r[2],spendRows=r[3]||[],list=$('list');list.textContent='';
+  Promise.all([api('/api/growth/marketing/performance','GET'),api('/api/growth/marketing/campaigns','GET'),api('/api/growth/marketing/content?limit=100','GET'),api('/api/growth/spend','GET'),api('/api/growth/marketing/social/accounts','GET').catch(function(){return null;})]).then(function(r){
+    var perf=r[0].campaigns,camps=r[1],items=r[2],spendRows=r[3]||[],acc=r[4],list=$('list');list.textContent='';
+    list.appendChild(socialAccountsBox(acc));
     list.appendChild(biTable('Campaign performance (tracked links)',perf,[['Campaign',function(x){return x.name+' ['+x.utm_campaign+']';}],['Status',function(x){return x.status;}],['Sessions',function(x){return x.sessions;}],['Signups',function(x){return x.signups;}],['Leads',function(x){return x.leads;}],['Spend logged',function(x){return money(x.spend_logged_ngn);}],['Cost / signup',function(x){return x.cost_per_signup_ngn==null?'n/a':money(x.cost_per_signup_ngn);}],['Content',function(x){return x.content_published+'/'+x.content_total+' published';}]]));
     list.appendChild(mk('div','msg',r[0].note));
     list.appendChild(mk('h2',null,'Insights and advice'));
@@ -6670,10 +6768,10 @@ function loadMkt(){
       api('/api/growth/marketing/generate','POST',{kind:gk.value,platform:gp.value,city:gc.value||undefined,purpose:gu.value||undefined,campaign_id:gs.value||undefined,topic:gt.value||undefined,count:3,goal:gg.value}).then(function(){loadMkt();}).catch(function(e){gm.className='msg err';gm.textContent=' '+e.message;gb.disabled=false;});};
     [gk,gp,gc,gu,gs,gg].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});list.appendChild(gt);list.appendChild(gb);list.appendChild(gm);
     list.appendChild(mk('h2',null,'Create a post with a photo or video'));
-    list.appendChild(mk('div','msg','Upload a photo (JPG, PNG, WEBP) or video (MP4, MOV, up to 50 MB), write the caption, and save. Then use Share / post on the post below to send it to Facebook, Instagram or TikTok.'));
+    list.appendChild(mk('div','msg','Upload a photo (JPG, PNG, WEBP) or video (MP4, MOV, up to 50 MB), write the caption, and save. Hashtags are created for you if you leave them empty. Then use the posting buttons on the post below.'));
     var pf=mk('input');pf.type='file';pf.accept='image/jpeg,image/png,image/webp,video/mp4,video/quicktime';pf.style.cssText='width:100%;margin-bottom:6px';
     var pc=mk('textarea');pc.rows=4;pc.placeholder='Caption';pc.style.cssText='width:100%;box-sizing:border-box;margin-bottom:6px;font-family:inherit';
-    var ph=mk('input');ph.placeholder='Hashtags (optional)';ph.style.cssText='width:100%;margin-bottom:6px';
+    var ph=mk('input');ph.placeholder='Hashtags (leave empty to create them automatically)';ph.style.cssText='width:100%;margin-bottom:6px';
     var pp=mk('select');['instagram','facebook','tiktok','x','youtube','whatsapp'].forEach(function(v){var op=mk('option',null,v);op.value=v;pp.appendChild(op);});
     var pg=mk('select');[['customer_acquisition','For customers'],['agent_recruitment','For agents / agencies']].forEach(function(v){var op=mk('option',null,v[1]);op.value=v[0];pg.appendChild(op);});
     var pcs=mk('select');var pco=mk('option',null,'(no campaign)');pco.value='';pcs.appendChild(pco);camps.forEach(function(c){var op=mk('option',null,c.name);op.value=c.id;pcs.appendChild(op);});
@@ -6681,22 +6779,25 @@ function loadMkt(){
     pb.onclick=function(){
       if(!pc.value.trim()){pm.className='msg err';pm.textContent=' write a caption';return;}
       pb.disabled=true;pm.className='msg';pm.textContent=' uploading...';
-      var up=pf.files&&pf.files[0]?uploadMedia(pf.files[0]):Promise.resolve(null);
+      var up=pf.files&&pf.files[0]?asJpeg(pf.files[0]).then(uploadMedia):Promise.resolve(null);
       up.then(function(m){return api('/api/growth/marketing/content','POST',{kind:'social_post',platform:pp.value,goal:pg.value,campaign_id:pcs.value||undefined,body:pc.value,hashtags:ph.value||undefined,media_url:m?m.url:undefined,media_type:m?m.media_type:undefined});}).then(function(){loadMkt();}).catch(function(e){pb.disabled=false;pm.className='msg err';pm.textContent=' '+e.message;});};
-    list.appendChild(pf);list.appendChild(pc);list.appendChild(ph);[pp,pg,pcs,pb,pm].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});
+    var phm=mk('span','msg');var phb=hashtagButton(ph,function(){return pc.value;},function(){return {platform:pp.value,goal:pg.value};},phm);
+    list.appendChild(pf);list.appendChild(pc);list.appendChild(ph);list.appendChild(phb);list.appendChild(phm);list.appendChild(mk('br'));[pp,pg,pcs,pb,pm].forEach(function(e){e.style.marginRight='6px';e.style.marginBottom='6px';list.appendChild(e);});
     list.appendChild(mk('h2',null,'Content calendar'));
     if(!items.length)list.appendChild(mk('div','msg','No content yet.'));
     items.forEach(function(it){
       var box=mk('div');box.style.cssText='border-top:1px solid #eee;padding:10px 0';
       box.appendChild(mk('div',null,(it.title||it.kind)+'  |  '+it.kind+(it.platform?' / '+it.platform:'')+(it.generated_by==='ai'?'  |  AI draft':'')));
-      var ta=mk('textarea');ta.value=it.body+(it.hashtags?'\\n'+it.hashtags:'');ta.rows=5;ta.style.cssText='width:100%;box-sizing:border-box;margin:6px 0;font-family:inherit';box.appendChild(ta);
+      var ta=mk('textarea');ta.value=it.body;ta.rows=5;ta.style.cssText='width:100%;box-sizing:border-box;margin:6px 0;font-family:inherit';box.appendChild(ta);
+      var tg=mk('input');tg.value=it.hashtags||'';tg.placeholder='Hashtags';tg.style.cssText='width:100%;margin-bottom:4px';box.appendChild(tg);
+      var tgm=mk('span','msg');var ctx0=it.context||{};box.appendChild(hashtagButton(tg,(function(a){return function(){return a.value;};})(ta),(function(i,c){return function(){return {platform:i.platform,city:c.city,purpose:c.purpose,goal:c.goal};};})(it,ctx0),tgm));box.appendChild(tgm);box.appendChild(mk('br'));
       var st=mk('select');['idea','draft','approved','scheduled','published','rejected'].forEach(function(v){var op=mk('option',null,v);op.value=v;st.appendChild(op);});st.value=it.status;
       var when=mk('input');when.type='datetime-local';when.style.cssText='width:auto;margin-left:6px';if(it.scheduled_for){var d=new Date(it.scheduled_for);var pad=function(n){return String(n).padStart(2,'0');};when.value=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());}
       var url=mk('input');url.placeholder='Published URL';url.value=it.published_url||'';url.style.cssText='width:auto;margin-left:6px';
       var save=mk('button',null,'Save');save.style.marginLeft='6px';var cp=mk('button','sec','Copy');cp.style.marginLeft='6px';var del=mk('button','sec','Delete');del.style.marginLeft='6px';var msg=mk('span','msg');
-      save.onclick=function(){var body={status:st.value,body:ta.value};if(when.value)body.scheduled_for=new Date(when.value).toISOString();if(url.value)body.published_url=url.value;
+      save.onclick=function(){var body={status:st.value,body:ta.value,hashtags:tg.value};if(when.value)body.scheduled_for=new Date(when.value).toISOString();if(url.value)body.published_url=url.value;
         api('/api/growth/marketing/content/'+it.id,'PATCH',body).then(function(){msg.className='msg ok';msg.textContent=' saved';}).catch(function(e){msg.className='msg err';msg.textContent=' '+e.message;});};
-      cp.onclick=function(){ta.select();try{document.execCommand('copy');msg.className='msg ok';msg.textContent=' copied';}catch(e){}};
+      cp.onclick=function(){copyText(fullCaption(ta.value,tg.value)).then(function(){msg.className='msg ok';msg.textContent=' copied';}).catch(function(){});};
       del.onclick=function(){if(confirm('Delete this item?'))api('/api/growth/marketing/content/'+it.id,'DELETE').then(loadMkt).catch(function(e){msg.className='msg err';msg.textContent=' '+e.message;});};
       [st,when,url,save,cp,del,msg].forEach(function(e){box.appendChild(e);});
       if(it.link_url){var lk=mk('div','msg','Tracked link: '+it.link_url);box.appendChild(lk);}
@@ -6705,12 +6806,11 @@ function loadMkt(){
       if(it.media_url){var pv=it.media_type==='video'?mk('video'):mk('img');pv.src=it.media_url;if(it.media_type==='video'){pv.controls=true;}pv.style.cssText='max-width:260px;max-height:200px;display:block;margin:6px 0;border-radius:6px';box.appendChild(pv);}
       var row2=mk('div');row2.style.margin='6px 0';
       var sh=mk('button',null,'Share / post');var shm=mk('span','msg');
-      sh.onclick=function(){shareItem(it,ta.value,shm);};row2.appendChild(sh);
+      sh.onclick=function(){shareItem(it,fullCaption(ta.value,tg.value),shm);};row2.appendChild(sh);
       if(it.media_url){var dl=mk('a');dl.href=it.media_url;dl.target='_blank';dl.rel='noopener';dl.textContent='Download / open file';dl.style.cssText='margin-left:10px;font-size:13px';row2.appendChild(dl);}
-      [['Facebook','https://www.facebook.com/'],['Instagram','https://www.instagram.com/'],['TikTok','https://www.tiktok.com/upload']].forEach(function(p){var a2=mk('a');a2.href=p[1];a2.target='_blank';a2.rel='noopener';a2.textContent='Open '+p[0];a2.style.cssText='margin-left:10px;font-size:13px';row2.appendChild(a2);});
-      row2.appendChild(shm);box.appendChild(row2);
+      row2.appendChild(shm);var pmsg=mk('div','msg');box.appendChild(postButtons(it,acc,ta,tg,st,url,pmsg));box.appendChild(pmsg);box.appendChild(row2);
       var att=mk('input');att.type='file';att.accept='image/jpeg,image/png,image/webp,video/mp4,video/quicktime';att.style.cssText='width:auto;margin-top:4px';
-      var attm=mk('span','msg');att.onchange=function(){if(!att.files||!att.files[0])return;attm.className='msg';attm.textContent=' uploading...';uploadMedia(att.files[0]).then(function(m){return api('/api/growth/marketing/content/'+it.id,'PATCH',{media_url:m.url,media_type:m.media_type});}).then(function(){loadMkt();}).catch(function(e){attm.className='msg err';attm.textContent=' '+e.message;});};
+      var attm=mk('span','msg');att.onchange=function(){if(!att.files||!att.files[0])return;attm.className='msg';attm.textContent=' uploading...';asJpeg(att.files[0]).then(uploadMedia).then(function(m){return api('/api/growth/marketing/content/'+it.id,'PATCH',{media_url:m.url,media_type:m.media_type});}).then(function(){loadMkt();}).catch(function(e){attm.className='msg err';attm.textContent=' '+e.message;});};
       box.appendChild(mk('div','msg',it.media_url?'Replace photo/video:':'Attach photo/video:'));box.appendChild(att);box.appendChild(attm);
       var mt=it.metrics||{};var mrow=mk('div');mrow.style.marginTop='6px';mrow.appendChild(mk('div','msg','Numbers after posting (from the platform insights; leave blank if unknown):'));
       var mf={};[['reach','Reach'],['views','Views'],['likes','Likes'],['comments','Comments'],['shares','Shares'],['saves','Saves'],['clicks','Link clicks']].forEach(function(k){var inp=mk('input');inp.type='number';inp.min='0';inp.placeholder=k[1];inp.title=k[1];inp.value=mt[k[0]]!=null?mt[k[0]]:'';inp.style.cssText='width:90px;margin:0 6px 6px 0';mf[k[0]]=inp;mrow.appendChild(inp);});
