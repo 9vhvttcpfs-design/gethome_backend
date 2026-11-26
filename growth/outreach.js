@@ -5,11 +5,10 @@
 const { signToken, readToken } = require('./optout');
 const C = require('./consent');
 const Dd = require('./dedupe');
+const Core = require('./outreachCore');
 const { limiter } = require('../middleware/security');
 
 const SITE = 'https://trygethome.online';
-const DAILY_EMAIL_CAP = 100;           // protects the sending domain's reputation
-const RESEND_COOLDOWN_HOURS = 72;      // never email the same prospect twice within this window
 const isUuid = (s) => typeof s === 'string' && /^[0-9a-f-]{36}$/i.test(s);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40);
@@ -89,7 +88,7 @@ module.exports = function mountOutreach(ctx) {
       if (!p) return res.status(404).json({ error: 'Prospect not found' });
       if (!canTouch(req.crm, p)) return res.status(403).json({ error: 'Forbidden' });
       if (p.do_not_contact) return res.status(409).json({ error: 'This prospect has opted out and must not be contacted.' });
-      if (p.stage === 'lost' || p.stage === 'subscribed') return res.status(409).json({ error: 'Prospect is already ' + p.stage + '.' });
+      if (channel !== 'email' && (p.stage === 'lost' || p.stage === 'subscribed')) return res.status(409).json({ error: 'Prospect is already ' + p.stage + '.' });
       if (channel === 'email' && !p.email) return res.status(400).json({ error: 'Prospect has no email address.' });
       if (channel !== 'email' && !p.phone) return res.status(400).json({ error: 'Prospect has no phone number.' });
       const { data: sup } = await db.from('gx_suppressions').select('value').in('value', [p.phone, p.email].filter(Boolean)).limit(1);
@@ -113,12 +112,10 @@ module.exports = function mountOutreach(ctx) {
       if (b.send === true) {
         if (channel !== 'email') { out.send_error = 'Only email can be sent automatically. Copy the message and send it yourself, then confirm with mark-sent.'; return res.json(out); }
         if (req.crm.type !== 'ADMIN') { out.send_error = 'Only an admin can send email. Your draft is saved.'; return res.json(out); }
-        const since = new Date(Date.now() - RESEND_COOLDOWN_HOURS * 3600000).toISOString();
-        const { count: recent } = await db.from('gx_outreach').select('id', { count: 'exact', head: true }).eq('prospect_id', p.id).eq('channel', 'email').eq('status', 'sent').gte('sent_at', since);
-        if (recent > 0) { out.send_error = 'This prospect was emailed in the last ' + RESEND_COOLDOWN_HOURS + ' hours.'; return res.json(out); }
         const startDay = new Date(); startDay.setUTCHours(0, 0, 0, 0);
         const { count: today } = await db.from('gx_outreach').select('id', { count: 'exact', head: true }).eq('channel', 'email').eq('status', 'sent').gte('sent_at', startDay.toISOString());
-        if (today >= DAILY_EMAIL_CAP) { out.send_error = 'Daily email cap (' + DAILY_EMAIL_CAP + ') reached. Draft saved.'; return res.json(out); }
+        const dailyCap = Number(outSettings.daily_email_limit);
+        if (today >= dailyCap) { out.send_error = 'Daily email limit (' + dailyCap + ') reached. Draft saved.'; return res.json(out); }
         const unsub = baseUrl(req) + '/api/growth/opt-out/' + signToken(p.id);
         const r = await sendEmail(p.email, msg.subject, msg.text, unsub);
         if (r.ok) {
@@ -173,7 +170,13 @@ module.exports = function mountOutreach(ctx) {
       const id = readToken(req.params.token);
       if (!id) return res.status(400).type('html').send(page('<p>This link is not valid.</p>'));
       const { data: p } = await db.from('gx_prospects').select('phone, email').eq('id', id).maybeSingle();
-      if (p) await suppress(p.phone, p.email);
+      if (p) {
+        await suppress(p.phone, p.email);
+        const { data: contacts } = await db.from('gx_prospect_contacts').select('value').eq('prospect_id', id);
+        await Core.suppressValues(db, (contacts || []).map((c) => c.value), 'opt_out', 'unsubscribe_link');
+        await db.from('gx_prospects').update({ do_not_contact: true }).eq('id', id);
+        await Core.stopForProspect(db, id, 'opted_out');
+      }
       res.type('html').send(page('<h2>You have been unsubscribed.</h2><p>GetHome will not contact you again.</p>'));
     } catch (e) { res.status(500).type('html').send(page('<p>Something went wrong. Please try again.</p>')); }
   });

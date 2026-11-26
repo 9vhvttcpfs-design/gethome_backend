@@ -7,6 +7,7 @@ const createAuth = require('../middleware/auth');
 const { limiter } = require('../middleware/security');
 const D = require('./dedupe');
 const C = require('./consent');
+const P = require('./places');
 
 const STAGES = ['new', 'qualified', 'permission_obtained', 'campaign_ready', 'contacted', 'interested', 'applied', 'approved', 'subscribed', 'lost'];
 const CATEGORIES = ['independent_agent', 'established_agency', 'commercial_agent', 'residential_agent', 'property_consultant', 'other'];
@@ -19,7 +20,7 @@ const SETTING_RULES = {
   max_email_attempts: (v) => Number.isInteger(v) && v >= 1 && v <= 5,
   max_whatsapp_attempts: (v) => Number.isInteger(v) && v >= 1 && v <= 5,
   daily_discovery_limit: (v) => Number.isInteger(v) && v >= 1 && v <= 1000,
-  daily_email_limit: (v) => Number.isInteger(v) && v >= 0 && v <= 500,
+  daily_email_limit: (v) => Number.isInteger(v) && v >= 0 && v <= 5000,
   email_sender_name: (v) => typeof v === 'string' && v.trim().length >= 2 && v.length <= 60,
   reply_to_email: (v) => D.normEmail(v) !== null,
   retention_days_unengaged: (v) => Number.isInteger(v) && v >= 30 && v <= 3650,
@@ -88,7 +89,7 @@ module.exports = function mountOutreachAdmin(app, db) {
       if (['none', 'granted', 'withdrawn'].includes(f.email_permission)) q = q.eq('email_permission', f.email_permission);
       if (SOURCES.includes(f.source)) q = q.eq('source', f.source);
       if (isUuid(f.campaign_id)) q = q.eq('campaign_id', f.campaign_id);
-      if (f.state) q = q.ilike('state', String(f.state).replace(/[^\w ]/g, '').slice(0, 60));
+      if (f.state) q = q.or(P.stateFilter(f.state));
       if (f.city) q = q.ilike('city', String(f.city).replace(/[^\w ]/g, '').slice(0, 60));
       if (f.q) { const s = String(f.q).replace(/[^\w@.+ -]/g, '').slice(0, 60); if (s) q = q.or('name.ilike.%' + s + '%,contact_person.ilike.%' + s + '%,website_domain.ilike.%' + s + '%,email.ilike.%' + s + '%,phone.ilike.%' + s + '%'); }
       const { data, count, error } = await q;
@@ -395,6 +396,7 @@ module.exports = function mountOutreachAdmin(app, db) {
         { key: 'email_tracking', title: 'Email delivery tracking (Resend webhook)', ok: has('RESEND_WEBHOOK_SECRET'), needed_for: 'Knowing which emails were delivered, bounced or marked as spam.', how: 'In Resend > Webhooks add the URL ' + (E.API_PUBLIC_URL || E.RENDER_EXTERNAL_URL || 'https://<your-render-url>') + '/api/growth/webhooks/resend, then put its signing secret in RESEND_WEBHOOK_SECRET.', missing: has('RESEND_WEBHOOK_SECRET') ? [] : ['RESEND_WEBHOOK_SECRET'] },
         { key: 'unsubscribe', title: 'Unsubscribe links', ok: has('API_PUBLIC_URL') || has('RENDER_EXTERNAL_URL'), needed_for: 'Every email must carry a working unsubscribe link (required by law).', how: 'Set API_PUBLIC_URL to your Render URL.', missing: (has('API_PUBLIC_URL') || has('RENDER_EXTERNAL_URL')) ? [] : ['API_PUBLIC_URL'] },
         { key: 'whatsapp', title: 'WhatsApp (Meta Cloud API)', ok: has('WA_PHONE_NUMBER_ID') && has('WA_ACCESS_TOKEN'), optional: true, needed_for: 'Sending approved WhatsApp templates to people who opted in. Without it you can still copy messages and send by hand.', how: 'Meta Business > WhatsApp > API setup. Add WA_PHONE_NUMBER_ID, WA_ACCESS_TOKEN, WA_BUSINESS_ACCOUNT_ID, WA_APP_SECRET and WA_VERIFY_TOKEN.', missing: ['WA_PHONE_NUMBER_ID', 'WA_ACCESS_TOKEN'].filter((k) => !has(k)) },
+        { key: 'web_search', title: 'Web search for finding agencies', ok: has('ANTHROPIC_API_KEY'), optional: true, needed_for: 'Find prospects > Search the web. Each search uses your Anthropic API credit.', how: 'Add ANTHROPIC_API_KEY on Render and make sure web search is allowed for that account in the Anthropic Console.', missing: has('ANTHROPIC_API_KEY') ? [] : ['ANTHROPIC_API_KEY'] },
         { key: 'ai', title: 'AI message writer', ok: has('ANTHROPIC_API_KEY') || has('LOCAL_AI_URL'), optional: true, needed_for: 'Slightly personalised openings. Without it, plain templates are used and everything still works.', how: 'ANTHROPIC_API_KEY is already used by the AI chat; nothing more to do if that works.', missing: [] },
         { key: 'sms', title: 'SMS (Termii)', ok: has('TERMII_API_KEY'), optional: true, needed_for: 'Payment and booking confirmation SMS to customers. It is NOT used by outreach to agents.', how: 'Add TERMII_API_KEY and TERMII_SENDER_ID (sender ID must be approved by Termii). Note: the confirmation SMS code currently passes the customer email instead of a phone number, so no SMS can arrive until a phone field is saved at checkout.', missing: has('TERMII_API_KEY') ? [] : ['TERMII_API_KEY'] },
       ];

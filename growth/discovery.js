@@ -12,6 +12,8 @@ const createAuth = require('../middleware/auth');
 const { limiter } = require('../middleware/security');
 const D = require('./dedupe');
 const C = require('./consent');
+const P = require('./places');
+const Web = require('./websearch');
 
 const OUR_UA_TOKEN = 'gethomeoutreach';
 const USER_AGENT = process.env.OSM_USER_AGENT || 'GetHomeOutreach/1.0 (+https://trygethome.online)';
@@ -105,10 +107,17 @@ function parseRobots(text) {
 
 // ---------- HTML extraction (public business contact details only) ----------
 const JUNK_EMAIL = /(\.(png|jpe?g|gif|webp|svg|css|js)$)|(^(example|user|name|email|your|test)@)|(@(example\.|sentry|wixpress|domain\.com|email\.com|yourdomain))/i;
+function decodeCfEmail(hex) {
+  const key = parseInt(hex.slice(0, 2), 16); let out = '';
+  for (let i = 2; i < hex.length; i += 2) out += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16) ^ key);
+  return out;
+}
+
 function extractFromHtml(html, baseUrl) {
   const h = String(html || '');
   const text = h.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ');
   const emails = new Set(), phones = new Set();
+  (text.match(/data-cfemail="[0-9a-f]+"/gi) || []).forEach((m) => { const e = D.normEmail(decodeCfEmail(m.slice(14, -1))); if (e && !JUNK_EMAIL.test(e)) emails.add(e); });
   (text.match(/mailto:([^"'?\s>]+)/gi) || []).forEach((m) => { const e = D.normEmail(decodeURIComponent(m.slice(7))); if (e && !JUNK_EMAIL.test(e)) emails.add(e); });
   (text.replace(/<[^>]+>/g, ' ').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || []).forEach((m) => { const e = D.normEmail(m); if (e && !JUNK_EMAIL.test(e)) emails.add(e); });
   (text.match(/tel:([+\d\s().-]{7,20})/gi) || []).forEach((m) => { const p = D.normPhone(m.slice(4)); if (p) phones.add(p); });
@@ -126,18 +135,107 @@ function extractFromHtml(html, baseUrl) {
 const adapters = {};
 function registerAdapter(a) { adapters[a.id] = a; }
 
+// Reads up to 3 public pages (home, contact, about) of one business website, obeying robots.txt.
+async function crawlSite(spec, ctx) {
+  const notes = [];
+  const home = D.cleanUrl(spec.url);
+  if (!home) return { item: null, notes: ['Skipped an invalid URL'] };
+  try {
+    const origin = new URL(home).origin;
+    let robots = parseRobots('');
+    try { const r = await safeFetch(origin + '/robots.txt', {}, ctx.net); if (r.status >= 500) throw new Error('robots unavailable'); if (r.ok) robots = parseRobots(r.text); } catch (e) { return { item: null, notes: [origin + ': robots.txt unavailable, skipped to be safe'] }; }
+    const pages = [home]; const seen = new Set(); const emails = [], phones = []; let name = spec.name || null;
+    while (pages.length && seen.size < 3) {
+      const pageUrl = pages.shift(); if (seen.has(pageUrl)) continue; seen.add(pageUrl);
+      if (!robots.allowed(new URL(pageUrl).pathname)) { notes.push(pageUrl + ': disallowed by robots.txt'); continue; }
+      if (seen.size > 1) await (ctx.sleep || sleep)(1000);
+      const r = await safeFetch(pageUrl, {}, ctx.net);
+      if (!r.ok || !/html/i.test(r.contentType)) continue;
+      const x = extractFromHtml(r.text, r.url);
+      if (!name) name = x.name;
+      x.emails.forEach((e) => emails.push({ channel: 'email', value: e, source_url: pageUrl }));
+      x.phones.forEach((p) => phones.push({ channel: 'phone', value: p, source_url: pageUrl }));
+      x.links.forEach((l) => { if (!seen.has(l)) pages.push(l); });
+    }
+    if (!name) return { item: null, notes: notes.concat(home + ': no business name found; add one when listing the URL') };
+    return { item: { name, category: spec.category || (ctx.target === 'agent' ? 'independent_agent' : 'established_agency'), state: spec.state || ctx.state, city: spec.city || ctx.city, website: home, source_url: home, contacts: emails.concat(phones), raw: { pages_read: [...seen] } }, notes };
+  } catch (e) { return { item: null, notes: notes.concat(home + ': ' + e.message) }; }
+}
+
+// Different businesses are read at the same time; pages of one site are still read one per second.
+async function crawlMany(specs, ctx) {
+  const out = await Promise.all(specs.map((s) => crawlSite(typeof s === 'string' ? { url: s } : (s || {}), ctx)));
+  return { items: out.map((o) => o.item).filter(Boolean), notes: out.reduce((a, o) => a.concat(o.notes), []) };
+}
+
+const WEB_BATCH = 8, WEB_MAX_ROUNDS = 4;
 registerAdapter({
-  id: 'osm', label: 'OpenStreetMap (Overpass)',
-  description: 'Businesses mapped as estate agents in OpenStreetMap for a state or city. Names and locations are common; phone, email and website are present only where mappers added them.',
-  limits: 'One query per job. Coverage of Nigeria is uneven. Data (c) OpenStreetMap contributors (ODbL).',
+  id: 'web', label: 'Search the web (recommended)',
+  description: "Searches the web for real estate agencies and agents in the state you choose, then reads each website's public contact pages for business emails and phone numbers. No website list needed.",
+  limits: 'Each search round uses your Anthropic API credit. Property portals and social networks are left out. Obeys robots.txt.',
   async run(ctx) {
-    const place = ctx.city || ctx.state;
-    if (!place || !NAME_OK.test(place)) throw new Error('Provide a valid state or city name (letters only)');
+    const prev = ctx.params || {};
+    let queue = Array.isArray(prev.queue) ? prev.queue : [];
+    let round = Number(prev.round) || 0, found = null;
+    const seen = new Set((Array.isArray(prev.seen) ? prev.seen : []).concat(ctx.knownDomains || []));
+    if (!queue.length) {
+      if (!ctx.state && !ctx.city) throw new Error('Choose a state');
+      const r = await (ctx.search || Web.searchAgencies)({ state: ctx.state || ctx.city, city: ctx.state ? ctx.city : null, target: ctx.target, round, exclude: seen });
+      queue = r.sites; round++; found = r.sites.length;
+      r.sites.forEach((s) => seen.add(D.domainOf(s.url)));
+    }
+    const batch = queue.slice(0, WEB_BATCH), rest = queue.slice(WEB_BATCH);
+    const { items, notes } = await crawlMany(batch, ctx);
+    // A website that could not be read is still worth keeping: its name and address came from the search.
+    const readOk = new Set(items.map((i) => i.website));
+    batch.forEach((s) => { if (s.name && !readOk.has(s.url)) items.push({ name: s.name, category: ctx.target === 'agent' ? 'independent_agent' : 'established_agency', state: ctx.state, city: s.city || ctx.city, website: s.url, source_url: s.url, contacts: [], raw: { from: 'web_search' } }); });
+    if (found !== null) notes.unshift('Search round ' + round + ' found ' + found + ' new websites');
+    const done = !rest.length && (round >= WEB_MAX_ROUNDS || found === 0);
+    return { items, done, params: { queue: rest, round, seen: [...seen].slice(-300) }, notes: notes.join('; ') };
+  },
+});
+
+registerAdapter({
+  id: 'website', label: 'Websites I already know (optional)',
+  description: 'Reads the home, contact and about pages of agency websites you paste in, and records business emails and phone numbers that are publicly shown. Use "Search the web" if you do not have addresses.',
+  limits: 'Up to 6 sites per run, max 3 pages per site, respects robots.txt, public web hosts only.',
+  async run(ctx) {
+    const urls = Array.isArray(ctx.params.urls) ? ctx.params.urls : [];
+    const start = parseInt(ctx.params.cursor) || 0, batch = urls.slice(start, start + 6);
+    const { items, notes } = await crawlMany(batch, ctx);
+    const next = start + batch.length;
+    return { items, done: next >= urls.length, cursor: next, notes: notes.join('; ') };
+  },
+});
+
+registerAdapter({
+  id: 'osm', label: 'OpenStreetMap (free, limited)',
+  description: 'Businesses mapped as estate agents or property managers in OpenStreetMap. Free, but very few Nigerian businesses are mapped, so expect small numbers.',
+  limits: 'One query per job. Data (c) OpenStreetMap contributors (ODbL).',
+  async run(ctx) {
+    const state = ctx.state ? P.canonicalState(ctx.state) : null, city = ctx.city || null;
+    if (!state && !city) throw new Error('Choose a state or city');
+    if ((state && !NAME_OK.test(state)) || (city && !NAME_OK.test(city))) throw new Error('Provide a valid state or city name (letters only)');
     const n = Math.min((ctx.limit || 100) * 2, 500);
-    const q = '[out:json][timeout:60];area["name"="' + place + '"]["boundary"="administrative"]->.a;(nwr["office"="estate_agent"](area.a););out tags center ' + n + ';';
-    const res = await safeFetch(ctx.overpassUrl || OVERPASS_URL, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, Object.assign({ timeoutMs: 70000, maxBytes: 5000000 }, ctx.net));
-    if (!res.ok) throw new Error('Overpass returned HTTP ' + res.status);
-    let j; try { j = JSON.parse(res.text); } catch (e) { throw new Error('Overpass returned an unreadable response (server may be busy; try again later)'); }
+    // States are mapped as "Ogun State" / "Ashanti Region" and Abuja as "Federal Capital Territory".
+    const area = state === 'Abuja' ? 'Federal Capital Territory' : state;
+    const where = city
+      ? 'node["place"~"^(city|town|suburb)$"]["name"="' + city + '"](area.c)->.p;'
+      : 'rel(area.c)["boundary"="administrative"]["name"~"^(' + area + ')( State| Region)?$",i];map_to_area->.a;';
+    const scope = city ? '(around.p:15000)' : '(area.a)';
+    const q = '[out:json][timeout:60];area["ISO3166-1"~"^(NG|GH)$"]["admin_level"="2"]->.c;' + where +
+      '(nwr["office"~"^(estate_agent|property_management)$"]' + scope + ';nwr["shop"="estate_agent"]' + scope + ';nwr["office"]["name"~"real ?estate|realt|propert",i]' + scope + ';);out tags center ' + n + ';';
+    // The public servers are often at capacity, so try a second one before giving up.
+    const servers = ctx.overpassUrl ? [ctx.overpassUrl] : [OVERPASS_URL, 'https://overpass.kumi.systems/api/interpreter'];
+    let j = null, problem = null;
+    for (const server of servers) {
+      try {
+        const res = await safeFetch(server, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, Object.assign({ timeoutMs: 45000, maxBytes: 5000000, retries: 1 }, ctx.net));
+        if (!res.ok) { problem = 'HTTP ' + res.status; continue; }
+        j = JSON.parse(res.text); break;
+      } catch (e) { problem = e.message; }
+    }
+    if (!j) throw new Error('OpenStreetMap is busy right now (' + problem + '). Try again later, or use "Search the web".');
     const split = (v) => String(v || '').split(/[;,]/).map((s) => s.trim()).filter(Boolean);
     const items = (j.elements || []).map((el) => {
       const t = el.tags || {}; if (!t.name) return null;
@@ -146,47 +244,9 @@ registerAdapter({
       [t.phone, t['contact:phone'], t.mobile, t['contact:mobile']].forEach((v) => split(v).forEach((p) => contacts.push({ channel: 'phone', value: p, source_url: src })));
       split(t['contact:whatsapp']).forEach((p) => contacts.push({ channel: 'whatsapp', value: p, source_url: src }));
       [t.email, t['contact:email']].forEach((v) => split(v).forEach((e) => contacts.push({ channel: 'email', value: e, source_url: src })));
-      return { name: t.name, category: ctx.target === 'agent' ? 'independent_agent' : 'established_agency', state: ctx.state, city: t['addr:city'] || ctx.city || null, website: t.website || t['contact:website'] || t.url || null, source_url: src, contacts, raw: t, notes: 'Source: OpenStreetMap contributors (ODbL)' };
+      return { name: t.name, category: ctx.target === 'agent' ? 'independent_agent' : 'established_agency', state: ctx.state, city: t['addr:city'] || city, website: t.website || t['contact:website'] || t.url || null, source_url: src, contacts, raw: t, notes: 'Source: OpenStreetMap contributors (ODbL)' };
     }).filter(Boolean);
-    return { items, done: true, notes: 'OpenStreetMap returned ' + items.length + ' named estate agents for ' + place };
-  },
-});
-
-registerAdapter({
-  id: 'website', label: 'Agency websites (public contact pages)',
-  description: 'Reads the home, contact and about pages of agency websites you list, and records business emails and phone numbers that are publicly shown. Obeys robots.txt.',
-  limits: 'Up to 6 sites per run, 1 request per second per site, max 3 pages per site, respects robots.txt, public web hosts only.',
-  async run(ctx) {
-    const urls = Array.isArray(ctx.params.urls) ? ctx.params.urls : [];
-    const start = parseInt(ctx.params.cursor) || 0, batch = urls.slice(start, start + 6);
-    const items = [], notes = [];
-    for (const entry of batch) {
-      const spec = typeof entry === 'string' ? { url: entry } : (entry || {});
-      const home = D.cleanUrl(spec.url);
-      if (!home) { notes.push('Skipped an invalid URL'); continue; }
-      try {
-        const origin = new URL(home).origin;
-        let robots = parseRobots('');
-        try { const r = await safeFetch(origin + '/robots.txt', {}, ctx.net); if (r.status >= 500) throw new Error('robots unavailable'); if (r.ok) robots = parseRobots(r.text); } catch (e) { notes.push(origin + ': robots.txt unavailable, skipped to be safe'); continue; }
-        const pages = [home]; const seen = new Set(); const emails = [], phones = []; let name = spec.name || null;
-        while (pages.length && seen.size < 3) {
-          const pageUrl = pages.shift(); if (seen.has(pageUrl)) continue; seen.add(pageUrl);
-          if (!robots.allowed(new URL(pageUrl).pathname)) { notes.push(pageUrl + ': disallowed by robots.txt'); continue; }
-          if (seen.size > 1) await (ctx.sleep || sleep)(1000);
-          const r = await safeFetch(pageUrl, {}, ctx.net);
-          if (!r.ok || !/html/i.test(r.contentType)) continue;
-          const x = extractFromHtml(r.text, r.url);
-          if (!name) name = x.name;
-          x.emails.forEach((e) => emails.push({ channel: 'email', value: e, source_url: pageUrl }));
-          x.phones.forEach((p) => phones.push({ channel: 'phone', value: p, source_url: pageUrl }));
-          x.links.forEach((l) => { if (!seen.has(l)) pages.push(l); });
-        }
-        if (!name) { notes.push(home + ': no business name found; add one when listing the URL'); continue; }
-        items.push({ name, category: spec.category || 'established_agency', state: spec.state || ctx.state, city: spec.city || ctx.city, website: home, source_url: home, contacts: emails.concat(phones), raw: { pages_read: [...seen] } });
-      } catch (e) { notes.push(home + ': ' + e.message); }
-    }
-    const next = start + batch.length;
-    return { items, done: next >= urls.length, cursor: next, notes: notes.join('; ') };
+    return { items, done: true, notes: 'OpenStreetMap has ' + items.length + ' named estate agents for ' + (city || state) + (items.length < 10 ? '. Use "Search the web" for many more.' : '') };
   },
 });
 
@@ -198,7 +258,7 @@ registerAdapter({
 });
 
 // ---------- ingestion: one path for every source ----------
-const SOURCE_FOR = { osm: 'osm', website: 'website_crawl', csv: 'csv_import', manual: 'manual', provider: 'provider' };
+const SOURCE_FOR = { web: 'website_crawl', osm: 'osm', website: 'website_crawl', csv: 'csv_import', manual: 'manual', provider: 'provider' };
 
 async function ingestCandidate(db, cand, ctx) {
   const adapter = ctx.adapter;
@@ -298,7 +358,7 @@ module.exports = function mountDiscovery(app, db, deps) {
     try {
       const b = req.body || {};
       if (!adapters[b.adapter]) return res.status(400).json({ error: 'Unknown adapter. Available: ' + Object.keys(adapters).join(', ') });
-      if (b.adapter === 'osm' && !clip(b.state, 60) && !clip(b.city, 60)) return res.status(400).json({ error: 'Choose a state or city' });
+      if ((b.adapter === 'osm' || b.adapter === 'web') && !clip(b.state, 60) && !clip(b.city, 60)) return res.status(400).json({ error: 'Choose a state or city' });
       const params = {};
       if (b.adapter === 'website') {
         const urls = (Array.isArray(b.urls) ? b.urls : []).slice(0, 60);
@@ -333,8 +393,14 @@ module.exports = function mountDiscovery(app, db, deps) {
       if (daily.remaining <= 0) return res.status(429).json({ error: 'Daily discovery limit reached (' + daily.limit + '). Change it in Permissions & Limits.' });
       await db.from('gx_discovery_jobs').update({ status: 'running', started_at: job.started_at || new Date().toISOString() }).eq('id', job.id);
       let result;
+      let knownDomains = [];
+      if (job.adapter === 'web') {
+        let kq = db.from('gx_prospects').select('website_domain').order('discovered_at', { ascending: false }).limit(150);
+        if (job.state) kq = kq.or(P.stateFilter(job.state));
+        knownDomains = ((await kq).data || []).map((r) => r.website_domain).filter(Boolean);
+      }
       try {
-        result = await adapter.run({ state: job.state, city: job.city, target: job.target, limit: job.limit_count, params: job.params || {}, net: deps && deps.net, overpassUrl: deps && deps.overpassUrl, sleep: deps && deps.sleep });
+        result = await adapter.run({ knownDomains, search: deps && deps.search, state: job.state, city: job.city, target: job.target, limit: job.limit_count, params: job.params || {}, net: deps && deps.net, overpassUrl: deps && deps.overpassUrl, sleep: deps && deps.sleep });
       } catch (e) {
         await db.from('gx_discovery_jobs').update({ status: 'failed', error: String(e.message).slice(0, 500), finished_at: new Date().toISOString() }).eq('id', job.id);
         return res.status(502).json({ error: 'Source failed: ' + e.message });
@@ -349,7 +415,7 @@ module.exports = function mountDiscovery(app, db, deps) {
       let verified = { checked: 0, invalid: 0 };
       for (const id of newIds.slice(0, 100)) { const v = await verifyProspectContacts(db, id, resolver); verified.checked += v.checked; verified.invalid += v.invalid; }
       const done = result.done || inserted >= cap;
-      const params = Object.assign({}, job.params || {}); if (result.cursor != null) params.cursor = result.cursor;
+      const params = Object.assign({}, job.params || {}, result.params || {}); if (result.cursor != null) params.cursor = result.cursor;
       await db.from('gx_discovery_jobs').update({
         status: done ? 'completed' : 'running', params, found_count: (job.found_count || 0) + result.items.length, inserted_count: (job.inserted_count || 0) + inserted,
         duplicate_count: (job.duplicate_count || 0) + duplicates, finished_at: done ? new Date().toISOString() : null, error: result.notes ? String(result.notes).slice(0, 500) : null,

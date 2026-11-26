@@ -22,6 +22,7 @@ Admin dashboard > **Outreach** tab. Everything runs on demand from that page (no
 | `ANTHROPIC_API_KEY` | AI personalisation (optional) | already set for the AI chat. Optional `OUTREACH_AI_MODEL`. |
 | `LOCAL_AI_URL`, `LOCAL_AI_MODEL`, `LOCAL_AI_KEY` | local/hosted model (optional) | any `/chat/completions`-compatible server |
 | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_PORT` | SMTP instead of Resend (optional) | then set the email provider to SMTP in the page |
+| `OUTREACH_SEARCH_MODEL` | web search discovery (optional) | model used with `ANTHROPIC_API_KEY`; defaults to `claude-opus-5-5`. A cheaper model such as `claude-haiku-4-5` costs less. |
 | `OVERPASS_URL`, `OSM_USER_AGENT` | OpenStreetMap discovery (optional) | defaults to the public Overpass server |
 | `WA_PHONE_NUMBER_ID`, `WA_ACCESS_TOKEN` | sending WhatsApp | Meta Business > WhatsApp > API setup |
 | `WA_BUSINESS_ACCOUNT_ID` | WhatsApp templates | WhatsApp Business Account ID |
@@ -38,7 +39,7 @@ No credential is ever stored in the database or shown in the page.
 
 ## 4. Daily use
 
-1. **Discovery:** create a job (OpenStreetMap or a list of agency websites) or import a CSV. Press **Run**. Review results under *Prospects*; merge duplicates under *Duplicates*.
+1. **Discovery:** choose a state and press **Find prospects** (web search by default; OpenStreetMap or your own website list also work), or import a CSV. Review results under *Prospects*; merge duplicates under *Duplicates*.
 2. **Qualify and permission:** prospects with contact details are auto-qualified. Record explicit consent (Prospects > open one > Consent record) where you have it. Use "Can we message this prospect?" to see exactly why a send is allowed or blocked.
 3. **Campaign:** create a follow-up *sequence* (invitation + up to two follow-ups), create a *campaign*, **Enrol** prospects (only those passing the permission check are enrolled), **Activate**, **Prepare messages**.
 4. **Review & Send:** read, edit, approve or reject each message, then **Send approved now** (or **Run cycle now** on the Campaigns tab, which also prepares due follow-ups).
@@ -47,9 +48,9 @@ No credential is ever stored in the database or shown in the page.
 
 ## 5. Rules built in
 
-* Marketing email only with recorded consent, or (when enabled) B2B legitimate interest with a recorded source. Always with an unsubscribe link.
+* Email goes to anyone who can receive it and has not blocked us. Opted out, unsubscribed, complained, bounced or replied "not interested" are blocked. Previously emailed, replied and registered prospects can be emailed again. Always with an unsubscribe link. The daily email limit still applies.
 * WhatsApp marketing only with a recorded opt-in, only as Meta-approved templates. Free-form replies only inside 24 hours of the prospect's message.
-* Stops: after the attempt limit (default 2), on reply, registration, subscription, opt-out, bounce, or admin stop.
+* Automatic follow-ups stop: after the attempt limit (default 2), on reply, registration, subscription, opt-out, bounce, or admin stop.
 * Opt-outs and bounces go on a permanent suppression list that imports and campaigns check.
 * Paying agents and revenue count only payments with a verified payment reference. The compensation model is not changed.
 * Delivered is a provider event; email opens are not measured.

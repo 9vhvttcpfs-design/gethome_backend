@@ -12,6 +12,7 @@ const C = require('./consent');
 const AI = require('./ai');
 const Core = require('./outreachCore');
 const Mail = require('./email');
+const P = require('./places');
 const { signToken } = require('./optout');
 
 const SITE = 'https://trygethome.online';
@@ -185,14 +186,19 @@ module.exports = function mountMessaging(app, db, deps) {
       if (Array.isArray(b.prospect_ids) && b.prospect_ids.length) {
         const ids = b.prospect_ids.filter(isUuid).slice(0, 200); const { data } = await db.from('gx_prospects').select('*').in('id', ids); prospects = data || [];
       } else {
-        let q = db.from('gx_prospects').select('*').in('stage', ['qualified', 'permission_obtained', 'campaign_ready']).limit(Math.min(parseInt(b.limit) || 100, 200));
-        if (clip(b.state, 60)) q = q.ilike('state', String(b.state).replace(/[^\w ]/g, ''));
+        let q = db.from('gx_prospects').select('*').eq('do_not_contact', false).order('last_contacted_at', { ascending: true, nullsFirst: true }).limit(1000);
+        if (clip(b.state, 60)) q = q.or(P.stateFilter(b.state));
         if (clip(b.category, 40)) q = q.eq('category', String(b.category));
         const { data } = await q; prospects = data || [];
       }
       const settings = await C.getSettings(db);
       const skipped = {}; let enrolled = 0;
+      const want = Math.min(parseInt(b.limit) || 100, 200);
+      const { data: already } = await db.from('gx_sequence_enrollments').select('prospect_id').eq('campaign_id', c.id);
+      const inCampaign = new Set((already || []).map((e) => e.prospect_id));
       for (const p of prospects) {
+        if (enrolled >= want) break;
+        if (inCampaign.has(p.id)) { skipped.already_enrolled = (skipped.already_enrolled || 0) + 1; continue; }
         const { data: contacts } = await db.from('gx_prospect_contacts').select('*').eq('prospect_id', p.id);
         const pool = (contacts || []).filter((x) => (channel === 'email' ? x.channel === 'email' : x.channel !== 'email')).sort((a, b2) => (b2.is_primary ? 1 : 0) - (a.is_primary ? 1 : 0));
         let chosen = null, lastReason = pool.length ? null : 'no_contact';
@@ -223,7 +229,7 @@ module.exports = function mountMessaging(app, db, deps) {
       const { data: p } = await db.from('gx_prospects').select('*').eq('id', en.prospect_id).maybeSingle();
       const { data: ct } = en.contact_id ? await db.from('gx_prospect_contacts').select('*').eq('id', en.contact_id).maybeSingle() : { data: null };
       if (!step || !p) { await db.from('gx_sequence_enrollments').update({ status: 'stopped', stop_reason: 'admin' }).eq('id', en.id); stopped++; continue; }
-      const gate = await C.evaluateSend(db, p, ct, step.channel, settings);
+      const gate = await C.evaluateSend(db, p, ct, step.channel, settings, { followUp: en.current_step > 1 });
       if (!gate.ok) { await Core.stopForProspect(db, p.id, Core.STOP_REASON[gate.reason] || 'admin'); stopped++; continue; }
       const { data: tpl } = await db.from('gx_message_templates').select('*').eq('id', step.template_id).maybeSingle();
       if (!tpl) { await db.from('gx_sequence_enrollments').update({ status: 'stopped', stop_reason: 'admin' }).eq('id', en.id); stopped++; continue; }
@@ -329,14 +335,26 @@ module.exports = function mountMessaging(app, db, deps) {
   async function processQueue(req, opts) {
     const settings = await C.getSettings(db);
     const sendEmailFn = deps.sendEmail || ((m) => Mail.send(settings.email_provider || 'resend', m));
-    const out = { sent: 0, blocked: 0, failed: 0, deferred: 0, skipped_paused: 0, stopped_reason: null };
+    const out = { sent: 0, blocked: 0, failed: 0, deferred: 0, skipped_paused: 0, stopped_reason: null, last_error: null };
+    const provider = settings.email_provider || 'resend';
+    if (!deps.sendEmail && !Mail.configured(provider)) {
+      out.stopped_reason = 'email_not_configured'; out.last_error = 'Email provider "' + provider + '" is not configured on the server';
+      out.remaining_today = Number(settings.daily_email_limit) || 0; return out;
+    }
     const dailyCap = Number(settings.daily_email_limit); const spacing = Number(settings.send_spacing_ms) || 700;
     const { data: sentToday } = await db.from('gx_messages').select('id, campaign_id').eq('channel', 'email').gte('sent_at', startOfDay());
     let sentCount = (sentToday || []).length; const perCampaign = {};
     (sentToday || []).forEach((m) => { perCampaign[m.campaign_id] = (perCampaign[m.campaign_id] || 0) + 1; });
-    const { data: queue } = await db.from('gx_messages').select('*').eq('status', 'approved').eq('channel', 'email').lte('scheduled_for', now().toISOString()).order('scheduled_for', { ascending: true }).limit(Math.min(opts.max || 20, 50));
+    // Read more than will be sent: messages of paused campaigns stay in the queue and must not block the ones behind them.
+    const max = Math.min(opts.max || 20, 50);
+    let qq = db.from('gx_messages').select('*').eq('status', 'approved').eq('channel', 'email').lte('scheduled_for', now().toISOString()).order('scheduled_for', { ascending: true }).limit(500);
+    if (opts.ids) qq = qq.in('id', opts.ids.slice(0, 100));
+    const { data: queue } = await qq;
     const t0 = Date.now();
+    let failuresInARow = 0;
     for (const m of queue || []) {
+      if (out.sent + out.failed >= max) { out.stopped_reason = 'batch_full'; break; }
+      if (failuresInARow >= 3) { out.stopped_reason = 'provider_error'; break; }
       if (Date.now() - t0 > (opts.budgetMs || 45000)) { out.stopped_reason = 'time_budget'; break; }
       if (sentCount >= dailyCap) { out.stopped_reason = 'daily_limit'; break; }
       const { data: c } = m.campaign_id ? await db.from('gx_recruit_campaigns').select('*').eq('id', m.campaign_id).maybeSingle() : { data: null };
@@ -345,7 +363,7 @@ module.exports = function mountMessaging(app, db, deps) {
       if (c && c.daily_send_limit && (perCampaign[c.id] || 0) >= c.daily_send_limit) { out.deferred++; continue; }
       const { data: p } = await db.from('gx_prospects').select('*').eq('id', m.prospect_id).maybeSingle();
       const { data: ct } = m.contact_id ? await db.from('gx_prospect_contacts').select('*').eq('id', m.contact_id).maybeSingle() : { data: null };
-      const gate = p ? await C.evaluateSend(db, p, ct, 'email', settings) : { ok: false, reason: 'no_contact' };
+      const gate = p ? await C.evaluateSend(db, p, ct, 'email', settings, { followUp: !!m.enrollment_id && m.step > 1 }) : { ok: false, reason: 'no_contact' };
       if (!gate.ok) { // permission changed since approval
         await db.from('gx_messages').update({ status: 'cancelled', last_error: 'blocked at send time: ' + gate.reason }).eq('id', m.id);
         if (p) await Core.stopForProspect(db, p.id, Core.STOP_REASON[gate.reason] || 'admin');
@@ -372,15 +390,15 @@ module.exports = function mountMessaging(app, db, deps) {
           const { data: seq } = en ? await db.from('gx_sequences').select('*').eq('id', en.sequence_id).maybeSingle() : { data: null };
           const nextStep = seq && (seq.steps || []).find((s) => s.step === en.current_step + 1);
           const maxAttempts = Math.min(seq ? seq.max_attempts : 2, Number(settings.max_email_attempts) || 2);
-          if (en && nextStep && upd.email_attempts < maxAttempts) await db.from('gx_sequence_enrollments').update({ current_step: nextStep.step, next_send_at: new Date(now().getTime() + nextStep.delay_days * 86400000).toISOString() }).eq('id', en.id);
+          if (en && nextStep && en.current_step < maxAttempts) await db.from('gx_sequence_enrollments').update({ current_step: nextStep.step, next_send_at: new Date(now().getTime() + nextStep.delay_days * 86400000).toISOString() }).eq('id', en.id);
           else if (en) await db.from('gx_sequence_enrollments').update({ status: 'completed', next_send_at: null }).eq('id', en.id);
         }
-        sentCount++; perCampaign[m.campaign_id] = (perCampaign[m.campaign_id] || 0) + 1; out.sent++;
+        sentCount++; perCampaign[m.campaign_id] = (perCampaign[m.campaign_id] || 0) + 1; out.sent++; failuresInARow = 0;
       } catch (e) {
         const attempts = (m.attempts || 0) + 1;
         if (e.retryable !== false && attempts < 3) await db.from('gx_messages').update({ status: 'approved', last_error: String(e.message).slice(0, 300), scheduled_for: new Date(now().getTime() + attempts * 5 * 60000).toISOString() }).eq('id', m.id);
         else { await db.from('gx_messages').update({ status: 'failed', last_error: String(e.message).slice(0, 300) }).eq('id', m.id); if (m.enrollment_id) await db.from('gx_sequence_enrollments').update({ status: 'stopped', stop_reason: 'send_failed' }).eq('id', m.enrollment_id); }
-        out.failed++;
+        out.failed++; failuresInARow++; out.last_error = String(e.message).slice(0, 300);
       }
       if (spacing > 0) await sleep(spacing);
     }
@@ -404,53 +422,94 @@ module.exports = function mountMessaging(app, db, deps) {
   });
 
   // ---------- bulk email ----------
-  // One subject + body (with {{contact_name}} etc.) to many prospects at once. Each recipient is checked against the
-  // do-not-contact gate, gets their own greeting ("Hello Ben," or "Hello Sir/Madam," when no name is recorded), and the
-  // optional image_url is shown in the email. Messages are queued as approved and sent in the same request, up to the
-  // per-request and daily limits; anything left over goes out the next time Run cycle / Process queue is used.
-  router.post('/outreach/bulk-send', manage, limiter(60 * 1000, 6), async (req, res) => {
+  // One subject + body (with {{contact_name}} etc.) to many prospects at once. Every prospect matching the filters is
+  // looked at, never-emailed first, until the requested number can be emailed. Only the send gate (consent.js) blocks
+  // anyone: people emailed before are included unless the sender asks to leave out recent ones.
+  // mode "send" queues as approved and sends straight away; "review" puts the messages in Pending approval;
+  // dry_run only counts. Anything not sent in this request stays approved for the next sending pass.
+  async function emailContacts(p, contacts) {
+    if (contacts.length) return contacts.sort((a, b2) => (b2.is_primary ? 1 : 0) - (a.is_primary ? 1 : 0));
+    // Older prospects hold their address only on the prospect row.
+    const value = D.normEmail(p.email);
+    if (!value) return [];
+    const row = { prospect_id: p.id, channel: 'email', value, is_primary: true, is_role_address: D.isRoleAddress(value), verification_status: 'format_valid', verification_method: 'format' };
+    const { data, error } = await db.from('gx_prospect_contacts').insert([row]).select().single();
+    return error ? [] : [data];
+  }
+
+  router.post('/outreach/bulk-send', manage, limiter(60 * 1000, 10), async (req, res) => {
     try {
       const b = req.body || {};
+      const dry = b.dry_run === true, review = b.mode === 'review';
       const subject = clip(b.subject, 200), body = clip(b.body, 5000);
-      if (!subject || !body) return res.status(400).json({ error: 'subject and body are required' });
+      if (!dry && (!subject || !body)) return res.status(400).json({ error: 'subject and body are required' });
       let imageUrl = null;
       if (b.image_url) { imageUrl = Mail.httpsUrl(String(b.image_url)); if (!imageUrl) return res.status(400).json({ error: 'image_url must be a public https:// link' }); }
       const settings = await C.getSettings(db);
-      const cap = Math.min(Math.max(parseInt(b.limit) || 100, 1), 200);
-      let prospects = [];
-      if (Array.isArray(b.prospect_ids) && b.prospect_ids.length) {
-        const { data } = await db.from('gx_prospects').select('*').in('id', b.prospect_ids.filter(isUuid).slice(0, cap)); prospects = data || [];
-      } else {
-        let q = db.from('gx_prospects').select('*').eq('do_not_contact', false).in('stage', ['new', 'qualified', 'permission_obtained', 'campaign_ready', 'contacted']).order('discovered_at', { ascending: true }).limit(cap);
-        if (clip(b.state, 60)) q = q.ilike('state', String(b.state).replace(/[^\w ]/g, ''));
-        if (clip(b.category, 40)) q = q.eq('category', String(b.category));
-        const { data } = await q; prospects = data || [];
+      const cap = Math.min(Math.max(parseInt(b.limit) || 100, 1), 500);
+      const skipDays = Math.min(Math.max(parseInt(b.skip_recent_days) || 0, 0), 365);
+      const recentCutoff = skipDays ? new Date(now().getTime() - skipDays * 86400000).toISOString() : null;
+      const ids = Array.isArray(b.prospect_ids) && b.prospect_ids.length ? b.prospect_ids.filter(isUuid).slice(0, 500) : null;
+
+      // Read the whole matching list first, so that updates made while queuing cannot shift the pages.
+      const all = [];
+      for (let from = 0; from < 20000; from += 1000) {
+        let q = db.from('gx_prospects').select('*').eq('do_not_contact', false).order('last_contacted_at', { ascending: true, nullsFirst: true }).order('id', { ascending: true }).range(from, from + 999);
+        if (ids) q = q.in('id', ids);
+        else {
+          if (clip(b.state, 60)) q = q.or(P.stateFilter(b.state));
+          if (clip(b.category, 40)) q = q.eq('category', String(b.category));
+        }
+        const { data, error } = await q;
+        if (error) throw error;
+        all.push(...(data || []));
+        if (!data || data.length < 1000) break;
       }
-      const since = new Date(now().getTime() - 72 * 3600000).toISOString();
-      const skipped = {}; let queued = 0; const skip = (r) => { skipped[r] = (skipped[r] || 0) + 1; };
+
+      const skipped = {}; const skip = (r) => { skipped[r] = (skipped[r] || 0) + 1; };
       const campaignTag = slug(clip(b.campaign_tag, 40) || 'bulk_email');
-      for (const p of prospects) {
-        const { data: contacts } = await db.from('gx_prospect_contacts').select('*').eq('prospect_id', p.id).eq('channel', 'email');
-        const pool = (contacts || []).sort((a, c2) => (c2.is_primary ? 1 : 0) - (a.is_primary ? 1 : 0));
-        let ct = null, why = pool.length ? null : 'no_email';
-        for (const x of pool) { const g = await C.evaluateSend(db, p, x, 'email', settings); if (g.ok) { ct = x; break; } why = g.reason; }
-        if (!ct) { skip(why); continue; }
-        const { data: recent } = await db.from('gx_messages').select('id').eq('prospect_id', p.id).eq('channel', 'email').in('status', ['approved', 'sending', 'sent', 'delivered']).gte('created_at', since).limit(1);
-        if (recent && recent.length) { skip('emailed_recently'); continue; }
-        let ghaCode = null;
-        if (p.owner_type === 'GHA' && p.owner_id) { const { data: g } = await db.from('gha_agents').select('gha_code').eq('id', p.owner_id).maybeSingle(); ghaCode = g && g.gha_code; }
-        const qs = new URLSearchParams({ utm_source: 'recruit', utm_medium: 'email', utm_campaign: campaignTag }); if (ghaCode) qs.set('ref', ghaCode);
-        const vars = AI.mergeVars(p, ct, settings, SITE + '/?' + qs.toString());
-        const { error } = await db.from('gx_messages').insert([{
-          prospect_id: p.id, contact_id: ct.id, campaign_id: null, step: 1, channel: 'email', subject: AI.merge(subject, vars), body: AI.merge(body, vars),
-          generated_by: 'human', personalization: { image_url: imageUrl, bulk: true }, consent_basis: 'b2b_unsubscribe_link',
-          status: 'approved', approved_by: actorOf(req), approved_at: now().toISOString(), scheduled_for: now().toISOString(), created_by: 'bulk_send',
-        }]);
-        if (error) skip('error'); else queued++;
+      const addresses = new Set(), queuedIds = [];
+      let eligible = 0, looked = 0, timedOut = false;
+      const t0 = Date.now();
+      for (let i = 0; i < all.length && eligible < cap && !timedOut; i += 100) {
+        const page = all.slice(i, i + 100);
+        const { data: rows } = await db.from('gx_prospect_contacts').select('*').eq('channel', 'email').in('prospect_id', page.map((p) => p.id));
+        const byProspect = {}; (rows || []).forEach((c) => { (byProspect[c.prospect_id] = byProspect[c.prospect_id] || []).push(c); });
+        for (const p of page) {
+          if (eligible >= cap) break;
+          if (Date.now() - t0 > 40000) { timedOut = true; break; }
+          looked++;
+          if (!byProspect[p.id] && !D.normEmail(p.email)) { skip('no_email'); continue; }
+          if (recentCutoff && p.last_contacted_at && new Date(p.last_contacted_at) >= new Date(recentCutoff)) { skip('emailed_recently'); continue; }
+          const pool = dry && !byProspect[p.id] ? [{ channel: 'email', value: D.normEmail(p.email), verification_status: 'format_valid' }] : await emailContacts(p, byProspect[p.id] || []);
+          let ct = null, why = pool.length ? null : 'no_email';
+          for (const x of pool) { const g = await C.evaluateSend(db, p, x, 'email', settings); if (g.ok) { ct = x; break; } why = g.reason; }
+          if (!ct) { skip(why); continue; }
+          if (addresses.has(ct.value)) { skip('same_address_twice'); continue; }
+          addresses.add(ct.value);
+          if (dry) { eligible++; continue; }
+          let ghaCode = null;
+          if (p.owner_type === 'GHA' && p.owner_id) { const { data: g } = await db.from('gha_agents').select('gha_code').eq('id', p.owner_id).maybeSingle(); ghaCode = g && g.gha_code; }
+          const qs = new URLSearchParams({ utm_source: 'recruit', utm_medium: 'email', utm_campaign: campaignTag }); if (ghaCode) qs.set('ref', ghaCode);
+          const vars = AI.mergeVars(p, ct, settings, SITE + '/?' + qs.toString());
+          // A newer bulk email replaces an older one that never went out, so nobody receives two at once.
+          await db.from('gx_messages').update({ status: 'cancelled', last_error: 'replaced by a newer bulk email' }).eq('prospect_id', p.id).eq('created_by', 'bulk_send').in('status', ['pending_approval', 'approved']);
+          const { data: msg, error } = await db.from('gx_messages').insert([{
+            prospect_id: p.id, contact_id: ct.id, campaign_id: null, step: 1, channel: 'email', subject: AI.merge(subject, vars), body: AI.merge(body, vars),
+            generated_by: 'human', personalization: { image_url: imageUrl, bulk: true }, consent_basis: 'b2b_unsubscribe_link',
+            status: review ? 'pending_approval' : 'approved', approved_by: review ? null : actorOf(req), approved_at: review ? null : now().toISOString(), scheduled_for: now().toISOString(), created_by: 'bulk_send',
+          }]).select().single();
+          if (error) { console.error('[outreach/bulk-send] insert:', error.message); skip('could_not_save'); continue; }
+          eligible++; queuedIds.push(msg.id);
+        }
       }
-      const sending = queued ? await processQueue(req, { max: 50, budgetMs: 40000 }) : null;
-      await audit(req, 'bulk.send', 'queue', null, { queued, skipped, sent: sending && sending.sent });
-      res.json({ matched: prospects.length, queued, skipped, sending, note: 'Anything not yet sent stays approved and goes out on the next Run cycle / Process queue, within your daily email limit.' });
+      if (dry) return res.json({ dry_run: true, matched: all.length, checked: looked, eligible, skipped });
+      const sending = !review && queuedIds.length ? await processQueue(req, { ids: queuedIds, max: 50, budgetMs: 40000 }) : null;
+      await audit(req, 'bulk.send', 'queue', null, { mode: review ? 'review' : 'send', queued: queuedIds.length, skipped, sent: sending && sending.sent });
+      res.json({
+        matched: all.length, checked: looked, queued: queuedIds.length, mode: review ? 'review' : 'send', skipped, sending,
+        note: review ? 'Saved under Pending approval. Nothing is sent until you approve it.' : 'Anything not yet sent stays approved and goes out on the next sending pass, within your daily email limit.',
+      });
     } catch (e) { fail(res, e, 'bulk-send'); }
   });
 
