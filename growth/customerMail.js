@@ -85,7 +85,7 @@ module.exports = function mountCustomerMail(app, db, deps) {
 
   // Customers who can be emailed: have an address, account not deleted, not unsubscribed or bounced.
   async function audience() {
-    const rows = await fetchAll(() => db.from('profiles').select('id, email, full_name, is_deleted').eq('role', 'customer').order('id', { ascending: true }));
+    const rows = await fetchAll(() => db.from('profiles').select('*').eq('role', 'customer').order('id', { ascending: true }));
     const seen = new Set(), people = [];
     rows.forEach((r) => {
       const email = r.is_deleted ? null : D.normEmail(r.email);
